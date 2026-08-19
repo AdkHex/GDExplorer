@@ -13,6 +13,12 @@ dist-ssr
 *.local
 *.local.*
 
+# This project uses pnpm (see packageManager in package.json). A stray
+# `npm install` used to leave a package-lock.json behind, which then blocked
+# `git pull` on machines that had one. Ignore the lockfiles we do not use.
+package-lock.json
+yarn.lock
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
