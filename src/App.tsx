@@ -12,7 +12,8 @@ import { useUIStore } from './store/ui-store'
 
 function App() {
   const { data: preferences } = usePreferences()
-  const { updateChecking, updateDownloading } = useUIStore()
+  const { updateChecking, updateDownloading, updateSplashDismissed } =
+    useUIStore()
   const hasCheckedUpdates = useRef(false)
 
   // Initialize command system and cleanup on app startup
@@ -48,7 +49,11 @@ function App() {
     <ErrorBoundary>
       <ThemeProvider>
         <MainWindow />
-        <UpdateSplash visible={updateChecking || updateDownloading} />
+        <UpdateSplash
+          visible={
+            (updateChecking || updateDownloading) && !updateSplashDismissed
+          }
+        />
       </ThemeProvider>
     </ErrorBoundary>
   )

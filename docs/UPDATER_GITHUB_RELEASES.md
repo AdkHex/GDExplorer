@@ -5,7 +5,7 @@ This app is set up to use the Tauri updater plugin with GitHub Releases.
 ## 1) Configure updater endpoint + public key
 
 - Endpoint is already set to:
-  - `https://github.com/vo1x/GDExplorer/releases/latest/download/latest.json`
+  - `https://github.com/AdkHex/GDExplorer/releases/latest/download/latest.json`
 - You must set the updater public key in `src-tauri/tauri.conf.json`:
   - `plugins.updater.pubkey`
 
@@ -38,6 +38,12 @@ The workflow `.github/workflows/release.yml` builds and uploads:
 
 - installers (Windows + macOS)
 - updater artifacts (`latest.json` + signatures)
+
+> **The release must be published, not left as a draft.** The workflow creates
+> the release with `releaseDraft: true`, and the updater endpoint resolves
+> `/releases/latest/`, which never matches a draft. Until you publish the draft
+> on GitHub, every client will keep reporting "you are up to date". This is a
+> deliberate manual gate - just remember it is the last step of a release.
 
 ## 5) In-app update check
 

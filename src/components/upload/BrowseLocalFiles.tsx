@@ -6,6 +6,7 @@ import { listen } from '@tauri-apps/api/event'
 import { useLocalUploadQueue } from '@/store/local-upload-queue-store'
 import { useUploadDestinationStore } from '@/store/upload-destination-store'
 import { useTransferUiStore } from '@/store/transfer-ui-store'
+import { useUIStore } from '@/store/ui-store'
 import { TransferTable } from '@/components/transfers/TransferTable'
 import { toast } from 'sonner'
 import { logger } from '@/lib/logger'
@@ -17,6 +18,21 @@ function normalizeSelection(
   return Array.isArray(selection) ? selection : [selection]
 }
 
+/**
+ * The destination field lives in the left sidebar, which the user may have
+ * collapsed - reveal it first, then focus, or the "fix it" hint goes nowhere.
+ */
+function focusDestinationInput() {
+  useUIStore.getState().setLeftSidebarVisible(true)
+  requestAnimationFrame(() => {
+    const element = document.getElementById('destination-url')
+    if (element instanceof HTMLInputElement) {
+      element.focus()
+      element.select()
+    }
+  })
+}
+
 export function BrowseLocalFiles() {
   const {
     items,
@@ -25,6 +41,8 @@ export function BrowseLocalFiles() {
     setItemProgress,
     setItemStatus,
     resetItemsUploadState,
+    resetStaleUploadState,
+    remove: removeItem,
   } = useLocalUploadQueue()
   const recordFileProgress = useTransferUiStore(s => s.recordFileProgress)
   const recordFileList = useTransferUiStore(s => s.recordFileList)
@@ -34,25 +52,22 @@ export function BrowseLocalFiles() {
   const [isDropActive, setIsDropActive] = useState(false)
   const [isUploading, setIsUploading] = useState(false)
 
-  const handleBrowse = async () => {
+  // Files and folders are picked separately. Previously one "Browse" click
+  // opened a file dialog and then unconditionally a folder dialog, so choosing
+  // files always left you staring at a second picker.
+  const handleBrowse = async (mode: 'files' | 'folder') => {
     if (isBrowsing) return
     setIsBrowsing(true)
     try {
-      const filesSelection = await open({
+      const selection = await open({
         multiple: true,
-        directory: false,
-        title: 'Select files',
+        directory: mode === 'folder',
+        title: mode === 'folder' ? 'Select folders' : 'Select files',
       })
-      const files = normalizeSelection(filesSelection) ?? []
-      if (files.length > 0) addFiles(files)
-
-      const foldersSelection = await open({
-        multiple: false,
-        directory: true,
-        title: 'Select folders',
-      })
-      const folders = normalizeSelection(foldersSelection) ?? []
-      if (folders.length > 0) addFolders(folders)
+      const paths = normalizeSelection(selection) ?? []
+      if (paths.length === 0) return
+      if (mode === 'folder') addFolders(paths)
+      else addFiles(paths)
     } finally {
       setIsBrowsing(false)
     }
@@ -64,8 +79,6 @@ export function BrowseLocalFiles() {
     let unlistenFileProgress: (() => void) | null = null
     let unlistenFileList: (() => void) | null = null
     let unlistenCompleted: (() => void) | null = null
-    let unlistenErrorBanner: (() => void) | null = null
-    let unlistenNotice: (() => void) | null = null
 
     const setup = async () => {
       unlistenStatus = await listen<{
@@ -116,30 +129,30 @@ export function BrowseLocalFiles() {
       })
 
       unlistenCompleted = await listen<{
-        summary: { total: number; succeeded: number; failed: number }
+        summary: {
+          total: number
+          succeeded: number
+          failed: number
+          canceled: number
+        }
       }>('upload:completed', event => {
         setIsUploading(false)
-        const { total, succeeded, failed } = event.payload.summary
-        toast.success('Upload completed', {
-          description: `${succeeded}/${total} succeeded, ${failed} failed`,
-        })
-      })
+        resetStaleUploadState()
 
-      unlistenErrorBanner = await listen<{
-        message: string
-        stage: string
-        saEmail?: string | null
-      }>('upload:error_banner', event => {
-        setIsUploading(false)
-        toast.error('Upload blocked', { description: event.payload.message })
-      })
+        const { total, succeeded, failed, canceled } = event.payload.summary
+        const parts = [`${succeeded}/${total} succeeded`]
+        if (failed > 0) parts.push(`${failed} failed`)
+        if (canceled > 0) parts.push(`${canceled} canceled`)
+        const description = parts.join(', ')
 
-      unlistenNotice = await listen<{ message: string }>(
-        'upload:notice',
-        event => {
-          toast.message('Upload notice', { description: event.payload.message })
+        if (failed > 0) {
+          toast.error('Upload finished with errors', { description })
+        } else if (canceled > 0) {
+          toast.message('Upload canceled', { description })
+        } else {
+          toast.success('Upload completed', { description })
         }
-      )
+      })
     }
 
     setup().catch(error => {
@@ -154,10 +167,14 @@ export function BrowseLocalFiles() {
       if (unlistenFileProgress) unlistenFileProgress()
       if (unlistenFileList) unlistenFileList()
       if (unlistenCompleted) unlistenCompleted()
-      if (unlistenErrorBanner) unlistenErrorBanner()
-      if (unlistenNotice) unlistenNotice()
     }
-  }, [recordFileList, recordFileProgress, setItemProgress, setItemStatus])
+  }, [
+    recordFileList,
+    recordFileProgress,
+    resetStaleUploadState,
+    setItemProgress,
+    setItemStatus,
+  ])
 
   useEffect(() => {
     let unlisten: (() => void) | null = null
@@ -242,13 +259,34 @@ export function BrowseLocalFiles() {
   }, [])
 
   const handleStartSelected = async (selectedIds: string[]) => {
-    if (!destinationFolderId) return
-    if (destinationError) return
+    // Pressing Start with no destination used to do nothing at all, with no
+    // hint as to why. Say what is wrong and put the caret where the fix goes.
+    if (!destinationFolderId || destinationError) {
+      toast.error(
+        destinationError
+          ? 'That destination is not a Drive folder'
+          : 'Choose a destination folder first',
+        {
+          description: 'Paste a Drive folder link or ID in the sidebar.',
+          action: {
+            label: 'Fix it',
+            onClick: () => focusDestinationInput(),
+          },
+        }
+      )
+      focusDestinationInput()
+      return
+    }
     if (selectedIds.length === 0) return
 
     const selected = items.filter(i => selectedIds.includes(i.id))
+    // 'failed' is startable so Start doubles as retry for a failed item.
     const startable = selected.filter(
-      i => i.status === 'queued' || i.status === 'paused' || !i.status
+      i =>
+        i.status === 'queued' ||
+        i.status === 'paused' ||
+        i.status === 'failed' ||
+        !i.status
     )
 
     if (isUploading) {
@@ -272,12 +310,26 @@ export function BrowseLocalFiles() {
 
     if (startable.length === 0) {
       toast.message('Nothing to start', {
-        description: 'Select queued or paused items.',
+        description: 'Select queued, paused or failed items.',
       })
       return
     }
 
     setIsUploading(true)
+
+    // Check the destination before touching any row state, so a bad folder ID
+    // or a service account without access fails in seconds instead of part-way
+    // through a large transfer.
+    try {
+      await invoke('verify_destination', { args: { destinationFolderId } })
+    } catch (error) {
+      setIsUploading(false)
+      const message = error instanceof Error ? error.message : String(error)
+      toast.error('Cannot reach the destination folder', {
+        description: message,
+      })
+      return
+    }
 
     clearFileProgress(startable.map(i => i.id))
     resetItemsUploadState(startable.map(i => i.id))
@@ -303,6 +355,26 @@ export function BrowseLocalFiles() {
     }
   }
 
+  const handleRemoveSelected = (selectedIds: string[]) => {
+    if (selectedIds.length === 0) return
+
+    const selected = items.filter(i => selectedIds.includes(i.id))
+    const active = selected.filter(
+      i => i.status === 'uploading' || i.status === 'preparing'
+    )
+    if (active.length > 0) {
+      toast.message('Some items are still uploading', {
+        description: 'Pause them first, or use Clear all to stop everything.',
+      })
+      return
+    }
+
+    clearFileProgress(selected.map(i => i.id))
+    for (const item of selected) {
+      removeItem(item.path)
+    }
+  }
+
   const handlePauseSelected = async (selectedIds: string[]) => {
     if (selectedIds.length === 0) return
     if (!isUploading) return
@@ -324,12 +396,13 @@ export function BrowseLocalFiles() {
 
   return (
     <div className="flex h-full w-full flex-col overflow-hidden">
-      <div className="flex min-h-0 flex-1 flex-col gap-3 p-6">
+      <div className="flex min-h-0 flex-1 flex-col gap-3 p-4">
         <TransferTable
           isDropActive={isDropActive}
           onBrowse={handleBrowse}
           onStartSelected={handleStartSelected}
           onPauseSelected={handlePauseSelected}
+          onRemoveSelected={handleRemoveSelected}
           isUploading={isUploading}
         />
       </div>

@@ -27,6 +27,20 @@ export async function checkForUpdates(
   if (checkInFlight) return 'downloading'
   checkInFlight = true
 
+  const {
+    updateDownloading,
+    updateReady,
+    setUpdateDownloading,
+    setUpdateReady,
+    setUpdateProgress,
+    setUpdateChecking,
+  } = useUIStore.getState()
+
+  // Flag the check before awaiting it, otherwise the "checking" state only
+  // existed for the instant between the check resolving and the download
+  // starting, and the UI never showed it.
+  setUpdateChecking(true)
+
   try {
     const update = await check()
     if (!update) {
@@ -36,15 +50,6 @@ export async function checkForUpdates(
       return 'latest'
     }
 
-    const {
-      updateDownloading,
-      updateReady,
-      setUpdateDownloading,
-      setUpdateReady,
-      setUpdateProgress,
-      setUpdateChecking,
-    } = useUIStore.getState()
-    setUpdateChecking(true)
     if (updateReady || updateDownloading) {
       if (notifyOnReady && updateReady) {
         toast('Update ready. Click the download icon to restart.')

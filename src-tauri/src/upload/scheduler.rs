@@ -15,6 +15,10 @@ impl UploadControlHandle {
     }
 }
 
+/// Error text used when an item stops because the whole job was cancelled.
+/// Cancellation is not a failure, so it is reported separately.
+pub const CANCELED: &str = "Upload canceled";
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueueItemInput {
@@ -25,7 +29,7 @@ pub struct QueueItemInput {
 
 pub async fn wait_if_paused(control: &UploadControlHandle, item_id: &str) -> Result<(), String> {
     if control.is_canceled() {
-        return Err("Upload canceled".to_string());
+        return Err(CANCELED.to_string());
     }
 
     let mut pause_all_rx = control.pause_rx.clone();
@@ -38,7 +42,7 @@ pub async fn wait_if_paused(control: &UploadControlHandle, item_id: &str) -> Res
 
     while *pause_all_rx.borrow() || paused_items_rx.borrow().contains(item_id) {
         if control.is_canceled() {
-            return Err("Upload canceled".to_string());
+            return Err(CANCELED.to_string());
         }
         tokio::select! {
             r = pause_all_rx.changed() => {

@@ -55,4 +55,7 @@ pub struct Summary {
     pub total: u32,
     pub succeeded: u32,
     pub failed: u32,
+    /// Items stopped by a cancel. Counted apart from `failed` so the summary
+    /// adds up and cancelling does not look like an error.
+    pub canceled: u32,
 }

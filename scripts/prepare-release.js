@@ -176,10 +176,10 @@ async function prepareRelease() {
 
       console.log(`\n🎊 Release ${tagVersion} has been published!`)
       console.log(
-        '📱 Check GitHub Actions: https://github.com/vo1x/GDExplorer/actions'
+        '📱 Check GitHub Actions: https://github.com/AdkHex/GDExplorer/actions'
       )
       console.log(
-        '📦 Draft release will appear at: https://github.com/vo1x/GDExplorer/releases'
+        '📦 Draft release will appear at: https://github.com/AdkHex/GDExplorer/releases'
       )
       console.log(
         '\n⚠️  Remember: You need to manually publish the draft release on GitHub!'

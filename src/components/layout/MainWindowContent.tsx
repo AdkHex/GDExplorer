@@ -2,6 +2,8 @@ import { cn } from '@/lib/utils'
 import { BrowseLocalFiles } from '@/components/upload/BrowseLocalFiles'
 import { LeftSideBar } from '@/components/layout/LeftSideBar'
 import { DestinationPicker } from '@/components/upload/DestinationPicker'
+import { QueueSummary } from '@/components/transfers/QueueSummary'
+import { Separator } from '@/components/ui/separator'
 import { useUIStore } from '@/store/ui-store'
 
 interface MainWindowContentProps {
@@ -26,8 +28,14 @@ export function MainWindowContent({
   return (
     <div className={cn('flex h-full w-full bg-background', className)}>
       {leftSidebarVisible ? (
-        <LeftSideBar className="w-[360px] shrink-0 p-4">
-          <DestinationPicker />
+        // 360px of chrome for a single URL field was mostly empty space. The
+        // panel is narrower now and earns its width with the queue summary.
+        <LeftSideBar className="w-60 shrink-0">
+          <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-4">
+            <DestinationPicker />
+            <Separator />
+            <QueueSummary />
+          </div>
         </LeftSideBar>
       ) : null}
       <div className="min-w-0 flex-1">

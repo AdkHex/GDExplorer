@@ -2,7 +2,7 @@ use crate::upload::events::{
     CompletedEvent, FileListEntry, FileListEvent, FileProgressEvent, ItemStatusEvent,
     ProgressEvent, Summary,
 };
-use crate::upload::scheduler::{wait_if_paused, QueueItemInput, UploadControlHandle};
+use crate::upload::scheduler::{wait_if_paused, QueueItemInput, UploadControlHandle, CANCELED};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -24,6 +24,11 @@ pub struct RclonePreferences {
     pub drive_chunk_size_mib: u32,
     pub transfers: u16,
     pub checkers: u16,
+    pub retries: u16,
+    /// `--bwlimit` value; empty means unlimited.
+    pub bandwidth_limit: String,
+    /// Glob patterns passed as repeated `--exclude` flags.
+    pub exclude_patterns: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -32,6 +37,24 @@ struct ServiceAccountFile {
     email: Option<String>,
     last_used: u64,
 }
+
+/// Why the rclone child process is being stopped early.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StopReason {
+    None,
+    Cancel,
+    /// Windows only: pause is implemented by stopping rclone and re-running it
+    /// on resume, because there is no portable SIGSTOP equivalent.
+    PauseRestart,
+}
+
+/// Internal sentinel error meaning "this item was paused, run it again once it
+/// is resumed". Never surfaced to the UI.
+const PAUSE_RESTART: &str = "__gdexplorer_pause_restart__";
+
+/// Keep the failure message useful without letting a pathological log line blow
+/// up the UI tooltip.
+const MAX_ERROR_DETAIL: usize = 600;
 
 pub async fn run_rclone_job(
     app: AppHandle,
@@ -64,6 +87,7 @@ pub async fn run_rclone_job(
 
     let succeeded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let canceled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     for item in &queue {
         log::debug!(
@@ -97,6 +121,7 @@ pub async fn run_rclone_job(
         let sa_tick = sa_tick.clone();
         let succeeded = succeeded.clone();
         let failed = failed.clone();
+        let canceled = canceled.clone();
 
         worker_handles.push(tokio::spawn(async move {
             loop {
@@ -120,21 +145,40 @@ pub async fn run_rclone_job(
                 )
                 .await;
 
-                if let Err(err) = result {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    let _ = app.emit(
-                        "upload:item_status",
-                        ItemStatusEvent {
-                            item_id: item.id.clone(),
-                            path: item.path.clone(),
-                            kind: item.kind.clone(),
-                            status: "failed".to_string(),
-                            message: Some(err),
-                            sa_email: None,
-                        },
-                    );
-                } else {
-                    succeeded.fetch_add(1, Ordering::Relaxed);
+                match result {
+                    Ok(()) => {
+                        succeeded.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // Cancelling is not a failure. Put the item back in the
+                    // queue so it can simply be started again.
+                    Err(err) if control.is_canceled() || err == CANCELED => {
+                        canceled.fetch_add(1, Ordering::Relaxed);
+                        let _ = app.emit(
+                            "upload:item_status",
+                            ItemStatusEvent {
+                                item_id: item.id.clone(),
+                                path: item.path.clone(),
+                                kind: item.kind.clone(),
+                                status: "queued".to_string(),
+                                message: None,
+                                sa_email: None,
+                            },
+                        );
+                    }
+                    Err(err) => {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        let _ = app.emit(
+                            "upload:item_status",
+                            ItemStatusEvent {
+                                item_id: item.id.clone(),
+                                path: item.path.clone(),
+                                kind: item.kind.clone(),
+                                status: "failed".to_string(),
+                                message: Some(err),
+                                sa_email: None,
+                            },
+                        );
+                    }
                 }
             }
         }));
@@ -165,6 +209,7 @@ pub async fn run_rclone_job(
 
     let succeeded = succeeded.load(Ordering::Relaxed) as u32;
     let failed = failed.load(Ordering::Relaxed) as u32;
+    let canceled = canceled.load(Ordering::Relaxed) as u32;
 
     let _ = app.emit(
         "upload:completed",
@@ -173,6 +218,7 @@ pub async fn run_rclone_job(
                 total: total_items,
                 succeeded,
                 failed,
+                canceled,
             },
         },
     );
@@ -200,43 +246,53 @@ async fn run_rclone_for_item(
         );
     }
 
-    let should_pause =
-        *control.pause_rx.borrow() || control.paused_items_rx.borrow().contains(&item.id);
-    let initial_status = if should_pause { "paused" } else { "uploading" };
-    log::debug!(
-        target: "rclone",
-        "upload.start id={} kind={} path={} paused={}",
-        item.id,
-        item.kind,
-        item.path,
-        should_pause
-    );
-    let _ = app.emit(
-        "upload:item_status",
-        ItemStatusEvent {
-            item_id: item.id.clone(),
-            path: item.path.clone(),
-            kind: item.kind.clone(),
-            status: initial_status.to_string(),
-            message: None,
-            sa_email: None,
-        },
-    );
+    // On Windows a pause stops the child process, so the item has to be run
+    // again when it resumes. rclone skips whatever already reached Drive, so
+    // re-running is safe. On Unix the process is suspended in place and this
+    // loop runs exactly once.
+    loop {
+        let should_pause =
+            *control.pause_rx.borrow() || control.paused_items_rx.borrow().contains(&item.id);
+        let initial_status = if should_pause { "paused" } else { "uploading" };
+        log::debug!(
+            target: "rclone",
+            "upload.start id={} kind={} path={} paused={}",
+            item.id,
+            item.kind,
+            item.path,
+            should_pause
+        );
+        let _ = app.emit(
+            "upload:item_status",
+            ItemStatusEvent {
+                item_id: item.id.clone(),
+                path: item.path.clone(),
+                kind: item.kind.clone(),
+                status: initial_status.to_string(),
+                message: None,
+                sa_email: None,
+            },
+        );
 
-    wait_if_paused(control, &item.id).await?;
+        wait_if_paused(control, &item.id).await?;
 
-    let (sa_path, sa_email) = select_service_account(sa_pool, sa_tick).await?;
+        let (sa_path, sa_email) = select_service_account(sa_pool, sa_tick).await?;
 
-    run_rclone_command(
-        app,
-        control,
-        prefs,
-        &sa_path,
-        sa_email,
-        destination_folder_id,
-        item,
-    )
-    .await
+        match run_rclone_command(
+            app,
+            control,
+            prefs,
+            &sa_path,
+            sa_email,
+            destination_folder_id,
+            item,
+        )
+        .await
+        {
+            Err(err) if err == PAUSE_RESTART => continue,
+            other => return other,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -250,7 +306,7 @@ async fn run_rclone_command(
     item: &QueueItemInput,
 ) -> Result<(), String> {
     if control.is_canceled() {
-        return Err("Upload canceled".to_string());
+        return Err(CANCELED.to_string());
     }
 
     log::debug!(
@@ -273,27 +329,7 @@ async fn run_rclone_command(
 
     let args = build_rclone_args(prefs, destination_folder_id, item, sa_path);
 
-    #[cfg(windows)]
-    let mut command = {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let mut std_command = std::process::Command::new(&prefs.rclone_path);
-        std_command
-            .args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .creation_flags(CREATE_NO_WINDOW);
-        Command::from(std_command)
-    };
-    #[cfg(not(windows))]
-    let mut command = {
-        let mut command = Command::new(&prefs.rclone_path);
-        command
-            .args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        command
-    };
+    let mut command = build_rclone_command(&prefs.rclone_path, &args);
 
     log::debug!(
         target: "rclone",
@@ -311,11 +347,15 @@ async fn run_rclone_command(
         .ok_or_else(|| "Failed to get rclone process id".to_string())?;
 
     let (done_tx, done_rx) = watch::channel(false);
+    // The monitor observes pause/cancel but does not own the child, so it asks
+    // this function to stop the process through `stop_tx`.
+    let (stop_tx, mut stop_rx) = watch::channel(StopReason::None);
     let pause_task = tokio::spawn(monitor_pause_state(
         app.clone(),
         control.clone(),
         item.clone(),
         pid,
+        stop_tx,
         done_rx,
     ));
 
@@ -337,28 +377,78 @@ async fn run_rclone_command(
     let mut last_bytes = 0_u64;
     let mut last_total = 0_u64;
     let mut last_file_progress: HashMap<String, (u64, u64)> = HashMap::new();
+    // Keep the most recent rclone errors so a failure can say what went wrong
+    // instead of only reporting an exit code.
+    let mut error_lines: Vec<String> = Vec::new();
+    let mut recent_lines: Vec<String> = Vec::new();
+    let mut stop_reason = StopReason::None;
+    let mut stopped = false;
 
-    while let Some(line) = line_rx.recv().await {
-        log::debug!(target: "rclone", "{}", line);
-        if let Some(entries) = parse_json_file_progress(&line) {
-            for (file_path, bytes, total) in entries {
-                let should_emit = match last_file_progress.get(&file_path) {
-                    Some((last_bytes, last_total)) => *last_bytes != bytes || *last_total != total,
-                    None => true,
-                };
-                if should_emit {
-                    last_file_progress.insert(file_path.clone(), (bytes, total));
-                    emit_file_progress(app, item, &file_path, bytes, total).await;
+    loop {
+        tokio::select! {
+            maybe_line = line_rx.recv() => {
+                let Some(line) = maybe_line else { break };
+                log::debug!(target: "rclone", "{}", line);
+
+                if let Some(message) = extract_log_error(&line) {
+                    if !error_lines.contains(&message) {
+                        if error_lines.len() == 5 {
+                            error_lines.remove(0);
+                        }
+                        error_lines.push(message);
+                    }
+                }
+                if recent_lines.len() == 3 {
+                    recent_lines.remove(0);
+                }
+                recent_lines.push(line.clone());
+
+                if let Some(entries) = parse_json_file_progress(&line) {
+                    for (file_path, bytes, total) in entries {
+                        let should_emit = match last_file_progress.get(&file_path) {
+                            Some((last_bytes, last_total)) => {
+                                *last_bytes != bytes || *last_total != total
+                            }
+                            None => true,
+                        };
+                        if should_emit {
+                            last_file_progress.insert(file_path.clone(), (bytes, total));
+                            emit_file_progress(app, item, &file_path, bytes, total).await;
+                        }
+                    }
+                }
+                if let Some((bytes, total)) = parse_json_progress(&line, &item.path)
+                    .or_else(|| parse_progress_line(&progress_re, &line))
+                {
+                    if bytes != last_bytes || total != last_total {
+                        last_bytes = bytes;
+                        last_total = total;
+                        emit_progress(app, item, bytes, total).await;
+                    }
                 }
             }
-        }
-        if let Some((bytes, total)) = parse_json_progress(&line, &item.path)
-            .or_else(|| parse_progress_line(&progress_re, &line))
-        {
-            if bytes != last_bytes || total != last_total {
-                last_bytes = bytes;
-                last_total = total;
-                emit_progress(app, item, bytes, total).await;
+            changed = stop_rx.changed(), if !stopped => {
+                if changed.is_err() {
+                    // Monitor finished; nothing more will ask us to stop.
+                    stopped = true;
+                    continue;
+                }
+                let reason = *stop_rx.borrow();
+                if reason == StopReason::None {
+                    continue;
+                }
+                stop_reason = reason;
+                stopped = true;
+                // A suspended process cannot act on a terminate request, so
+                // always resume before killing - this is what used to wedge the
+                // app when cancelling a paused item.
+                #[cfg(unix)]
+                {
+                    let _ = resume_process(pid);
+                }
+                if let Err(e) = child.kill().await {
+                    log::warn!(target: "rclone", "upload.kill_failed id={} err={e}", item.id);
+                }
             }
         }
     }
@@ -374,8 +464,12 @@ async fn run_rclone_command(
         .await
         .map_err(|e| format!("Failed to wait for rclone: {e}"))?;
 
-    if control.is_canceled() {
-        return Err("Upload canceled".to_string());
+    if control.is_canceled() || stop_reason == StopReason::Cancel {
+        return Err(CANCELED.to_string());
+    }
+
+    if stop_reason == StopReason::PauseRestart {
+        return Err(PAUSE_RESTART.to_string());
     }
 
     if status.success() {
@@ -398,14 +492,74 @@ async fn run_rclone_command(
         return Ok(());
     }
 
+    let failure = describe_failure(&status, &error_lines, &recent_lines);
     log::warn!(
         target: "rclone",
-        "upload.failed id={} status={}",
+        "upload.failed id={} status={} detail={}",
         item.id,
-        status
+        status,
+        failure
     );
 
-    Err(format!("Rclone failed with status: {status}"))
+    Err(failure)
+}
+
+/// Pull the human-readable message out of an rclone JSON log line, but only for
+/// lines that actually represent a failure.
+fn extract_log_error(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let value: Value = serde_json::from_str(trimmed).ok()?;
+    let level = value.get("level").and_then(|v| v.as_str())?;
+    if !matches!(level, "error" | "fatal" | "critical") {
+        return None;
+    }
+    let msg = value.get("msg").and_then(|v| v.as_str())?.trim();
+    if msg.is_empty() {
+        return None;
+    }
+    let object = value
+        .get("object")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim();
+    Some(if object.is_empty() {
+        msg.to_string()
+    } else {
+        format!("{object}: {msg}")
+    })
+}
+
+/// Build a failure message that tells the user what rclone actually complained
+/// about, falling back to the last raw output when nothing was tagged as an
+/// error (for example when rclone dies before it starts logging JSON).
+fn describe_failure(
+    status: &std::process::ExitStatus,
+    error_lines: &[String],
+    recent_lines: &[String],
+) -> String {
+    let mut detail = if !error_lines.is_empty() {
+        error_lines.join("; ")
+    } else {
+        recent_lines.join("; ")
+    };
+
+    if detail.chars().count() > MAX_ERROR_DETAIL {
+        detail = detail.chars().take(MAX_ERROR_DETAIL).collect::<String>() + "…";
+    }
+
+    let code = match status.code() {
+        Some(code) => format!("exit code {code}"),
+        None => "terminated by signal".to_string(),
+    };
+
+    if detail.is_empty() {
+        format!("rclone failed ({code})")
+    } else {
+        format!("rclone failed ({code}): {detail}")
+    }
 }
 
 async fn emit_progress(app: &AppHandle, item: &QueueItemInput, bytes: u64, total: u64) {
@@ -450,10 +604,11 @@ async fn monitor_pause_state(
     control: UploadControlHandle,
     item: QueueItemInput,
     pid: u32,
+    stop_tx: watch::Sender<StopReason>,
     mut done_rx: watch::Receiver<bool>,
 ) {
-    #[cfg(windows)]
-    let _pid = pid;
+    // `pid` is only needed for the Unix suspend/resume signals.
+    let _ = pid;
     let mut pause_all_rx = control.pause_rx.clone();
     let mut paused_items_rx = control.paused_items_rx.clone();
     let mut is_paused = false;
@@ -465,18 +620,7 @@ async fn monitor_pause_state(
 
         if control.is_canceled() {
             log::debug!(target: "rclone", "upload.cancel id={}", item.id);
-            #[cfg(unix)]
-            {
-                let _ = signal_process(pid, libc::SIGTERM);
-            }
-            #[cfg(windows)]
-            {
-                log::debug!(
-                    target: "rclone",
-                    "upload.cancel skipped on Windows id={}",
-                    item.id
-                );
-            }
+            let _ = stop_tx.send(StopReason::Cancel);
             break;
         }
 
@@ -489,23 +633,7 @@ async fn monitor_pause_state(
                 item.id,
                 is_paused
             );
-            #[cfg(unix)]
-            {
-                let _ = if is_paused {
-                    signal_process(pid, libc::SIGSTOP)
-                } else {
-                    signal_process(pid, libc::SIGCONT)
-                };
-            }
-            #[cfg(windows)]
-            {
-                log::debug!(
-                    target: "rclone",
-                    "upload.pause skipped on Windows id={} paused={}",
-                    item.id,
-                    is_paused
-                );
-            }
+
             let _ = app.emit(
                 "upload:item_status",
                 ItemStatusEvent {
@@ -521,6 +649,29 @@ async fn monitor_pause_state(
                     sa_email: None,
                 },
             );
+
+            #[cfg(unix)]
+            {
+                let _ = if is_paused {
+                    suspend_process(pid)
+                } else {
+                    resume_process(pid)
+                };
+            }
+            #[cfg(windows)]
+            {
+                // No portable process-suspend on Windows: stop rclone and let
+                // the worker re-run it when the item resumes.
+                if is_paused {
+                    log::debug!(
+                        target: "rclone",
+                        "upload.pause stopping child on Windows id={}",
+                        item.id
+                    );
+                    let _ = stop_tx.send(StopReason::PauseRestart);
+                    break;
+                }
+            }
         }
 
         tokio::select! {
@@ -532,13 +683,90 @@ async fn monitor_pause_state(
     }
 }
 
+/// Build an rclone command with piped output, hiding the console window on
+/// Windows so the app does not flash a terminal for every invocation.
+fn build_rclone_command(rclone_path: &str, args: &[String]) -> Command {
+    #[cfg(windows)]
+    let command = {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let mut std_command = std::process::Command::new(rclone_path);
+        std_command
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW);
+        Command::from(std_command)
+    };
+    #[cfg(not(windows))]
+    let command = {
+        let mut command = Command::new(rclone_path);
+        command
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    };
+    command
+}
+
+/// Check that the destination folder is reachable with the configured remote
+/// and service accounts, so a bad folder ID or an account without access fails
+/// immediately instead of part-way through a large transfer.
+pub async fn verify_destination(
+    prefs: &RclonePreferences,
+    service_account_folder: &str,
+    destination_folder_id: &str,
+) -> Result<(), String> {
+    let sa_files = load_service_account_files(service_account_folder)?;
+    let sa = sa_files
+        .first()
+        .ok_or("No valid service account JSON files found in the selected folder.")?;
+
+    let args = vec![
+        "lsjson".to_string(),
+        format!("{}:", prefs.remote_name),
+        "--drive-root-folder-id".to_string(),
+        destination_folder_id.to_string(),
+        "--max-depth".to_string(),
+        "1".to_string(),
+        "--use-json-log".to_string(),
+        "--drive-service-account-file".to_string(),
+        sa.path.to_string_lossy().to_string(),
+    ];
+
+    let mut command = build_rclone_command(&prefs.rclone_path, &args);
+    let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+        .await
+        .map_err(|_| "Timed out checking the destination folder.".to_string())?
+        .map_err(|e| format!("Failed to run rclone: {e}"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let error_lines: Vec<String> = stderr.lines().filter_map(extract_log_error).collect();
+    let detail = if error_lines.is_empty() {
+        stderr.lines().rev().take(2).collect::<Vec<_>>().join("; ")
+    } else {
+        error_lines.join("; ")
+    };
+
+    Err(if detail.trim().is_empty() {
+        "Destination folder is not reachable with the configured service accounts.".to_string()
+    } else {
+        format!("Destination folder is not reachable: {}", detail.trim())
+    })
+}
+
 fn build_rclone_args(
     prefs: &RclonePreferences,
     destination_folder_id: &str,
     item: &QueueItemInput,
     sa_path: &Path,
 ) -> Vec<String> {
-    let args = vec![
+    let mut args = vec![
         "copy".to_string(),
         item.path.clone(),
         format!(
@@ -571,7 +799,24 @@ fn build_rclone_args(
         "--use-json-log".to_string(),
         "--drive-service-account-file".to_string(),
         sa_path.to_string_lossy().to_string(),
+        "--retries".to_string(),
+        prefs.retries.to_string(),
     ];
+
+    let bandwidth_limit = prefs.bandwidth_limit.trim();
+    if !bandwidth_limit.is_empty() {
+        args.push("--bwlimit".to_string());
+        args.push(bandwidth_limit.to_string());
+    }
+
+    for pattern in &prefs.exclude_patterns {
+        let pattern = pattern.trim();
+        if pattern.is_empty() {
+            continue;
+        }
+        args.push("--exclude".to_string());
+        args.push(pattern.to_string());
+    }
 
     args
 }
@@ -791,6 +1036,16 @@ fn signal_process(pid: u32, signal: i32) -> Result<(), String> {
     } else {
         Err("Failed to signal rclone process".to_string())
     }
+}
+
+#[cfg(unix)]
+fn suspend_process(pid: u32) -> Result<(), String> {
+    signal_process(pid, libc::SIGSTOP)
+}
+
+#[cfg(unix)]
+fn resume_process(pid: u32) -> Result<(), String> {
+    signal_process(pid, libc::SIGCONT)
 }
 
 async fn read_rclone_stream<R: tokio::io::AsyncRead + Unpin>(

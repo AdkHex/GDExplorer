@@ -1,4 +1,5 @@
 import { Loader2 } from 'lucide-react'
+import { Button } from '@/components/ui/button'
 import { useUIStore } from '@/store/ui-store'
 
 interface UpdateSplashProps {
@@ -6,8 +7,13 @@ interface UpdateSplashProps {
 }
 
 export function UpdateSplash({ visible }: UpdateSplashProps) {
-  const { updateDownloading, updateProgress, updateReady, updateVersion } =
-    useUIStore()
+  const {
+    updateDownloading,
+    updateProgress,
+    updateReady,
+    updateVersion,
+    dismissUpdateSplash,
+  } = useUIStore()
 
   if (!visible) return null
 
@@ -33,6 +39,17 @@ export function UpdateSplash({ visible }: UpdateSplashProps) {
             Open Settings to restart and install.
           </p>
         ) : null}
+        {/* Without this the app is unusable for the whole download. Dismissing
+            keeps the transfer running - the title bar shows its progress. */}
+        <Button
+          type="button"
+          variant="secondary"
+          size="sm"
+          className="mt-4 w-full"
+          onClick={dismissUpdateSplash}
+        >
+          Continue in background
+        </Button>
       </div>
     </div>
   )

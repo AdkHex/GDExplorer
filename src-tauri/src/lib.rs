@@ -144,6 +144,9 @@ async fn start_upload(
             drive_chunk_size_mib: preferences.upload_chunk_size_mib,
             transfers: preferences.rclone_transfers,
             checkers: preferences.rclone_checkers,
+            retries: preferences.rclone_retries,
+            bandwidth_limit: preferences.rclone_bandwidth_limit,
+            exclude_patterns: preferences.rclone_exclude_patterns,
         };
 
         if let Err(e) = upload::rclone::run_rclone_job(
@@ -162,6 +165,35 @@ async fn start_upload(
     });
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VerifyDestinationArgs {
+    destination_folder_id: String,
+}
+
+#[tauri::command]
+async fn verify_destination(app: AppHandle, args: VerifyDestinationArgs) -> Result<(), String> {
+    let preferences = load_preferences(app).await?;
+    let service_account_folder = preferences
+        .service_account_folder_path
+        .clone()
+        .ok_or_else(|| "Service Account folder path is not set in Preferences.".to_string())?;
+
+    let prefs = upload::rclone::RclonePreferences {
+        rclone_path: preferences.rclone_path,
+        remote_name: preferences.rclone_remote_name,
+        drive_chunk_size_mib: preferences.upload_chunk_size_mib,
+        transfers: preferences.rclone_transfers,
+        checkers: preferences.rclone_checkers,
+        retries: preferences.rclone_retries,
+        bandwidth_limit: preferences.rclone_bandwidth_limit,
+        exclude_patterns: preferences.rclone_exclude_patterns,
+    };
+
+    upload::rclone::verify_destination(&prefs, &service_account_folder, &args.destination_folder_id)
+        .await
 }
 
 #[tauri::command]
@@ -219,8 +251,12 @@ async fn list_item_files(path: String, kind: LocalPathKind) -> Result<Vec<FileLi
                     continue;
                 }
                 let file_path = entry.path().to_path_buf();
-                let metadata = std::fs::metadata(&file_path)
-                    .map_err(|e| format!("Failed to stat file: {e}"))?;
+                // Skip files we cannot stat (broken symlinks, permission
+                // denied) instead of failing the whole listing.
+                let Ok(metadata) = std::fs::metadata(&file_path) else {
+                    log::warn!("Skipping unreadable file while listing: {file_path:?}");
+                    continue;
+                };
                 files.push(FileListEntry {
                     file_path: file_path.to_string_lossy().to_string(),
                     total_bytes: metadata.len(),
@@ -320,6 +356,45 @@ fn validate_rclone_checkers(value: u16) -> Result<(), String> {
     }
 }
 
+fn validate_rclone_retries(value: u16) -> Result<(), String> {
+    if value <= 20 {
+        Ok(())
+    } else {
+        Err("Invalid rclone retries: must be between 0 and 20".to_string())
+    }
+}
+
+fn validate_rclone_bandwidth_limit(value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    validate_string_input(trimmed, 32, "Rclone bandwidth limit")?;
+    // Accept rclone size suffixes, e.g. "512k", "10M", "1.5G".
+    let pattern = Regex::new(r"(?i)^\d+(\.\d+)?[bkmgt]?$")
+        .map_err(|e| format!("Regex compilation error: {e}"))?;
+    if !pattern.is_match(trimmed) {
+        return Err(
+            "Invalid bandwidth limit: use a number with an optional B/K/M/G/T suffix, e.g. 10M"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_rclone_exclude_patterns(patterns: &[String]) -> Result<(), String> {
+    if patterns.len() > 50 {
+        return Err("Too many exclude patterns (max 50).".to_string());
+    }
+    for pattern in patterns {
+        if pattern.trim().is_empty() {
+            return Err("Exclude patterns cannot be empty.".to_string());
+        }
+        validate_string_input(pattern, 256, "Exclude pattern")?;
+    }
+    Ok(())
+}
+
 fn validate_service_account_json_path(path: &Option<String>) -> Result<(), String> {
     let Some(path) = path else {
         return Ok(());
@@ -351,19 +426,6 @@ fn validate_destination_presets(presets: &[DestinationPreset]) -> Result<(), Str
     Ok(())
 }
 
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    // Input validation
-    if let Err(e) = validate_string_input(name, 100, "Name") {
-        log::warn!("Invalid greet input: {e}");
-        return format!("Error: {e}");
-    }
-
-    log::info!("Greeting user: {name}");
-    format!("Hello, {name}! You've been greeted from Rust!")
-}
-
 // Preferences data structure
 // Only contains settings that should be persisted to disk
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,6 +455,14 @@ pub struct AppPreferences {
     pub rclone_transfers: u16,
     #[serde(default = "default_rclone_checkers")]
     pub rclone_checkers: u16,
+    #[serde(default = "default_rclone_retries")]
+    pub rclone_retries: u16,
+    /// rclone `--bwlimit` value, e.g. "10M". Empty means unlimited.
+    #[serde(default)]
+    pub rclone_bandwidth_limit: String,
+    /// Glob patterns passed to rclone as `--exclude`.
+    #[serde(default)]
+    pub rclone_exclude_patterns: Vec<String>,
     pub destination_presets: Vec<DestinationPreset>,
 }
 
@@ -408,9 +478,16 @@ impl Default for AppPreferences {
             rclone_remote_name: "gdrive".to_string(),
             rclone_transfers: 4,
             rclone_checkers: 8,
+            rclone_retries: default_rclone_retries(),
+            rclone_bandwidth_limit: String::new(),
+            rclone_exclude_patterns: Vec::new(),
             destination_presets: Vec::new(),
         }
     }
+}
+
+fn default_rclone_retries() -> u16 {
+    3
 }
 
 fn default_rclone_path() -> String {
@@ -480,6 +557,9 @@ async fn save_preferences(app: AppHandle, preferences: AppPreferences) -> Result
     validate_rclone_remote_name(&preferences.rclone_remote_name)?;
     validate_rclone_transfers(preferences.rclone_transfers)?;
     validate_rclone_checkers(preferences.rclone_checkers)?;
+    validate_rclone_retries(preferences.rclone_retries)?;
+    validate_rclone_bandwidth_limit(&preferences.rclone_bandwidth_limit)?;
+    validate_rclone_exclude_patterns(&preferences.rclone_exclude_patterns)?;
     validate_service_account_json_path(&preferences.service_account_folder_path)?;
     validate_destination_presets(&preferences.destination_presets)?;
 
@@ -819,7 +899,6 @@ pub fn run() {
         )
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_persisted_scope::init())
-        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
@@ -893,7 +972,6 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            greet,
             load_preferences,
             save_preferences,
             send_native_notification,
@@ -902,6 +980,7 @@ pub fn run() {
             cleanup_old_recovery_files,
             classify_paths,
             start_upload,
+            verify_destination,
             pause_upload,
             pause_items,
             cancel_upload,

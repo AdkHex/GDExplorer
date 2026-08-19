@@ -8,6 +8,9 @@ type UploadRuntimeStatus =
   | 'done'
   | 'failed'
 
+/** Weight given to the newest speed sample when smoothing (0-1). */
+const SPEED_SMOOTHING = 0.3
+
 export interface TransferMetrics {
   speedBytesPerSec: number
   etaSeconds: number | null
@@ -379,15 +382,31 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
         const baselineDtMs =
           baselineAtMs !== undefined ? Math.max(250, now - baselineAtMs) : dtMs
 
-        const speed = isActive
-          ? delta > 0
-            ? Math.max(0, Math.round((delta * 1000) / dtMs))
+        const previousSpeed = state.metricsById[id]?.speedBytesPerSec ?? 0
+
+        // Instantaneous rate for this tick, or the average since the transfer
+        // started when no bytes have moved yet.
+        const sample =
+          delta > 0
+            ? (delta * 1000) / dtMs
             : sent > 0 && baselineAtMs !== undefined
-              ? Math.max(0, Math.round((sent * 1000) / baselineDtMs))
-              : (state.metricsById[id]?.speedBytesPerSec ?? 0)
-          : paused
-            ? 0
-            : 0
+              ? (sent * 1000) / baselineDtMs
+              : null
+
+        // rclone reports in ~1s bursts, so raw samples swing wildly. Smooth them
+        // exponentially; the displayed rate settles instead of flickering.
+        const speed = !isActive
+          ? 0
+          : sample === null
+            ? previousSpeed
+            : Math.max(
+                0,
+                Math.round(
+                  previousSpeed > 0
+                    ? previousSpeed + SPEED_SMOOTHING * (sample - previousSpeed)
+                    : sample
+                )
+              )
 
         const etaSeconds =
           isActive && total > 0 && speed > 0
@@ -429,17 +448,32 @@ function omitKey<T extends Record<string, unknown>>(obj: T, key: string): T {
   return rest as T
 }
 
+function normalizeSeparators(path: string): string {
+  return path.replace(/\\/g, '/')
+}
+
+/**
+ * rclone reports paths relative to the source root ("sub/dir/file.txt") while
+ * the pre-built file list holds absolute paths. Match on the relative path as a
+ * suffix first - matching on the bare filename alone produced duplicate ghost
+ * rows whenever two files in different subfolders shared a name.
+ */
 function resolveFileKey(existingOrder: string[], candidate: string): string {
   if (existingOrder.includes(candidate)) return candidate
+
+  const normalized = normalizeSeparators(candidate)
+  const suffixMatches = existingOrder.filter(entry => {
+    const entryPath = normalizeSeparators(entry)
+    return entryPath === normalized || entryPath.endsWith(`/${normalized}`)
+  })
+  if (suffixMatches.length === 1) return suffixMatches[0] ?? candidate
+  if (suffixMatches.length > 1) return candidate
+
+  // Nothing matched on the full relative path; fall back to a filename match,
+  // but only when it is unambiguous.
   const base = getPathName(candidate)
-  let match: string | null = null
-  for (const entry of existingOrder) {
-    if (getPathName(entry) === base) {
-      if (match) return candidate
-      match = entry
-    }
-  }
-  return match ?? candidate
+  const baseMatches = existingOrder.filter(entry => getPathName(entry) === base)
+  return baseMatches.length === 1 ? (baseMatches[0] ?? candidate) : candidate
 }
 
 function getPathName(path: string): string {

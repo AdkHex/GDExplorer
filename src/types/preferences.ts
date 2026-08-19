@@ -10,6 +10,11 @@ export interface AppPreferences {
   rcloneRemoteName: string
   rcloneTransfers: number
   rcloneCheckers: number
+  rcloneRetries: number
+  /** rclone `--bwlimit` value, e.g. "10M". Empty means unlimited. */
+  rcloneBandwidthLimit: string
+  /** Glob patterns passed to rclone as `--exclude`. */
+  rcloneExcludePatterns: string[]
   destinationPresets: DestinationPreset[]
 }
 
@@ -29,5 +34,8 @@ export const defaultPreferences: AppPreferences = {
   rcloneRemoteName: 'gdrive',
   rcloneTransfers: 4,
   rcloneCheckers: 8,
+  rcloneRetries: 3,
+  rcloneBandwidthLimit: '',
+  rcloneExcludePatterns: [],
   destinationPresets: [],
 }

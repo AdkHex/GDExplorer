@@ -65,11 +65,9 @@ export function useMainWindowEventListeners() {
       const unlisteners = await Promise.all([
         listen('menu-about', () => {
           logger.debug('About menu event received')
-          // Show simple about dialog
-          const appVersion = '0.1.0' // Could be dynamic from package.json
-          alert(
-            `GDExplorer\n\nVersion: ${appVersion}\n\nBuilt with Tauri v2 + React + TypeScript`
-          )
+          // Open the About pane, which reads the real version from Tauri,
+          // rather than a blocking alert with a hardcoded version string.
+          useUIStore.getState().openPreferencesAt('about')
         }),
 
         listen('menu-check-updates', async () => {

@@ -21,7 +21,13 @@ import {
   PanelLeftClose,
   Settings,
 } from 'lucide-react'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
 import { installUpdate } from '@/lib/updater'
+import { detectPlatform } from '@/lib/platform'
 
 interface TitleBarProps {
   className?: string
@@ -46,7 +52,7 @@ export function TitleBar({ className, title = 'GDExplorer' }: TitleBarProps) {
     <div
       data-tauri-drag-region
       className={cn(
-        'relative flex h-8 w-full shrink-0 items-center justify-between border-b bg-background',
+        'relative flex h-9 w-full shrink-0 items-center justify-between border-b bg-background',
         className
       )}
     >
@@ -56,21 +62,29 @@ export function TitleBar({ className, title = 'GDExplorer' }: TitleBarProps) {
 
         {/* Left Action Buttons */}
         <div className="flex items-center gap-1">
-          <Button
-            onClick={toggleLeftSidebar}
-            variant="ghost"
-            size="icon"
-            className="h-6 w-6 text-foreground/70 hover:text-foreground"
-            title={
-              leftSidebarVisible ? 'Hide Left Sidebar' : 'Show Left Sidebar'
-            }
-          >
-            {leftSidebarVisible ? (
-              <PanelLeftClose className="h-3 w-3" />
-            ) : (
-              <PanelLeft className="h-3 w-3" />
-            )}
-          </Button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                onClick={toggleLeftSidebar}
+                variant="ghost"
+                size="icon"
+                className="size-7 text-foreground/70 hover:text-foreground"
+                aria-label={
+                  leftSidebarVisible ? 'Hide sidebar' : 'Show sidebar'
+                }
+              >
+                {leftSidebarVisible ? (
+                  <PanelLeftClose className="size-3.5" />
+                ) : (
+                  <PanelLeft className="size-3.5" />
+                )}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              {leftSidebarVisible ? 'Hide sidebar' : 'Show sidebar'}
+              <span className="ml-2 opacity-60">⌘1</span>
+            </TooltipContent>
+          </Tooltip>
         </div>
       </div>
 
@@ -95,31 +109,42 @@ export function TitleBar({ className, title = 'GDExplorer' }: TitleBarProps) {
           </div>
         ) : null}
         {updateReady ? (
-          <Button
-            onClick={async () => {
-              setConfirmOpen(true)
-            }}
-            variant="ghost"
-            size="icon"
-            className="h-6 w-6 text-foreground/80 hover:text-foreground"
-            title={
-              updateVersion
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                onClick={() => setConfirmOpen(true)}
+                variant="ghost"
+                size="icon"
+                className="size-7 text-status-info hover:text-status-info"
+                aria-label="Restart to install update"
+              >
+                <Download className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              {updateVersion
                 ? `Restart to update (${updateVersion})`
-                : 'Restart to update'
-            }
-          >
-            <Download className="h-3 w-3" />
-          </Button>
+                : 'Restart to update'}
+            </TooltipContent>
+          </Tooltip>
         ) : null}
-        <Button
-          onClick={() => setPreferencesOpen(true)}
-          variant="ghost"
-          size="icon"
-          className="h-6 w-6 text-foreground/70 hover:text-foreground"
-          title="Settings"
-        >
-          <Settings className="h-3 w-3" />
-        </Button>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              onClick={() => setPreferencesOpen(true)}
+              variant="ghost"
+              size="icon"
+              className="size-7 text-foreground/70 hover:text-foreground"
+              aria-label="Settings"
+            >
+              <Settings className="size-3.5" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">
+            Settings
+            <span className="ml-2 opacity-60">⌘,</span>
+          </TooltipContent>
+        </Tooltip>
         {platformName === 'windows' ? (
           <WindowsWindowControls className="ml-2" />
         ) : null}
@@ -149,15 +174,3 @@ export function TitleBar({ className, title = 'GDExplorer' }: TitleBarProps) {
 }
 
 export default TitleBar
-
-function detectPlatform(): 'macos' | 'windows' | null {
-  const platform = navigator.platform.toLowerCase()
-  if (platform.includes('mac')) return 'macos'
-  if (platform.includes('win')) return 'windows'
-
-  const userAgent = navigator.userAgent.toLowerCase()
-  if (userAgent.includes('mac')) return 'macos'
-  if (userAgent.includes('windows')) return 'windows'
-
-  return null
-}
