@@ -1,4 +1,3 @@
-import { useState } from 'react'
 import { Info, Palette, Settings } from 'lucide-react'
 import {
   Breadcrumb,
@@ -24,12 +23,10 @@ import {
   SidebarMenuItem,
   SidebarProvider,
 } from '@/components/ui/sidebar'
-import { useUIStore } from '@/store/ui-store'
+import { useUIStore, type PreferencePane } from '@/store/ui-store'
 import { GeneralPane } from './panes/GeneralPane'
 import { AppearancePane } from './panes/AppearancePane'
 import { AboutPane } from './panes/AboutPane'
-
-type PreferencePane = 'general' | 'appearance' | 'about'
 
 const navigationItems = [
   {
@@ -63,8 +60,12 @@ const getPaneTitle = (pane: PreferencePane): string => {
 }
 
 export function PreferencesDialog() {
-  const [activePane, setActivePane] = useState<PreferencePane>('general')
-  const { preferencesOpen, setPreferencesOpen } = useUIStore()
+  const {
+    preferencesOpen,
+    setPreferencesOpen,
+    preferencesPane: activePane,
+    setPreferencesPane: setActivePane,
+  } = useUIStore()
 
   return (
     <Dialog open={preferencesOpen} onOpenChange={setPreferencesOpen}>

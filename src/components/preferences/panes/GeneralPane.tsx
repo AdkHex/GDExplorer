@@ -1,4 +1,5 @@
 import React, { useCallback, useMemo, useState } from 'react'
+import { ChevronDown, ChevronRight } from 'lucide-react'
 import { open } from '@tauri-apps/plugin-dialog'
 import { invoke } from '@tauri-apps/api/core'
 import { toast } from 'sonner'
@@ -9,6 +10,7 @@ import { Button } from '@/components/ui/button'
 import { usePreferences, useSavePreferences } from '@/services/preferences'
 import type { DestinationPreset } from '@/types/preferences'
 import { extractDriveFolderId } from '@/lib/drive-url'
+import { isWindows } from '@/lib/platform'
 
 const SettingsField: React.FC<{
   label: string
@@ -37,6 +39,38 @@ const SettingsSection: React.FC<{
   </div>
 )
 
+/**
+ * Collapsed by default so the everyday settings are not buried under rclone
+ * tuning knobs most people never touch.
+ */
+const AdvancedSection: React.FC<{ children: React.ReactNode }> = ({
+  children,
+}) => {
+  const [open, setOpen] = useState(false)
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <button
+          type="button"
+          onClick={() => setOpen(current => !current)}
+          aria-expanded={open}
+          className="flex w-full items-center gap-2 text-left text-lg font-medium text-foreground"
+        >
+          {open ? (
+            <ChevronDown className="size-4" />
+          ) : (
+            <ChevronRight className="size-4" />
+          )}
+          Advanced (rclone tuning)
+        </button>
+        <Separator className="mt-2" />
+      </div>
+      {open ? <div className="space-y-4">{children}</div> : null}
+    </div>
+  )
+}
+
 export const GeneralPane: React.FC = () => {
   const { data: preferences } = usePreferences()
   const savePreferences = useSavePreferences()
@@ -51,6 +85,9 @@ export const GeneralPane: React.FC = () => {
       rcloneRemoteName: preferences.rcloneRemoteName ?? 'gdrive',
       rcloneTransfers: preferences.rcloneTransfers ?? 4,
       rcloneCheckers: preferences.rcloneCheckers ?? 8,
+      rcloneRetries: preferences.rcloneRetries ?? 3,
+      rcloneBandwidthLimit: preferences.rcloneBandwidthLimit ?? '',
+      rcloneExcludePatterns: preferences.rcloneExcludePatterns ?? [],
       destinationPresets: preferences.destinationPresets ?? [],
     })
   }, [preferences])
@@ -112,6 +149,24 @@ const GeneralPaneForm: React.FC<{
   )
   const [lastSavedRcloneCheckers, setLastSavedRcloneCheckers] = useState(
     () => preferences.rcloneCheckers ?? 8
+  )
+  const [rcloneRetriesInput, setRcloneRetriesInput] = useState<string>(() =>
+    String(preferences.rcloneRetries ?? 3)
+  )
+  const [lastSavedRcloneRetries, setLastSavedRcloneRetries] = useState(
+    () => preferences.rcloneRetries ?? 3
+  )
+  const [bandwidthLimitInput, setBandwidthLimitInput] = useState<string>(
+    () => preferences.rcloneBandwidthLimit ?? ''
+  )
+  const [lastSavedBandwidthLimit, setLastSavedBandwidthLimit] = useState(
+    () => preferences.rcloneBandwidthLimit ?? ''
+  )
+  const [excludePatternsInput, setExcludePatternsInput] = useState<string>(() =>
+    (preferences.rcloneExcludePatterns ?? []).join('\n')
+  )
+  const [lastSavedExcludePatterns, setLastSavedExcludePatterns] = useState(() =>
+    (preferences.rcloneExcludePatterns ?? []).join('\n')
   )
   const [isInstallingRclone, setIsInstallingRclone] = useState(false)
   const [isConfiguringRclone, setIsConfiguringRclone] = useState(false)
@@ -281,6 +336,70 @@ const GeneralPaneForm: React.FC<{
       })
   }
 
+  const rcloneRetriesError = useMemo(() => {
+    const trimmed = rcloneRetriesInput.trim()
+    if (!trimmed) return 'Please enter a number between 0 and 20.'
+    if (!/^\d+$/.test(trimmed)) return 'Must be an integer between 0 and 20.'
+    const parsed = Number.parseInt(trimmed, 10)
+    if (!Number.isFinite(parsed) || parsed > 20) {
+      return 'Must be an integer between 0 and 20.'
+    }
+    return null
+  }, [rcloneRetriesInput])
+
+  const handleSaveRcloneRetries = () => {
+    if (rcloneRetriesError) return
+    const value = Number.parseInt(rcloneRetriesInput.trim(), 10)
+    savePreferences
+      .mutateAsync({ rcloneRetries: value })
+      .then(() => setLastSavedRcloneRetries(value))
+      .catch(() => setRcloneRetriesInput(String(lastSavedRcloneRetries)))
+  }
+
+  const bandwidthLimitError = useMemo(() => {
+    const trimmed = bandwidthLimitInput.trim()
+    if (!trimmed) return null
+    if (!/^\d+(\.\d+)?[bkmgtBKMGT]?$/.test(trimmed)) {
+      return 'Use a number with an optional B/K/M/G/T suffix, e.g. 10M.'
+    }
+    return null
+  }, [bandwidthLimitInput])
+
+  const handleSaveBandwidthLimit = () => {
+    if (bandwidthLimitError) return
+    const value = bandwidthLimitInput.trim()
+    savePreferences
+      .mutateAsync({ rcloneBandwidthLimit: value })
+      .then(() => setLastSavedBandwidthLimit(value))
+      .catch(() => setBandwidthLimitInput(lastSavedBandwidthLimit))
+  }
+
+  const parsedExcludePatterns = useMemo(
+    () =>
+      excludePatternsInput
+        .split('\n')
+        .map(line => line.trim())
+        .filter(Boolean),
+    [excludePatternsInput]
+  )
+
+  const excludePatternsError = useMemo(() => {
+    if (parsedExcludePatterns.length > 50) return 'At most 50 patterns.'
+    if (parsedExcludePatterns.some(p => p.length > 256)) {
+      return 'Each pattern must be 256 characters or fewer.'
+    }
+    return null
+  }, [parsedExcludePatterns])
+
+  const handleSaveExcludePatterns = () => {
+    if (excludePatternsError) return
+    const next = excludePatternsInput
+    savePreferences
+      .mutateAsync({ rcloneExcludePatterns: parsedExcludePatterns })
+      .then(() => setLastSavedExcludePatterns(next))
+      .catch(() => setExcludePatternsInput(lastSavedExcludePatterns))
+  }
+
   const handleInstallRclone = async () => {
     setIsInstallingRclone(true)
     try {
@@ -426,20 +545,40 @@ const GeneralPaneForm: React.FC<{
         </SettingsField>
 
         <SettingsField
-          label="Upload chunk size (MiB)"
-          description="Size of each chunk sent during resumable uploads. Larger values can improve throughput on fast networks but increase memory usage."
+          label="Bandwidth limit"
+          description="Caps upload speed (rclone --bwlimit). For example 10M for 10 MiB/s. Leave empty for unlimited."
         >
           <div className="space-y-2">
             <Input
-              inputMode="numeric"
-              type="number"
-              value={chunkSizeInput}
-              onChange={e => setChunkSizeInput(e.target.value)}
-              onBlur={handleSaveChunkSize}
-              aria-invalid={Boolean(chunkSizeError)}
+              value={bandwidthLimitInput}
+              onChange={e => setBandwidthLimitInput(e.target.value)}
+              onBlur={handleSaveBandwidthLimit}
+              placeholder="Unlimited"
+              aria-invalid={Boolean(bandwidthLimitError)}
             />
-            {chunkSizeError ? (
-              <p className="text-sm text-destructive">{chunkSizeError}</p>
+            {bandwidthLimitError ? (
+              <p className="text-sm text-destructive">{bandwidthLimitError}</p>
+            ) : null}
+          </div>
+        </SettingsField>
+
+        <SettingsField
+          label="Exclude patterns"
+          description="One glob per line, skipped during upload (rclone --exclude). For example .DS_Store or **/node_modules/**"
+        >
+          <div className="space-y-2">
+            <textarea
+              value={excludePatternsInput}
+              onChange={e => setExcludePatternsInput(e.target.value)}
+              onBlur={handleSaveExcludePatterns}
+              rows={4}
+              spellCheck={false}
+              placeholder={'.DS_Store\n**/node_modules/**'}
+              aria-invalid={Boolean(excludePatternsError)}
+              className="flex w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 aria-invalid:border-destructive aria-invalid:ring-destructive/20"
+            />
+            {excludePatternsError ? (
+              <p className="text-sm text-destructive">{excludePatternsError}</p>
             ) : null}
           </div>
         </SettingsField>
@@ -478,68 +617,44 @@ const GeneralPaneForm: React.FC<{
           </div>
         </SettingsField>
 
-        <SettingsField
-          label="Rclone transfers"
-          description="Controls --transfers (parallel file uploads within rclone)."
-        >
-          <div className="space-y-2">
-            <Input
-              inputMode="numeric"
-              type="number"
-              value={rcloneTransfersInput}
-              onChange={e => setRcloneTransfersInput(e.target.value)}
-              onBlur={handleSaveRcloneTransfers}
-              aria-invalid={Boolean(rcloneTransfersError)}
-            />
-            {rcloneTransfersError ? (
-              <p className="text-sm text-destructive">{rcloneTransfersError}</p>
-            ) : null}
-          </div>
-        </SettingsField>
-
-        <SettingsField
-          label="Rclone checkers"
-          description="Controls --checkers (parallel directory/metadata checks)."
-        >
-          <div className="space-y-2">
-            <Input
-              inputMode="numeric"
-              type="number"
-              value={rcloneCheckersInput}
-              onChange={e => setRcloneCheckersInput(e.target.value)}
-              onBlur={handleSaveRcloneCheckers}
-              aria-invalid={Boolean(rcloneCheckersError)}
-            />
-            {rcloneCheckersError ? (
-              <p className="text-sm text-destructive">{rcloneCheckersError}</p>
-            ) : null}
-          </div>
-        </SettingsField>
-
-        <SettingsField
-          label="Rclone setup (Windows)"
-          description="Install rclone and configure the remote automatically."
-        >
-          <div className="flex flex-wrap gap-2">
-            <Button
-              type="button"
-              onClick={handleInstallRclone}
-              disabled={isInstallingRclone}
-            >
-              {isInstallingRclone ? 'Installing…' : 'Install rclone'}
-            </Button>
-            <Button
-              type="button"
-              variant="secondary"
-              onClick={handleConfigureRclone}
-              disabled={
-                isConfiguringRclone || !serviceAccountFolder.trim().length
-              }
-            >
-              {isConfiguringRclone ? 'Configuring…' : 'Configure remote'}
-            </Button>
-          </div>
-        </SettingsField>
+        {/* These call Windows-only commands that hard-error elsewhere, so they
+            are only offered on Windows. */}
+        {isWindows() ? (
+          <SettingsField
+            label="Rclone setup"
+            description="Download rclone and configure the remote automatically."
+          >
+            <div className="flex flex-wrap gap-2">
+              <Button
+                type="button"
+                onClick={handleInstallRclone}
+                disabled={isInstallingRclone}
+              >
+                {isInstallingRclone ? 'Installing…' : 'Install rclone'}
+              </Button>
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={handleConfigureRclone}
+                disabled={
+                  isConfiguringRclone || !serviceAccountFolder.trim().length
+                }
+              >
+                {isConfiguringRclone ? 'Configuring…' : 'Configure remote'}
+              </Button>
+            </div>
+          </SettingsField>
+        ) : (
+          <SettingsField
+            label="Rclone setup"
+            description="Automatic setup is Windows-only. On this platform install rclone yourself (for example `brew install rclone`) and point the path above at it."
+          >
+            <p className="text-sm text-muted-foreground">
+              See{' '}
+              <span className="font-mono">https://rclone.org/downloads/</span>
+            </p>
+          </SettingsField>
+        )}
 
         <SettingsField
           label="Destination presets"
@@ -631,6 +746,84 @@ const GeneralPaneForm: React.FC<{
           </div>
         </SettingsField>
       </SettingsSection>
+
+      <AdvancedSection>
+        <SettingsField
+          label="Upload chunk size (MiB)"
+          description="Size of each chunk sent during resumable uploads. Larger values can improve throughput on fast networks but increase memory usage."
+        >
+          <div className="space-y-2">
+            <Input
+              inputMode="numeric"
+              type="number"
+              value={chunkSizeInput}
+              onChange={e => setChunkSizeInput(e.target.value)}
+              onBlur={handleSaveChunkSize}
+              aria-invalid={Boolean(chunkSizeError)}
+            />
+            {chunkSizeError ? (
+              <p className="text-sm text-destructive">{chunkSizeError}</p>
+            ) : null}
+          </div>
+        </SettingsField>
+
+        <SettingsField
+          label="Rclone transfers"
+          description="Controls --transfers (parallel file uploads within rclone)."
+        >
+          <div className="space-y-2">
+            <Input
+              inputMode="numeric"
+              type="number"
+              value={rcloneTransfersInput}
+              onChange={e => setRcloneTransfersInput(e.target.value)}
+              onBlur={handleSaveRcloneTransfers}
+              aria-invalid={Boolean(rcloneTransfersError)}
+            />
+            {rcloneTransfersError ? (
+              <p className="text-sm text-destructive">{rcloneTransfersError}</p>
+            ) : null}
+          </div>
+        </SettingsField>
+
+        <SettingsField
+          label="Rclone checkers"
+          description="Controls --checkers (parallel directory/metadata checks)."
+        >
+          <div className="space-y-2">
+            <Input
+              inputMode="numeric"
+              type="number"
+              value={rcloneCheckersInput}
+              onChange={e => setRcloneCheckersInput(e.target.value)}
+              onBlur={handleSaveRcloneCheckers}
+              aria-invalid={Boolean(rcloneCheckersError)}
+            />
+            {rcloneCheckersError ? (
+              <p className="text-sm text-destructive">{rcloneCheckersError}</p>
+            ) : null}
+          </div>
+        </SettingsField>
+
+        <SettingsField
+          label="Rclone retries"
+          description="How many times rclone retries a failed transfer before giving up (--retries)."
+        >
+          <div className="space-y-2">
+            <Input
+              inputMode="numeric"
+              type="number"
+              value={rcloneRetriesInput}
+              onChange={e => setRcloneRetriesInput(e.target.value)}
+              onBlur={handleSaveRcloneRetries}
+              aria-invalid={Boolean(rcloneRetriesError)}
+            />
+            {rcloneRetriesError ? (
+              <p className="text-sm text-destructive">{rcloneRetriesError}</p>
+            ) : null}
+          </div>
+        </SettingsField>
+      </AdvancedSection>
     </div>
   )
 }

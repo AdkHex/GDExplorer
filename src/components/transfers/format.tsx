@@ -1,6 +1,8 @@
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'] as const
+  // Binary units, to match the 1024 divisor. These used to be labelled
+  // KB/MB/GB, which understated every figure by ~2.4% per step.
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'] as const
   let value = bytes
   let unitIndex = 0
   while (value >= 1024 && unitIndex < units.length - 1) {
