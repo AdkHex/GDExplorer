@@ -370,6 +370,21 @@ async fn list_remote_entries(
     upload::rclone::list_remote_entries(&prefs, &service_account_folder, folder_id).await
 }
 
+/// Human name for a folder the user pasted a link to. Returns null when it
+/// cannot be resolved, which the sidebar renders as the bare ID.
+#[tauri::command]
+async fn resolve_folder_name(
+    app: AppHandle,
+    args: ListRemoteFoldersArgs,
+) -> Result<Option<String>, String> {
+    let folder_id = args.folder_id.trim();
+    if folder_id.is_empty() {
+        return Ok(None);
+    }
+    let (prefs, service_account_folder) = rclone_context(app).await?;
+    Ok(upload::rclone::resolve_folder_name(&prefs, &service_account_folder, folder_id).await)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SearchRemoteFoldersArgs {
@@ -1375,6 +1390,7 @@ pub fn run() {
             list_shared_drives,
             list_remote_folders,
             list_remote_entries,
+            resolve_folder_name,
             search_remote_folders,
             run_preflight,
             pause_upload,

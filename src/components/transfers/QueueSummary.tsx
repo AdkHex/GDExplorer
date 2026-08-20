@@ -26,10 +26,12 @@ export function QueueSummary() {
   return (
     <section className="space-y-2">
       <div className="flex items-baseline justify-between gap-2">
-        <h2 className="text-sm font-semibold">Queue</h2>
-        <span className="text-xs tabular-nums text-muted-foreground">
+        <div className="text-[11px] font-medium text-muted-foreground">
+          Queue
+        </div>
+        <div className="text-xs tabular-nums text-muted-foreground">
           {items.length} {items.length === 1 ? 'item' : 'items'}
-        </span>
+        </div>
       </div>
 
       <ProgressBar
@@ -38,17 +40,27 @@ export function QueueSummary() {
         label="Overall upload progress"
       />
 
-      <p className="text-xs tabular-nums text-muted-foreground">
+      {/* Two short lines rather than one long one: at 240px the single line
+          wrapped and left "left" stranded on a row of its own. */}
+      <div className="text-xs tabular-nums">
         {summary.totalBytes > 0
-          ? `${formatBytes(summary.sentBytes)} of ${formatBytes(summary.totalBytes)}`
+          ? `${formatBytes(summary.sentBytes)} / ${formatBytes(summary.totalBytes)}`
           : 'Size not known yet'}
-        {isActive && summary.speedBytesPerSec > 0
-          ? ` · ${formatSpeed(summary.speedBytesPerSec)}`
-          : ''}
-        {isActive && summary.etaSeconds !== null
-          ? ` · ${formatEta(summary.etaSeconds)} left`
-          : ''}
-      </p>
+      </div>
+      {isActive ? (
+        <div className="text-xs tabular-nums text-muted-foreground">
+          {[
+            summary.speedBytesPerSec > 0
+              ? formatSpeed(summary.speedBytesPerSec)
+              : null,
+            summary.etaSeconds !== null
+              ? `${formatEta(summary.etaSeconds)} left`
+              : null,
+          ]
+            .filter(Boolean)
+            .join(' · ')}
+        </div>
+      ) : null}
     </section>
   )
 }

@@ -1210,6 +1210,53 @@ pub const MAX_SEARCH_RESULTS: usize = 200;
 /// Note that Drive's `contains` matches from the start of a word rather than
 /// anywhere in the name, so "Ato" finds "Atomic" but "tomic" does not. That is
 /// the API's behaviour, not a filter applied here.
+/// Name of a single Drive folder, given only its ID.
+///
+/// Browsing already knows the name, but a pasted link carries nothing but an
+/// ID. `lsjson --stat` against the folder as its own root returns the entry for
+/// that folder, which is the cheapest way to put a human label on it.
+///
+/// Failure is not an error worth surfacing: the sidebar simply keeps showing
+/// the ID, so this returns None rather than propagating.
+pub async fn resolve_folder_name(
+    prefs: &RclonePreferences,
+    service_account_folder: &str,
+    folder_id: &str,
+) -> Option<String> {
+    let sa_files = load_service_account_files(service_account_folder).ok()?;
+    let sa = sa_files.first()?;
+
+    let args = vec![
+        "lsjson".to_string(),
+        format!("{}:", prefs.remote_name),
+        "--stat".to_string(),
+        "--drive-root-folder-id".to_string(),
+        folder_id.to_string(),
+        "--drive-service-account-file".to_string(),
+        sa.path.to_string_lossy().to_string(),
+    ];
+
+    let output = run_rclone_to_completion(prefs, &args, Duration::from_secs(30))
+        .await
+        .ok()?;
+    if !output.status.success() {
+        log::debug!(
+            target: "rclone",
+            "destination.name_unresolved id={} detail={}",
+            folder_id,
+            describe_command_failure(&output)
+        );
+        return None;
+    }
+
+    let entry: LsJsonEntry = serde_json::from_slice(&output.stdout).ok()?;
+    let name = entry.name.trim();
+    if name.is_empty() || name == "/" {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 pub async fn search_remote_folders(
     prefs: &RclonePreferences,
     service_account_folder: &str,

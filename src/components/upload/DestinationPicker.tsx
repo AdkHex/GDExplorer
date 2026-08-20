@@ -1,60 +1,59 @@
 import { useEffect, useMemo, useState } from 'react'
+import { invoke } from '@tauri-apps/api/core'
 import { openUrl } from '@tauri-apps/plugin-opener'
 import {
-  AlertCircleIcon,
-  CheckCircle2Icon,
+  ChevronDownIcon,
   ExternalLinkIcon,
   FolderIcon,
-  FolderSearchIcon,
-  XIcon,
+  HardDriveIcon,
+  LinkIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectSeparator,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from '@/components/ui/tooltip'
 import { useUploadDestinationStore } from '@/store/upload-destination-store'
 import { usePreferences } from '@/services/preferences'
 import { logger } from '@/lib/logger'
 import { cn } from '@/lib/utils'
+import { extractDriveFolderId } from '@/lib/drive-url'
 import { driveFolderUrl } from '@/lib/drive-links'
 import { RemoteFolderBrowser } from './RemoteFolderBrowser'
-
-const CUSTOM_VALUE = 'custom'
 
 export function DestinationPicker() {
   const {
     destinationUrl,
     destinationError,
     destinationFolderId,
+    destinationName,
+    destinationPath,
     setDestinationUrl,
+    setDestinationFolder,
+    setDestinationName,
     applyDefaultDestination,
     clearDestination,
   } = useUploadDestinationStore()
   const { data: preferences } = usePreferences()
   const [browserOpen, setBrowserOpen] = useState(false)
+  const [pasteOpen, setPasteOpen] = useState(false)
 
   const destinationPresets = useMemo(
     () => preferences?.destinationPresets ?? [],
     [preferences?.destinationPresets]
   )
-
-  const selectedPresetId = useMemo(() => {
-    const url = destinationUrl.trim()
-    if (!url) return CUSTOM_VALUE
-    const match = destinationPresets.find(p => p.url.trim() === url)
-    return match ? match.id : CUSTOM_VALUE
-  }, [destinationPresets, destinationUrl])
 
   useEffect(() => {
     const firstPreset = destinationPresets[0]
@@ -62,141 +61,246 @@ export function DestinationPicker() {
     applyDefaultDestination(firstPreset.url)
   }, [destinationPresets, applyDefaultDestination])
 
-  const hasValue = destinationUrl.trim().length > 0
+  // A pasted link carries only an ID, so ask rclone what the folder is called.
+  // Browsing already supplies the name, hence the `destinationName` guard.
+  useEffect(() => {
+    if (!destinationFolderId || destinationName) return
+    let cancelled = false
+    invoke<string | null>('resolve_folder_name', {
+      args: { folderId: destinationFolderId },
+    })
+      .then(name => {
+        if (cancelled || !name) return
+        setDestinationName(destinationFolderId, name)
+      })
+      .catch(error => {
+        logger.debug('Could not resolve the destination folder name', {
+          error: String(error),
+        })
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [destinationFolderId, destinationName, setDestinationName])
+
+  // Everything above the chosen folder, shown as the picker's breadcrumb.
+  const parentSegments = destinationPath.slice(0, -1)
 
   return (
     <section className="space-y-2">
-      <div className="flex items-center gap-2">
-        <FolderIcon className="size-4 text-muted-foreground" />
-        <h2 className="text-sm font-semibold">Destination</h2>
+      <div className="text-[11px] font-medium text-muted-foreground">
+        Destination
       </div>
 
-      {/* The field labels were removed as visible text - the section heading
-          already says what this is. They stay as aria-labels so the controls
-          are still announced properly. */}
-      {destinationPresets.length > 0 ? (
-        <Select
-          value={selectedPresetId}
-          onValueChange={value => {
-            if (value === CUSTOM_VALUE) {
-              clearDestination()
-              return
-            }
-            const preset = destinationPresets.find(p => p.id === value)
-            if (preset) setDestinationUrl(preset.url)
-          }}
-        >
-          <SelectTrigger
-            size="sm"
-            className="w-full"
-            aria-label="Saved destination"
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <button
+            type="button"
+            className={cn(
+              'flex w-full items-center gap-2 rounded-lg border bg-white/[0.04] px-2.5 py-1.5 text-left transition-colors',
+              'hover:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
+              destinationError
+                ? 'border-status-danger'
+                : destinationFolderId
+                  ? 'border-input'
+                  : 'border-dashed border-input'
+            )}
+            aria-label="Destination folder"
           >
-            <SelectValue placeholder="Custom" />
-          </SelectTrigger>
-          <SelectContent>
-            {destinationPresets.map(p => (
-              <SelectItem key={p.id} value={p.id}>
-                {p.name}
-              </SelectItem>
-            ))}
-            <SelectSeparator />
-            <SelectItem value={CUSTOM_VALUE}>Custom…</SelectItem>
-          </SelectContent>
-        </Select>
-      ) : null}
+            <div className="min-w-0 flex-1">
+              {destinationError ? (
+                <div className="truncate text-[11px] text-status-danger">
+                  Not a Drive folder
+                </div>
+              ) : parentSegments.length > 0 ? (
+                <div className="truncate text-[11px] text-muted-foreground">
+                  {parentSegments.join(' › ')}
+                </div>
+              ) : destinationFolderId && !destinationName ? (
+                <div className="truncate text-[11px] text-muted-foreground">
+                  Pasted link
+                </div>
+              ) : null}
 
-      <div className="relative">
-        <Input
-          id="destination-url"
-          aria-label="Destination folder URL"
-          value={destinationUrl}
-          onChange={e => setDestinationUrl(e.target.value)}
-          placeholder="Paste a Drive folder link or ID"
-          spellCheck={false}
-          autoComplete="off"
-          autoCorrect="off"
-          aria-invalid={destinationError}
-          aria-describedby="destination-status"
-          className={cn(
-            hasValue && 'pr-8',
-            destinationFolderId &&
-              'border-status-success focus-visible:border-status-success focus-visible:ring-status-success/25'
-          )}
-        />
-        {hasValue ? (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                onClick={clearDestination}
-                className="absolute right-1.5 top-1/2 flex size-5 -translate-y-1/2 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-                aria-label="Clear destination"
+              <div className="flex items-center gap-1.5 text-[13px] font-medium">
+                <FolderIcon
+                  className={cn(
+                    'size-3.5 shrink-0',
+                    destinationFolderId && !destinationError
+                      ? 'text-status-success'
+                      : 'text-muted-foreground'
+                  )}
+                />
+                {destinationError ? (
+                  <span className="truncate text-muted-foreground">
+                    Pick or paste again
+                  </span>
+                ) : destinationFolderId ? (
+                  <span
+                    className={cn(
+                      'truncate',
+                      !destinationName && 'font-mono text-[11px]'
+                    )}
+                  >
+                    {destinationName ?? destinationFolderId}
+                  </span>
+                ) : (
+                  <span className="truncate text-muted-foreground">
+                    Choose a folder
+                  </span>
+                )}
+              </div>
+            </div>
+            <ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground" />
+          </button>
+        </DropdownMenuTrigger>
+
+        <DropdownMenuContent align="start" className="w-[220px]">
+          {destinationPresets.map(preset => {
+            const presetId = extractDriveFolderId(preset.url)
+            const isActive =
+              presetId !== null && presetId === destinationFolderId
+            return (
+              <DropdownMenuItem
+                key={preset.id}
+                onSelect={() =>
+                  setDestinationFolder(preset.url, preset.name, [preset.name])
+                }
               >
-                <XIcon className="size-3.5" />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent side="bottom">Clear</TooltipContent>
-          </Tooltip>
-        ) : null}
-      </div>
+                <FolderIcon />
+                <span className="flex-1 truncate">{preset.name}</span>
+                {isActive ? (
+                  <span className="text-status-info" aria-hidden="true">
+                    ✓
+                  </span>
+                ) : null}
+              </DropdownMenuItem>
+            )
+          })}
+          {destinationPresets.length > 0 ? <DropdownMenuSeparator /> : null}
 
-      {/* Pasting a folder URL assumes you have one to hand. Browsing asks
-          rclone what the service accounts can actually see. */}
-      <Button
-        type="button"
-        variant="outline"
-        size="sm"
-        className="w-full"
-        onClick={() => setBrowserOpen(true)}
-      >
-        <FolderSearchIcon />
-        Browse Drive…
-      </Button>
+          <DropdownMenuItem onSelect={() => setBrowserOpen(true)}>
+            <HardDriveIcon />
+            Browse Drive…
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setPasteOpen(true)}>
+            <LinkIcon />
+            Paste link…
+          </DropdownMenuItem>
+
+          {destinationFolderId ? (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onSelect={() => {
+                  openUrl(driveFolderUrl(destinationFolderId)).catch(error => {
+                    logger.warn('Failed to open destination folder', {
+                      error: String(error),
+                    })
+                  })
+                }}
+              >
+                <ExternalLinkIcon />
+                Open in Drive
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                variant="destructive"
+                onSelect={clearDestination}
+              >
+                Clear destination
+              </DropdownMenuItem>
+            </>
+          ) : null}
+        </DropdownMenuContent>
+      </DropdownMenu>
 
       <RemoteFolderBrowser
         open={browserOpen}
         onOpenChange={setBrowserOpen}
-        onSelect={folder => setDestinationUrl(driveFolderUrl(folder.id))}
+        onSelect={folder =>
+          setDestinationFolder(
+            driveFolderUrl(folder.id),
+            folder.name,
+            folder.path
+          )
+        }
       />
 
-      {/* Was three stacked lines - "Ready to upload", the folder ID, and an
-          "Open in Drive" link. Collapsed to one. */}
-      <div id="destination-status" aria-live="polite">
-        {destinationError ? (
-          <p className="flex items-start gap-1.5 text-xs text-status-danger">
-            <AlertCircleIcon className="mt-px size-3.5 shrink-0" />
-            <span>Not a Drive folder link</span>
-          </p>
-        ) : destinationFolderId ? (
-          <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <CheckCircle2Icon className="size-3.5 shrink-0 text-status-success" />
-            <span className="truncate font-mono text-[11px]">
-              {destinationFolderId}
-            </span>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  onClick={() => {
-                    openUrl(
-                      `https://drive.google.com/drive/folders/${destinationFolderId}`
-                    ).catch(error => {
-                      logger.warn('Failed to open destination folder', {
-                        error: String(error),
-                      })
-                    })
-                  }}
-                  className="shrink-0 rounded p-0.5 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-                  aria-label="Open destination in Google Drive"
-                >
-                  <ExternalLinkIcon className="size-3" />
-                </button>
-              </TooltipTrigger>
-              <TooltipContent side="bottom">Open in Drive</TooltipContent>
-            </Tooltip>
-          </div>
-        ) : null}
-      </div>
+      <PasteLinkDialog
+        open={pasteOpen}
+        onOpenChange={setPasteOpen}
+        initialValue={destinationUrl}
+        onConfirm={setDestinationUrl}
+      />
     </section>
+  )
+}
+
+/** Kept as a dialog so the sidebar does not carry a text field it rarely needs. */
+function PasteLinkDialog({
+  open,
+  onOpenChange,
+  initialValue,
+  onConfirm,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  initialValue: string
+  onConfirm: (url: string) => void
+}) {
+  const [value, setValue] = useState(initialValue)
+  const folderId = extractDriveFolderId(value)
+  const isInvalid = value.trim().length > 0 && !folderId
+
+  const handleOpenChange = (next: boolean) => {
+    if (next) setValue(initialValue)
+    onOpenChange(next)
+  }
+
+  const confirm = () => {
+    if (!folderId) return
+    onConfirm(value)
+    handleOpenChange(false)
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Paste a destination link</DialogTitle>
+          <DialogDescription>
+            A Drive folder link or the folder ID on its own.
+          </DialogDescription>
+        </DialogHeader>
+        <Input
+          autoFocus
+          value={value}
+          onChange={event => setValue(event.target.value)}
+          placeholder="https://drive.google.com/drive/folders/…"
+          spellCheck={false}
+          autoComplete="off"
+          aria-invalid={isInvalid}
+          aria-label="Destination folder URL"
+          onKeyDown={event => {
+            if (event.key === 'Enter') confirm()
+          }}
+        />
+        {isInvalid ? (
+          <p className="text-xs text-status-danger">Not a Drive folder link</p>
+        ) : null}
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="secondary"
+            onClick={() => handleOpenChange(false)}
+          >
+            Cancel
+          </Button>
+          <Button type="button" disabled={!folderId} onClick={confirm}>
+            Use folder
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }

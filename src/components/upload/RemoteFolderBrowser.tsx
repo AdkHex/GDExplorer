@@ -31,6 +31,18 @@ export interface RemoteFolder {
   name: string
 }
 
+/**
+ * What the dialog hands back when you confirm a folder.
+ *
+ * The browser already walks the ancestor trail to render its breadcrumb, so it
+ * passes those names out too. Without them the sidebar has only an opaque
+ * folder ID to show.
+ */
+export interface RemoteFolderSelection extends RemoteFolder {
+  /** Shared drive down to and including the chosen folder. */
+  path: string[]
+}
+
 /** A row of the contents pane: a folder to descend into, or a file for context. */
 interface RemoteEntry extends RemoteFolder {
   isDir: boolean
@@ -150,7 +162,7 @@ export function RemoteFolderBrowser({
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
-  onSelect: (folder: RemoteFolder) => void
+  onSelect: (folder: RemoteFolderSelection) => void
 }) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -173,7 +185,7 @@ function BrowserBody({
   onSelect,
 }: {
   onOpenChange: (open: boolean) => void
-  onSelect: (folder: RemoteFolder) => void
+  onSelect: (folder: RemoteFolderSelection) => void
 }) {
   const [tree, setTree] = useState<TreeState>(INITIAL_TREE)
   const [location, setLocation] = useState<Location>({ trail: [] })
@@ -327,20 +339,21 @@ function BrowserBody({
   const entries = openFolderId ? entriesById[openFolderId] : undefined
   const entriesError = openFolderId ? entriesErrorById[openFolderId] : undefined
 
-  const selectedPath = useMemo(() => {
-    if (!selected) return null
+  const selectedSegments = useMemo(() => {
+    if (!selected) return []
     const trailIds = location.trail.map(folder => folder.id)
     // A folder picked from the contents pane is one level below the trail.
     if (trailIds.includes(selected.id)) {
       return location.trail
         .slice(0, trailIds.indexOf(selected.id) + 1)
         .map(folder => folder.name)
-        .join(' / ')
     }
-    return [...location.trail.map(folder => folder.name), selected.name].join(
-      ' / '
-    )
+    return [...location.trail.map(folder => folder.name), selected.name]
   }, [location.trail, selected])
+
+  const selectedPath = selectedSegments.length
+    ? selectedSegments.join(' / ')
+    : null
 
   return (
     <>
@@ -504,7 +517,7 @@ function BrowserBody({
             disabled={!selected}
             onClick={() => {
               if (!selected) return
-              onSelect(selected)
+              onSelect({ ...selected, path: selectedSegments })
               onOpenChange(false)
             }}
           >

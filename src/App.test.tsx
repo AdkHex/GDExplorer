@@ -10,7 +10,17 @@ vi.mock('@tauri-apps/api/core', () => ({
 describe('App', () => {
   it('renders main window layout', () => {
     render(<App />)
-    expect(screen.getByLabelText(/destination folder url/i)).toBeInTheDocument()
+    // The sidebar's destination control. It used to be a permanently visible
+    // URL field; that moved into the "Paste link…" dialog, so the always-on
+    // affordance to assert against is now the destination card itself.
+    expect(screen.getByLabelText(/destination folder/i)).toBeInTheDocument()
+  })
+
+  it('starts with no destination chosen', () => {
+    render(<App />)
+    expect(screen.getByLabelText(/destination folder/i)).toHaveTextContent(
+      /choose a folder/i
+    )
   })
 
   it('renders title bar with traffic light buttons', () => {
