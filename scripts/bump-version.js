@@ -89,8 +89,10 @@ fs.writeFileSync(CARGO_TOML, bumpedToml)
 // a dirty file after the next build, and CI would commit it on the following
 // release instead of this one.
 const cargoLock = fs.readFileSync(CARGO_LOCK, 'utf8')
+// `\r?\n`, not `\n`: git checks the file out with CRLF endings on the Windows
+// runner, where this script actually runs.
 const bumpedLock = cargoLock.replace(
-  /(name = "gdexplorer"\nversion = ")[^"]*(")/,
+  /(name = "gdexplorer"\r?\nversion = ")[^"]*(")/,
   `$1${version}$2`
 )
 if (bumpedLock === cargoLock) fail(`no gdexplorer entry found in ${CARGO_LOCK}`)
