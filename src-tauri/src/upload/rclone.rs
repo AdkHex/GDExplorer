@@ -6,6 +6,7 @@ use crate::upload::scheduler::{
     wait_if_paused, JobTallies, QueueItemInput, UploadControlHandle, CANCELED,
 };
 use regex::Regex;
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -716,6 +717,142 @@ pub async fn verify_destination(
         "Destination folder is not reachable with the configured service accounts.".to_string()
     } else {
         format!("Destination folder is not reachable: {}", detail.trim())
+    })
+}
+
+/// One entry of `rclone lsjson` output. Drive fills in `ID`, which is what the
+/// shareable links are built from.
+#[derive(Debug, Deserialize)]
+struct LsJsonEntry {
+    #[serde(rename = "Path")]
+    path: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "IsDir")]
+    is_dir: bool,
+    #[serde(rename = "ID")]
+    id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveFileLink {
+    /// Path relative to the uploaded item, matching what the file rows show.
+    pub file_path: String,
+    pub file_id: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemLinks {
+    /// Set for folder items once rclone has created the folder in Drive.
+    pub folder_id: Option<String>,
+    /// Set for a single file item, or for each file inside a folder.
+    pub files: Vec<DriveFileLink>,
+}
+
+async fn run_lsjson(
+    prefs: &RclonePreferences,
+    sa_path: &Path,
+    root_folder_id: &str,
+    recursive: bool,
+) -> Result<Vec<LsJsonEntry>, String> {
+    let mut args = vec![
+        "lsjson".to_string(),
+        format!("{}:", prefs.remote_name),
+        "--drive-root-folder-id".to_string(),
+        root_folder_id.to_string(),
+        "--drive-service-account-file".to_string(),
+        sa_path.to_string_lossy().to_string(),
+    ];
+    if recursive {
+        args.push("-R".to_string());
+        args.push("--files-only".to_string());
+    } else {
+        args.push("--max-depth".to_string());
+        args.push("1".to_string());
+    }
+
+    let mut command = build_rclone_command(&prefs.rclone_path, &args);
+    let output = tokio::time::timeout(Duration::from_secs(60), command.output())
+        .await
+        .map_err(|_| "Timed out listing Drive.".to_string())?
+        .map_err(|e| format!("Failed to run rclone: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.lines().rev().take(2).collect::<Vec<_>>().join("; ");
+        return Err(if detail.trim().is_empty() {
+            "Could not list the destination folder.".to_string()
+        } else {
+            format!("Could not list the destination folder: {}", detail.trim())
+        });
+    }
+
+    serde_json::from_slice::<Vec<LsJsonEntry>>(&output.stdout)
+        .map_err(|e| format!("Could not read the Drive listing: {e}"))
+}
+
+/// Looks up the Drive IDs for an uploaded item so the UI can offer share links.
+///
+/// rclone does not report the IDs it creates, so they have to be listed back
+/// out of Drive. A folder is resolvable as soon as rclone has created it, which
+/// is why folder links can be copied mid-upload; a single file only exists once
+/// its upload finishes.
+pub async fn resolve_item_links(
+    prefs: &RclonePreferences,
+    service_account_folder: &str,
+    destination_folder_id: &str,
+    path: &str,
+    kind: &str,
+) -> Result<ItemLinks, String> {
+    let sa_files = load_service_account_files(service_account_folder)?;
+    let sa = sa_files
+        .first()
+        .ok_or("No valid service account JSON files found in the selected folder.")?;
+
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
+        .to_string();
+
+    let top = run_lsjson(prefs, &sa.path, destination_folder_id, false).await?;
+    let Some(entry) = top.into_iter().find(|entry| entry.name == name) else {
+        return Ok(ItemLinks::default());
+    };
+    let Some(id) = entry.id else {
+        return Ok(ItemLinks::default());
+    };
+
+    if kind != "folder" || !entry.is_dir {
+        return Ok(ItemLinks {
+            folder_id: None,
+            files: vec![DriveFileLink {
+                file_path: name,
+                file_id: id,
+            }],
+        });
+    }
+
+    // Scope the recursive listing to the uploaded folder rather than walking the
+    // whole destination, which may hold plenty of unrelated content.
+    let files = run_lsjson(prefs, &sa.path, &id, true)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| !entry.is_dir)
+        .filter_map(|entry| {
+            entry.id.map(|file_id| DriveFileLink {
+                file_path: entry.path,
+                file_id,
+            })
+        })
+        .collect();
+
+    Ok(ItemLinks {
+        folder_id: Some(id),
+        files,
     })
 }
 

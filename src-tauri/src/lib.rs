@@ -294,6 +294,49 @@ async fn verify_destination(app: AppHandle, args: VerifyDestinationArgs) -> Resu
         .await
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveItemLinksArgs {
+    path: String,
+    kind: String,
+    destination_folder_id: String,
+}
+
+/// Looks up Drive IDs for an uploaded item so its share links can be copied.
+/// Resolved on demand rather than tracked during upload, because rclone never
+/// reports the IDs it creates.
+#[tauri::command]
+async fn resolve_item_links(
+    app: AppHandle,
+    args: ResolveItemLinksArgs,
+) -> Result<upload::rclone::ItemLinks, String> {
+    let preferences = load_preferences(app).await?;
+    let service_account_folder = preferences
+        .service_account_folder_path
+        .clone()
+        .ok_or_else(|| "Service Account folder path is not set in Preferences.".to_string())?;
+
+    let prefs = upload::rclone::RclonePreferences {
+        rclone_path: preferences.rclone_path,
+        remote_name: preferences.rclone_remote_name,
+        drive_chunk_size_mib: preferences.upload_chunk_size_mib,
+        transfers: preferences.rclone_transfers,
+        checkers: preferences.rclone_checkers,
+        retries: preferences.rclone_retries,
+        bandwidth_limit: preferences.rclone_bandwidth_limit,
+        exclude_patterns: preferences.rclone_exclude_patterns,
+    };
+
+    upload::rclone::resolve_item_links(
+        &prefs,
+        &service_account_folder,
+        &args.destination_folder_id,
+        &args.path,
+        &args.kind,
+    )
+    .await
+}
+
 #[tauri::command]
 async fn pause_upload(state: State<'_, UploadControlState>, paused: bool) -> Result<(), String> {
     let guard = state.0.lock().await;
@@ -1094,6 +1137,7 @@ pub fn run() {
             verify_destination,
             pause_upload,
             pause_items,
+            resolve_item_links,
             cancel_upload,
             list_item_files,
             rclone_tools::install_rclone_windows,

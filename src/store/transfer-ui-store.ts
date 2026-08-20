@@ -30,8 +30,16 @@ export interface FileMetrics {
   etaSeconds: number | null
 }
 
+/** Drive IDs for an uploaded item, resolved on demand so links can be copied. */
+export interface ItemDriveLinks {
+  folderId: string | null
+  /** Keyed by the file's path relative to the item. */
+  files: Record<string, string>
+}
+
 interface TransferUiState {
   pausedById: Record<string, boolean>
+  linksById: Record<string, ItemDriveLinks>
   metricsById: Record<string, TransferMetrics>
   fileProgressById: Record<string, Record<string, FileProgress>>
   fileOrderById: Record<string, string[]>
@@ -54,6 +62,7 @@ interface TransferUiState {
     totalBytes: number
   ) => void
   recordFileList: (itemId: string, files: FileProgressByPath[]) => void
+  setItemLinks: (itemId: string, links: ItemDriveLinks) => void
   clearFileProgress: (itemIds: string[]) => void
   clearRemoved: (remainingIds: string[]) => void
 
@@ -69,6 +78,7 @@ interface TransferUiState {
 
 export const useTransferUiStore = create<TransferUiState>((set, get) => ({
   pausedById: {},
+  linksById: {},
   metricsById: {},
   fileProgressById: {},
   fileOrderById: {},
@@ -176,6 +186,9 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       }
     }),
 
+  setItemLinks: (itemId, links) =>
+    set(state => ({ linksById: { ...state.linksById, [itemId]: links } })),
+
   recordFileList: (itemId, files) =>
     set(state => {
       if (!files.length) return state
@@ -277,6 +290,7 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
     set(state => {
       const remaining = new Set(remainingIds)
       const nextPaused: Record<string, boolean> = {}
+      const nextLinks: Record<string, ItemDriveLinks> = {}
       const nextMetrics: Record<string, TransferMetrics> = {}
       const nextFileProgress: Record<string, Record<string, FileProgress>> = {}
       const nextFileOrder: Record<string, string[]> = {}
@@ -290,6 +304,9 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
 
       for (const [id, v] of Object.entries(state.pausedById)) {
         if (remaining.has(id)) nextPaused[id] = v
+      }
+      for (const [id, v] of Object.entries(state.linksById)) {
+        if (remaining.has(id)) nextLinks[id] = v
       }
       for (const [id, v] of Object.entries(state.metricsById)) {
         if (remaining.has(id)) nextMetrics[id] = v
@@ -315,6 +332,7 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
 
       return {
         pausedById: nextPaused,
+        linksById: nextLinks,
         metricsById: nextMetrics,
         fileProgressById: nextFileProgress,
         fileOrderById: nextFileOrder,

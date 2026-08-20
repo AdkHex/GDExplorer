@@ -12,6 +12,7 @@ import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { invoke } from '@tauri-apps/api/core'
 import {
+  type ColumnDef,
   flexRender,
   getCoreRowModel,
   type RowSelectionState,
@@ -53,12 +54,22 @@ import { formatBytes, formatEta, formatSpeed } from './format'
 import { cn } from '@/lib/utils'
 import { extractDriveFolderId } from '@/lib/drive-url'
 import {
+  copyText,
+  driveFileUrl,
+  driveFolderUrl,
+  resolveItemLinks,
+} from '@/lib/drive-links'
+import { useUploadDestinationStore } from '@/store/upload-destination-store'
+import { toast } from 'sonner'
+import { logger } from '@/lib/logger'
+import {
   ChevronDownIcon,
   ChevronRightIcon,
   FileIcon,
   FilePlusIcon,
   FolderIcon,
   FolderPlusIcon,
+  LinkIcon,
   Loader2Icon,
   FolderSymlinkIcon,
   MoreHorizontalIcon,
@@ -80,7 +91,7 @@ import {
  * app's 1000px minimum window width with the sidebar open.
  */
 const GRID_COLUMNS =
-  'grid grid-cols-[28px_minmax(140px,2fr)_96px_minmax(110px,1.2fr)_88px_64px_76px_60px_28px] items-center gap-x-2.5 px-3'
+  'grid grid-cols-[28px_minmax(140px,2fr)_96px_minmax(110px,1.2fr)_88px_64px_76px_60px_52px] items-center gap-x-2.5 px-3'
 
 function getPathName(path: string): string {
   const normalized = path.replace(/[/\\]+$/g, '')
@@ -177,7 +188,92 @@ export function TransferTable({
   const fileOrderById = useTransferUiStore(s => s.fileOrderById)
   const fileMetricsById = useTransferUiStore(s => s.fileMetricsById)
   const recordFileList = useTransferUiStore(s => s.recordFileList)
+  const linksById = useTransferUiStore(s => s.linksById)
+  const setItemLinks = useTransferUiStore(s => s.setItemLinks)
+  const globalDestinationId = useUploadDestinationStore(
+    s => s.destinationFolderId
+  )
   const listRequestRef = useRef<Record<string, boolean>>({})
+
+  /**
+   * Drive IDs are looked up on demand and cached, rather than tracked through
+   * the upload: rclone never reports the IDs it creates, so there is nothing to
+   * capture while a transfer runs.
+   */
+  const ensureLinks = useCallback(
+    async (row: TransferRowData) => {
+      const cached = linksById[row.id]
+      if (cached) return cached
+
+      const destination = row.destinationFolderId ?? globalDestinationId
+      if (!destination) {
+        throw new Error('This item has no destination folder yet.')
+      }
+
+      const links = await resolveItemLinks(row.path, row.kind, destination)
+      const files: Record<string, string> = {}
+      for (const entry of links.files) files[entry.filePath] = entry.fileId
+      const resolved = { folderId: links.folderId, files }
+      setItemLinks(row.id, resolved)
+      return resolved
+    },
+    [globalDestinationId, linksById, setItemLinks]
+  )
+
+  const copyItemLink = useCallback(
+    async (row: TransferRowData) => {
+      try {
+        const links = await ensureLinks(row)
+        const firstFileId = Object.values(links.files)[0]
+        const url =
+          row.kind === 'folder'
+            ? links.folderId
+              ? driveFolderUrl(links.folderId)
+              : null
+            : firstFileId
+              ? driveFileUrl(firstFileId)
+              : null
+        if (!url) {
+          toast.message('No link yet', {
+            description:
+              row.kind === 'folder'
+                ? 'The folder has not been created in Drive yet.'
+                : 'The file finishes uploading before it gets a link.',
+          })
+          return
+        }
+        await copyText(url)
+        toast.success('Link copied', { description: row.name })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        logger.warn('copy link failed', { error: message })
+        toast.error('Could not copy the link', { description: message })
+      }
+    },
+    [ensureLinks]
+  )
+
+  const copyFileLink = useCallback(
+    async (row: TransferRowData, filePath: string) => {
+      try {
+        const links = await ensureLinks(row)
+        const fileId = links.files[filePath]
+        if (!fileId) {
+          toast.message('No link yet', {
+            description: 'This file has not finished uploading.',
+          })
+          return
+        }
+        await copyText(driveFileUrl(fileId))
+        toast.success('Link copied', { description: filePath })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        logger.warn('copy file link failed', { error: message })
+        toast.error('Could not copy the link', { description: message })
+      }
+    },
+    [ensureLinks]
+  )
 
   const rows = useMemo((): TransferRowData[] => {
     return items.map(item => {
@@ -291,6 +387,12 @@ export function TransferTable({
   const hasCompleted = items.some(i => i.status === 'done')
 
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({})
+  // Read through a ref inside cell renderers: keeping `rowSelection` out of the
+  // column deps means changing the selection does not remount every cell.
+  const rowSelectionRef = useRef(rowSelection)
+  useEffect(() => {
+    rowSelectionRef.current = rowSelection
+  }, [rowSelection])
   const lastIndexRef = useRef<number | null>(null)
   const [focusedIndex, setFocusedIndex] = useState(0)
   const rowRefs = useRef<Record<string, HTMLDivElement | null>>({})
@@ -358,9 +460,65 @@ export function TransferTable({
     [expandedById, fileOrderById, recordFileList]
   )
 
-  const table = useReactTable({
-    data: rows,
-    columns: [
+  /**
+   * Copies every resolvable link for the chosen rows, one per line: the folder
+   * link for a folder, then a line per file inside it.
+   */
+  const copyAllLinks = useCallback(
+    async (targets: TransferRowData[]) => {
+      if (targets.length === 0) return
+      const lines: string[] = []
+      const failures: string[] = []
+
+      for (const row of targets) {
+        try {
+          const links = await ensureLinks(row)
+          if (links.folderId) {
+            lines.push(`${row.name}\t${driveFolderUrl(links.folderId)}`)
+          }
+          for (const [filePath, fileId] of Object.entries(links.files)) {
+            const label =
+              row.kind === 'folder' ? `${row.name}/${filePath}` : row.name
+            lines.push(`${label}\t${driveFileUrl(fileId)}`)
+          }
+        } catch (error) {
+          failures.push(row.name)
+          logger.warn('copy all links: item failed', {
+            item: row.name,
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
+      }
+
+      if (lines.length === 0) {
+        toast.message('No links yet', {
+          description: 'Nothing in the selection has reached Drive.',
+        })
+        return
+      }
+
+      await copyText(lines.join('\n'))
+      toast.success(
+        `Copied ${lines.length} link${lines.length === 1 ? '' : 's'}`,
+        {
+          description:
+            failures.length > 0
+              ? `${failures.length} item(s) could not be resolved.`
+              : undefined,
+        }
+      )
+    },
+    [ensureLinks]
+  )
+
+  // `flexRender` turns each `cell` function into a component, so React compares
+  // them by identity. Rebuilding this array on every render handed React a new
+  // component type each time and it unmounted and remounted every cell. During
+  // an upload the table re-renders on each progress event, which tore the
+  // destination menu down milliseconds after it opened. Keeping the identity
+  // stable keeps open menus alive.
+  const columns = useMemo<ColumnDef<TransferRowData>[]>(
+    () => [
       {
         id: 'select',
         header: ({ table }: { table: Table<TransferRowData> }) => (
@@ -457,14 +615,16 @@ export function TransferTable({
               // Changing the destination of a row that is part of the current
               // selection applies to the whole selection, which is what you
               // want after selecting five folders that share a target.
+              const selected = rowSelectionRef.current
               const ids = row.getIsSelected()
-                ? Object.keys(rowSelection).filter(id => rowSelection[id])
+                ? Object.keys(selected).filter(id => selected[id])
                 : [row.original.id]
               setItemsDestination(ids, folderId, label)
             }}
             onPickCustom={() => {
+              const selected = rowSelectionRef.current
               const ids = row.getIsSelected()
-                ? Object.keys(rowSelection).filter(id => rowSelection[id])
+                ? Object.keys(selected).filter(id => selected[id])
                 : [row.original.id]
               setCustomDestinationTargets(ids)
             }}
@@ -520,33 +680,62 @@ export function TransferTable({
         cell: ({ row }) => {
           const item = row.original
           const removable = isRemovable(item.status)
-          if (!removable) return null
+          // A folder exists in Drive as soon as rclone starts writing into it,
+          // so its link is available mid-upload. A single file only gets one
+          // once it has finished.
+          const canCopyLink =
+            item.kind === 'folder'
+              ? item.status === 'uploading' ||
+                item.status === 'paused' ||
+                item.status === 'done'
+              : item.status === 'done'
           return (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  onClick={event => {
-                    event.stopPropagation()
-                    onRemoveSelected([item.id])
-                  }}
-                  className={cn(
-                    'flex size-5 items-center justify-center rounded text-muted-foreground transition-colors',
-                    'hover:bg-accent hover:text-foreground',
-                    'opacity-0 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
-                    'group-hover:opacity-100 group-focus-within:opacity-100'
-                  )}
-                  aria-label={`Remove ${item.name} from the queue`}
-                >
-                  <XIcon className="size-3.5" />
-                </button>
-              </TooltipTrigger>
-              <TooltipContent side="left">Remove from queue</TooltipContent>
-            </Tooltip>
+            <div className="flex items-center gap-0.5">
+              {canCopyLink ? (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      onClick={event => {
+                        event.stopPropagation()
+                        void copyItemLink(item)
+                      }}
+                      className={cn(
+                        'flex size-5 items-center justify-center rounded text-muted-foreground transition-colors',
+                        'hover:bg-accent hover:text-foreground',
+                        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50'
+                      )}
+                      aria-label={`Copy Drive link for ${item.name}`}
+                    >
+                      <LinkIcon className="size-3.5" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="left">Copy Drive link</TooltipContent>
+                </Tooltip>
+              ) : (
+                <span className="size-5" aria-hidden="true" />
+              )}
+              {removable ? (
+                <RemoveButton item={item} onRemove={onRemoveSelected} />
+              ) : null}
+            </div>
           )
         },
       },
     ],
+    [
+      expandedById,
+      toggleExpanded,
+      destinationPresets,
+      setItemsDestination,
+      copyItemLink,
+      onRemoveSelected,
+    ]
+  )
+
+  const table = useReactTable({
+    data: rows,
+    columns,
     state: { rowSelection },
     getRowId: row => row.id,
     onRowSelectionChange: setRowSelection,
@@ -801,6 +990,20 @@ export function TransferTable({
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
               <DropdownMenuItem
+                disabled={!hasAny}
+                onSelect={() => {
+                  const targets =
+                    selectedIds.length > 0
+                      ? rows.filter(r => selectedIds.includes(r.id))
+                      : rows
+                  void copyAllLinks(targets)
+                }}
+              >
+                <LinkIcon />
+                Copy all links
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
                 disabled={removableSelected.length === 0}
                 onSelect={() =>
                   onRemoveSelected(removableSelected.map(r => r.id))
@@ -968,6 +1171,12 @@ export function TransferTable({
                               parentState={item.progressState}
                               progress={fileProgress[filePath]}
                               metrics={fileMetrics[filePath]}
+                              onCopyLink={() =>
+                                void copyFileLink(
+                                  item,
+                                  displayFilePath(item.path, filePath)
+                                )
+                              }
                             />
                           ))
                         ) : (
@@ -1019,11 +1228,13 @@ function FileRow({
   parentState,
   progress,
   metrics,
+  onCopyLink,
 }: {
   name: string
   parentState: TransferState
   progress?: { bytesSent: number; totalBytes: number }
   metrics?: { speedBytesPerSec: number; etaSeconds: number | null }
+  onCopyLink: () => void
 }) {
   const total =
     typeof progress?.totalBytes === 'number' ? progress.totalBytes : 0
@@ -1100,7 +1311,31 @@ function FileRow({
       >
         {isActive ? formatEta(metrics?.etaSeconds ?? null) : '—'}
       </div>
-      <div role="gridcell" aria-hidden="true" />
+      <div role="gridcell">
+        {/* A file inside a folder only has a Drive link once it has finished. */}
+        {progressState === 'completed' ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={event => {
+                  event.stopPropagation()
+                  onCopyLink()
+                }}
+                className={cn(
+                  'flex size-5 items-center justify-center rounded text-muted-foreground transition-colors',
+                  'hover:bg-accent hover:text-foreground',
+                  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50'
+                )}
+                aria-label={`Copy Drive link for ${name}`}
+              >
+                <LinkIcon className="size-3" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="left">Copy file link</TooltipContent>
+          </Tooltip>
+        ) : null}
+      </div>
     </div>
   )
 }
@@ -1252,6 +1487,38 @@ function CustomDestinationDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  )
+}
+
+function RemoveButton({
+  item,
+  onRemove,
+}: {
+  item: TransferRowData
+  onRemove: (itemIds: string[]) => void
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          onClick={event => {
+            event.stopPropagation()
+            onRemove([item.id])
+          }}
+          className={cn(
+            'flex size-5 items-center justify-center rounded text-muted-foreground transition-colors',
+            'hover:bg-accent hover:text-foreground',
+            'opacity-0 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
+            'group-hover:opacity-100 group-focus-within:opacity-100'
+          )}
+          aria-label={`Remove ${item.name} from the queue`}
+        >
+          <XIcon className="size-3.5" />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="left">Remove from queue</TooltipContent>
+    </Tooltip>
   )
 }
 
