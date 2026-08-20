@@ -355,6 +355,21 @@ async fn list_remote_folders(
     upload::rclone::list_remote_folders(&prefs, &service_account_folder, folder_id).await
 }
 
+/// Contents of one Drive folder - folders and files - for the browser's
+/// right-hand pane.
+#[tauri::command]
+async fn list_remote_entries(
+    app: AppHandle,
+    args: ListRemoteFoldersArgs,
+) -> Result<Vec<upload::rclone::RemoteEntry>, String> {
+    let folder_id = args.folder_id.trim();
+    if folder_id.is_empty() {
+        return Err("No folder to list.".to_string());
+    }
+    let (prefs, service_account_folder) = rclone_context(app).await?;
+    upload::rclone::list_remote_entries(&prefs, &service_account_folder, folder_id).await
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SearchRemoteFoldersArgs {
@@ -1359,6 +1374,7 @@ pub fn run() {
             verify_destination,
             list_shared_drives,
             list_remote_folders,
+            list_remote_entries,
             search_remote_folders,
             run_preflight,
             pause_upload,

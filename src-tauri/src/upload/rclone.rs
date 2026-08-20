@@ -870,6 +870,10 @@ struct LsJsonEntry {
     is_dir: bool,
     #[serde(rename = "ID")]
     id: Option<String>,
+    #[serde(rename = "Size")]
+    size: Option<i64>,
+    #[serde(rename = "ModTime")]
+    mod_time: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1079,6 +1083,67 @@ pub async fn list_shared_drives(
             name: drive.name,
         })
         .collect())
+}
+
+/// One row of the browser's contents pane.
+///
+/// Files are carried alongside folders so the pane can show what is actually in
+/// a folder. Only folders are selectable as a destination; the files are there
+/// to confirm you are in the right place.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteEntry {
+    pub id: String,
+    pub name: String,
+    pub is_dir: bool,
+    /// Bytes. None for a folder - Drive does not report a folder's size without
+    /// walking everything inside it, which is far too expensive here.
+    pub size: Option<u64>,
+    /// RFC 3339, straight from rclone.
+    pub modified_at: Option<String>,
+}
+
+/// Everything inside one Drive folder: folders first, then files, each group
+/// by name.
+///
+/// Kept separate from `list_remote_folders` on purpose. The tree only ever
+/// needs folders, and asking Drive for a full listing there would make
+/// expanding a folder full of files needlessly slow.
+pub async fn list_remote_entries(
+    prefs: &RclonePreferences,
+    service_account_folder: &str,
+    folder_id: &str,
+) -> Result<Vec<RemoteEntry>, String> {
+    let sa_files = load_service_account_files(service_account_folder)?;
+    let sa = sa_files
+        .first()
+        .ok_or("No valid service account JSON files found in the selected folder.")?;
+
+    let mut entries: Vec<RemoteEntry> = run_lsjson(prefs, &sa.path, folder_id, LsMode::TopLevel)
+        .await?
+        .into_iter()
+        .filter_map(|entry| {
+            let id = entry.id?;
+            Some(RemoteEntry {
+                id,
+                name: entry.name,
+                is_dir: entry.is_dir,
+                size: if entry.is_dir {
+                    None
+                } else {
+                    entry.size.and_then(|size| u64::try_from(size).ok())
+                },
+                modified_at: entry.mod_time,
+            })
+        })
+        .collect();
+
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(entries)
 }
 
 /// Subfolders of a Drive folder, so the browser can descend one level at a

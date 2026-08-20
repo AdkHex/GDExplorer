@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import {
   AlertCircleIcon,
   ChevronDownIcon,
   ChevronRightIcon,
+  FileIcon,
   FolderIcon,
   HardDriveIcon,
   Loader2Icon,
@@ -21,6 +22,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { formatBytes } from '@/components/transfers/format'
 import { logger } from '@/lib/logger'
 import { cn } from '@/lib/utils'
 
@@ -29,32 +31,15 @@ export interface RemoteFolder {
   name: string
 }
 
+/** A row of the contents pane: a folder to descend into, or a file for context. */
+interface RemoteEntry extends RemoteFolder {
+  isDir: boolean
+  size: number | null
+  modifiedAt: string | null
+}
+
 /** Shared drives are the roots; everything else hangs off one of them. */
 const ROOT_KEY = '__roots__'
-
-interface BrowserState {
-  childrenById: Record<string, RemoteFolder[]>
-  loadingById: Record<string, boolean>
-  errorById: Record<string, string>
-  expandedById: Record<string, boolean>
-}
-
-/** Roots are already being fetched by the time the first render happens. */
-const INITIAL_STATE: BrowserState = {
-  childrenById: {},
-  loadingById: { [ROOT_KEY]: true },
-  errorById: {},
-  expandedById: {},
-}
-
-/** One level of the tree. Kept free of state so effects can call it directly. */
-function fetchFolders(parentId: string): Promise<RemoteFolder[]> {
-  return parentId === ROOT_KEY
-    ? invoke<RemoteFolder[]>('list_shared_drives')
-    : invoke<RemoteFolder[]>('list_remote_folders', {
-        args: { folderId: parentId },
-      })
-}
 
 /** Short searches match half a drive, so they are not worth a round trip. */
 const MIN_SEARCH_LENGTH = 2
@@ -65,6 +50,26 @@ const SEARCH_DEBOUNCE_MS = 400
 /** Matches the backend cap, so the UI can say when it was hit. */
 const MAX_SEARCH_RESULTS = 200
 
+interface TreeState {
+  childrenById: Record<string, RemoteFolder[]>
+  loadingById: Record<string, boolean>
+  errorById: Record<string, string>
+  expandedById: Record<string, boolean>
+}
+
+const INITIAL_TREE: TreeState = {
+  childrenById: {},
+  loadingById: { [ROOT_KEY]: true },
+  errorById: {},
+  expandedById: {},
+}
+
+/** Where the contents pane is pointed, and how it got there. */
+interface Location {
+  /** Root drive down to the open folder. Empty while nothing is open. */
+  trail: RemoteFolder[]
+}
+
 interface SearchGroup {
   drive: RemoteFolder
   folders: RemoteFolder[]
@@ -74,6 +79,20 @@ interface SearchGroup {
 interface SearchResult {
   query: string
   groups: SearchGroup[]
+}
+
+function fetchFolders(parentId: string): Promise<RemoteFolder[]> {
+  return parentId === ROOT_KEY
+    ? invoke<RemoteFolder[]>('list_shared_drives')
+    : invoke<RemoteFolder[]>('list_remote_folders', {
+        args: { folderId: parentId },
+      })
+}
+
+function fetchEntries(folderId: string): Promise<RemoteEntry[]> {
+  return invoke<RemoteEntry[]>('list_remote_entries', {
+    args: { folderId },
+  })
 }
 
 /**
@@ -106,10 +125,22 @@ async function searchAllDrives(
   )
 }
 
+function formatModified(value: string | null): string {
+  if (!value) return '—'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '—'
+  return date.toLocaleDateString(undefined, {
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+  })
+}
+
 /**
- * Picks a Drive destination from a tree instead of a pasted URL.
+ * Picks a Drive destination: a tree of drives on the left, the contents of
+ * whatever is selected on the right.
  *
- * Levels load on demand: Drive costs a round trip per folder, so walking a
+ * Levels load on demand. Drive costs a round trip per folder, so walking a
  * whole shared drive up front would make the dialog unusable on any real drive.
  */
 export function RemoteFolderBrowser({
@@ -123,36 +154,43 @@ export function RemoteFolderBrowser({
 }) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="flex h-[min(88vh,640px)] flex-col gap-3 sm:max-w-[min(94vw,1000px)]">
         {/* The body is unmounted while the dialog is closed, so the tree and
             the selection start fresh on every open without an effect that
             resets them. Reloading each time is deliberate too: folders get
             created between uploads, and a stale tree that quietly misses one
             is worse than a short wait. */}
         {open ? (
-          <FolderTree onOpenChange={onOpenChange} onSelect={onSelect} />
+          <BrowserBody onOpenChange={onOpenChange} onSelect={onSelect} />
         ) : null}
       </DialogContent>
     </Dialog>
   )
 }
 
-function FolderTree({
+function BrowserBody({
   onOpenChange,
   onSelect,
 }: {
   onOpenChange: (open: boolean) => void
   onSelect: (folder: RemoteFolder) => void
 }) {
-  const [state, setState] = useState<BrowserState>(INITIAL_STATE)
+  const [tree, setTree] = useState<TreeState>(INITIAL_TREE)
+  const [location, setLocation] = useState<Location>({ trail: [] })
   const [selected, setSelected] = useState<RemoteFolder | null>(null)
   const [query, setQuery] = useState('')
   const [debouncedQuery, setDebouncedQuery] = useState('')
   const [searchResult, setSearchResult] = useState<SearchResult | null>(null)
+  const [entriesById, setEntriesById] = useState<Record<string, RemoteEntry[]>>(
+    {}
+  )
+  const [entriesErrorById, setEntriesErrorById] = useState<
+    Record<string, string>
+  >({})
 
   const applyFolders = useCallback(
     (parentId: string, folders: RemoteFolder[]) =>
-      setState(current => ({
+      setTree(current => ({
         ...current,
         childrenById: { ...current.childrenById, [parentId]: folders },
         loadingById: omitKey(current.loadingById, parentId),
@@ -164,14 +202,14 @@ function FolderTree({
   const applyError = useCallback((parentId: string, error: unknown) => {
     const message = error instanceof Error ? error.message : String(error)
     logger.warn('Failed to list Drive folders', { parentId, error: message })
-    setState(current => ({
+    setTree(current => ({
       ...current,
       loadingById: omitKey(current.loadingById, parentId),
       errorById: { ...current.errorById, [parentId]: message },
     }))
   }, [])
 
-  // The roots start loading with the dialog. `INITIAL_STATE` already says so,
+  // The roots start loading with the dialog. `INITIAL_TREE` already says so,
   // so nothing has to be set before the request settles.
   useEffect(() => {
     let cancelled = false
@@ -187,7 +225,7 @@ function FolderTree({
     }
   }, [applyFolders, applyError])
 
-  const load = useCallback(
+  const loadFolders = useCallback(
     (parentId: string) => {
       fetchFolders(parentId)
         .then(folders => applyFolders(parentId, folders))
@@ -196,38 +234,62 @@ function FolderTree({
     [applyFolders, applyError]
   )
 
-  /** Marks a node as loading and fetches it. For event handlers only. */
-  const reload = useCallback(
-    (parentId: string) => {
-      setState(current => ({
-        ...current,
-        loadingById: { ...current.loadingById, [parentId]: true },
-        errorById: omitKey(current.errorById, parentId),
-      }))
-      load(parentId)
+  /**
+   * Loads a folder's contents for the right-hand pane.
+   *
+   * Cached per folder for the life of the dialog: clicking back up a trail you
+   * have already walked should not re-ask Drive for the same listing.
+   */
+  const loadEntries = useCallback((folderId: string) => {
+    fetchEntries(folderId)
+      .then(entries =>
+        setEntriesById(current => ({ ...current, [folderId]: entries }))
+      )
+      .catch(error => {
+        const message = error instanceof Error ? error.message : String(error)
+        logger.warn('Failed to list Drive contents', {
+          folderId,
+          error: message,
+        })
+        setEntriesErrorById(current => ({ ...current, [folderId]: message }))
+      })
+  }, [])
+
+  /** Points the contents pane at a folder, loading it if it is new. */
+  const openFolder = useCallback(
+    (trail: RemoteFolder[]) => {
+      const folder = trail[trail.length - 1]
+      if (!folder) return
+      setLocation({ trail })
+      setSelected(folder)
+      setEntriesErrorById(current => omitKey(current, folder.id))
+      setEntriesById(current => {
+        if (!current[folder.id]) loadEntries(folder.id)
+        return current
+      })
     },
-    [load]
+    [loadEntries]
   )
 
-  const toggle = useCallback(
+  const toggleExpanded = useCallback(
     (folder: RemoteFolder) => {
-      const isExpanded = Boolean(state.expandedById[folder.id])
-      const needsFetch = !isExpanded && !state.childrenById[folder.id]
-      setState(current => ({
+      const isExpanded = Boolean(tree.expandedById[folder.id])
+      const needsFetch = !isExpanded && !tree.childrenById[folder.id]
+      setTree(current => ({
         ...current,
         expandedById: { ...current.expandedById, [folder.id]: !isExpanded },
         loadingById: needsFetch
           ? { ...current.loadingById, [folder.id]: true }
           : current.loadingById,
       }))
-      if (needsFetch) load(folder.id)
+      if (needsFetch) loadFolders(folder.id)
     },
-    [load, state.childrenById, state.expandedById]
+    [loadFolders, tree.childrenById, tree.expandedById]
   )
 
-  const roots = state.childrenById[ROOT_KEY]
-  const rootError = state.errorById[ROOT_KEY]
-  const isLoadingRoots = Boolean(state.loadingById[ROOT_KEY])
+  const roots = tree.childrenById[ROOT_KEY]
+  const rootError = tree.errorById[ROOT_KEY]
+  const isLoadingRoots = Boolean(tree.loadingById[ROOT_KEY])
 
   const trimmedQuery = query.trim()
   const isSearchActive = trimmedQuery.length >= MIN_SEARCH_LENGTH
@@ -261,56 +323,89 @@ function FolderTree({
     }
   }, [debouncedQuery, roots])
 
+  const openFolderId = location.trail[location.trail.length - 1]?.id ?? null
+  const entries = openFolderId ? entriesById[openFolderId] : undefined
+  const entriesError = openFolderId ? entriesErrorById[openFolderId] : undefined
+
+  const selectedPath = useMemo(() => {
+    if (!selected) return null
+    const trailIds = location.trail.map(folder => folder.id)
+    // A folder picked from the contents pane is one level below the trail.
+    if (trailIds.includes(selected.id)) {
+      return location.trail
+        .slice(0, trailIds.indexOf(selected.id) + 1)
+        .map(folder => folder.name)
+        .join(' / ')
+    }
+    return [...location.trail.map(folder => folder.name), selected.name].join(
+      ' / '
+    )
+  }, [location.trail, selected])
+
   return (
     <>
-      <DialogHeader>
+      <DialogHeader className="pr-8">
         <DialogTitle>Choose a destination folder</DialogTitle>
         <DialogDescription>
-          Shared drives your service accounts can reach. Expand one to pick a
-          folder inside it, or search every drive by name.
+          Shared drives your service accounts can reach. Pick a folder on either
+          side, or search every drive by name.
         </DialogDescription>
       </DialogHeader>
 
-      <div className="relative">
-        <SearchIcon className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-        <Input
-          value={query}
-          onChange={event => setQuery(event.target.value)}
-          placeholder="Search folders in all drives…"
-          spellCheck={false}
-          autoComplete="off"
-          aria-label="Search folders by name"
-          disabled={!roots || roots.length === 0}
-          className="px-8"
-        />
-        {query ? (
-          <button
-            type="button"
-            onClick={() => setQuery('')}
-            aria-label="Clear the search"
-            className="absolute right-2 top-1/2 flex size-5 -translate-y-1/2 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-          >
-            <XIcon className="size-3.5" />
-          </button>
-        ) : null}
+      <div className="flex items-center gap-2">
+        <Breadcrumb trail={location.trail} onNavigate={openFolder} />
+
+        <div className="relative w-64 shrink-0">
+          <SearchIcon className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            value={query}
+            onChange={event => setQuery(event.target.value)}
+            placeholder="Search folders in all drives…"
+            spellCheck={false}
+            autoComplete="off"
+            aria-label="Search folders by name"
+            disabled={!roots || roots.length === 0}
+            className="h-9 px-8"
+          />
+          {query ? (
+            <button
+              type="button"
+              onClick={() => setQuery('')}
+              aria-label="Clear the search"
+              className="absolute right-2 top-1/2 flex size-5 -translate-y-1/2 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            >
+              <XIcon className="size-3.5" />
+            </button>
+          ) : null}
+        </div>
+
+        <Button
+          type="button"
+          variant="outline"
+          size="icon"
+          className="size-9 shrink-0"
+          aria-label="Reload"
+          onClick={() => {
+            if (openFolderId) {
+              setEntriesById(current => omitKey(current, openFolderId))
+              setEntriesErrorById(current => omitKey(current, openFolderId))
+              loadEntries(openFolderId)
+            }
+            setTree(current => ({
+              ...current,
+              loadingById: { ...current.loadingById, [ROOT_KEY]: true },
+              errorById: omitKey(current.errorById, ROOT_KEY),
+            }))
+            loadFolders(ROOT_KEY)
+          }}
+        >
+          <RefreshCwIcon />
+        </Button>
       </div>
 
-      {isSearchActive ? (
+      <div className="grid min-h-0 flex-1 grid-cols-[280px_1fr] overflow-hidden rounded-lg border bg-card">
         <div
-          className="h-72 overflow-auto rounded-md border bg-card p-1"
-          aria-label="Search results"
-          aria-busy={isSearching}
-        >
-          <SearchResults
-            isSearching={isSearching}
-            result={searchResult}
-            selectedId={selected?.id ?? null}
-            onSelect={setSelected}
-          />
-        </div>
-      ) : (
-        <div
-          className="h-72 overflow-auto rounded-md border bg-card p-1"
+          className="overflow-auto border-r py-1"
           role="tree"
           aria-label="Drive folders"
         >
@@ -325,12 +420,21 @@ function FolderTree({
                 <AlertCircleIcon className="size-4 shrink-0" />
                 Could not list shared drives
               </p>
-              <p className="text-xs text-muted-foreground">{rootError}</p>
+              <p className="text-xs break-words text-muted-foreground">
+                {rootError}
+              </p>
               <Button
                 type="button"
                 variant="secondary"
                 size="sm"
-                onClick={() => reload(ROOT_KEY)}
+                onClick={() => {
+                  setTree(current => ({
+                    ...current,
+                    loadingById: { ...current.loadingById, [ROOT_KEY]: true },
+                    errorById: omitKey(current.errorById, ROOT_KEY),
+                  }))
+                  loadFolders(ROOT_KEY)
+                }}
               >
                 <RefreshCwIcon />
                 Try again
@@ -343,25 +447,49 @@ function FolderTree({
             </p>
           ) : (
             (roots ?? []).map(root => (
-              <FolderNode
+              <TreeNode
                 key={root.id}
                 folder={root}
+                trail={[root]}
                 depth={0}
                 isDrive
-                state={state}
+                tree={tree}
                 selectedId={selected?.id ?? null}
-                onToggle={toggle}
-                onSelect={setSelected}
-                onRetry={reload}
+                onToggle={toggleExpanded}
+                onOpen={openFolder}
               />
             ))
           )}
         </div>
-      )}
+
+        {isSearchActive ? (
+          <SearchResults
+            isSearching={isSearching}
+            result={searchResult}
+            selectedId={selected?.id ?? null}
+            onSelect={setSelected}
+          />
+        ) : (
+          <ContentsPane
+            hasLocation={Boolean(openFolderId)}
+            entries={entries}
+            error={entriesError}
+            selectedId={selected?.id ?? null}
+            onSelect={setSelected}
+            onOpen={folder => openFolder([...location.trail, folder])}
+          />
+        )}
+      </div>
 
       <DialogFooter className="sm:items-center sm:justify-between">
         <p className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
-          {selected ? `Selected: ${selected.name}` : 'Nothing selected yet'}
+          {selectedPath ? (
+            <>
+              Selected <span className="text-foreground">{selectedPath}</span>
+            </>
+          ) : (
+            'Nothing selected yet'
+          )}
         </p>
         <div className="flex items-center gap-2">
           <Button
@@ -388,12 +516,165 @@ function FolderTree({
   )
 }
 
+/** Path to the open folder, each segment clickable to jump back up. */
+function Breadcrumb({
+  trail,
+  onNavigate,
+}: {
+  trail: RemoteFolder[]
+  onNavigate: (trail: RemoteFolder[]) => void
+}) {
+  return (
+    <div className="flex h-9 min-w-0 flex-1 items-center gap-0.5 overflow-hidden rounded-md border border-input bg-transparent px-2 text-sm">
+      {trail.length === 0 ? (
+        <span className="truncate px-1 text-muted-foreground">
+          Pick a drive to start
+        </span>
+      ) : (
+        trail.map((folder, index) => (
+          <span key={folder.id} className="flex min-w-0 items-center gap-0.5">
+            {index > 0 ? (
+              <ChevronRightIcon className="size-3 shrink-0 text-muted-foreground/60" />
+            ) : null}
+            <button
+              type="button"
+              onClick={() => onNavigate(trail.slice(0, index + 1))}
+              className={cn(
+                'truncate rounded px-1.5 py-0.5 transition-colors hover:bg-accent',
+                'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
+                index === trail.length - 1
+                  ? 'font-medium text-foreground'
+                  : 'text-muted-foreground'
+              )}
+            >
+              {folder.name}
+            </button>
+          </span>
+        ))
+      )}
+    </div>
+  )
+}
+
+/** Right-hand pane: what is inside the open folder. */
+function ContentsPane({
+  hasLocation,
+  entries,
+  error,
+  selectedId,
+  onSelect,
+  onOpen,
+}: {
+  hasLocation: boolean
+  entries: RemoteEntry[] | undefined
+  error: string | undefined
+  selectedId: string | null
+  onSelect: (folder: RemoteFolder) => void
+  onOpen: (folder: RemoteFolder) => void
+}) {
+  if (!hasLocation) {
+    return (
+      <p className="flex items-center justify-center px-6 text-center text-sm text-muted-foreground">
+        Choose a drive on the left to see what is inside it.
+      </p>
+    )
+  }
+
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-2 px-6 text-center">
+        <p className="flex items-center gap-1.5 text-sm text-status-danger">
+          <AlertCircleIcon className="size-4 shrink-0" />
+          Could not open this folder
+        </p>
+        <p className="text-xs break-words text-muted-foreground">{error}</p>
+      </div>
+    )
+  }
+
+  if (!entries) {
+    return (
+      <p className="flex items-center justify-center gap-2 text-sm text-muted-foreground">
+        <Loader2Icon className="size-4 animate-spin" />
+        Loading…
+      </p>
+    )
+  }
+
+  if (entries.length === 0) {
+    return (
+      <p className="flex items-center justify-center px-6 text-center text-sm text-muted-foreground">
+        This folder is empty. You can still upload into it.
+      </p>
+    )
+  }
+
+  return (
+    <div className="flex min-w-0 flex-col">
+      <div className="grid h-8 shrink-0 grid-cols-[1fr_96px_120px] items-center gap-3 border-b bg-muted/30 px-3 text-[11px] font-medium text-muted-foreground">
+        <div>Name</div>
+        <div>Size</div>
+        <div>Modified</div>
+      </div>
+      <div className="min-h-0 flex-1 overflow-auto">
+        {entries.map(entry => {
+          const isSelected = entry.isDir && selectedId === entry.id
+          return (
+            <div
+              key={entry.id}
+              role={entry.isDir ? 'button' : undefined}
+              tabIndex={entry.isDir ? 0 : undefined}
+              onClick={entry.isDir ? () => onSelect(entry) : undefined}
+              onDoubleClick={entry.isDir ? () => onOpen(entry) : undefined}
+              onKeyDown={
+                entry.isDir
+                  ? event => {
+                      if (event.key === 'Enter') onOpen(entry)
+                      if (event.key === ' ') {
+                        event.preventDefault()
+                        onSelect(entry)
+                      }
+                    }
+                  : undefined
+              }
+              className={cn(
+                'grid h-9 grid-cols-[1fr_96px_120px] items-center gap-3 border-b border-border/40 px-3 text-sm',
+                'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/50',
+                entry.isDir
+                  ? 'cursor-pointer'
+                  : // Files are context only: they show you are in the right
+                    // folder, but an upload destination is always a folder.
+                    'text-muted-foreground/60',
+                isSelected
+                  ? 'bg-status-info/10'
+                  : entry.isDir && 'hover:bg-accent/60'
+              )}
+            >
+              <div className="flex min-w-0 items-center gap-2">
+                {entry.isDir ? (
+                  <FolderIcon className="size-4 shrink-0 text-muted-foreground" />
+                ) : (
+                  <FileIcon className="size-4 shrink-0" />
+                )}
+                <span className="truncate">{entry.name}</span>
+              </div>
+              <div className="truncate text-xs tabular-nums text-muted-foreground">
+                {entry.size === null ? '—' : formatBytes(entry.size)}
+              </div>
+              <div className="truncate text-xs tabular-nums text-muted-foreground">
+                {formatModified(entry.modifiedAt)}
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 /**
- * Flat list of matches, grouped by the drive they were found in.
- *
- * A match has no path shown: Drive returns parent IDs, not names, and turning
- * each one into a readable path would cost a call per result. The drive it
- * lives in is the context that fits in one line.
+ * Search takes over the right-hand pane while the tree stays put, so a search
+ * does not cost you the place you had navigated to.
  */
 function SearchResults({
   isSearching,
@@ -408,7 +689,7 @@ function SearchResults({
 }) {
   if (isSearching && !result) {
     return (
-      <p className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
+      <p className="flex items-center justify-center gap-2 text-sm text-muted-foreground">
         <Loader2Icon className="size-4 animate-spin" />
         Searching every drive…
       </p>
@@ -417,15 +698,14 @@ function SearchResults({
 
   if (!result) return null
 
-  const matchCount = result.groups.reduce(
-    (total, group) => total + group.folders.length,
-    0
+  const matches = result.groups.flatMap(group =>
+    group.folders.map(folder => ({ folder, group }))
   )
   const failures = result.groups.filter(group => group.error)
 
-  if (matchCount === 0 && failures.length === 0) {
+  if (matches.length === 0 && failures.length === 0) {
     return (
-      <p className="px-6 py-8 text-center text-xs text-muted-foreground">
+      <p className="flex items-center justify-center px-8 text-center text-xs text-muted-foreground">
         No folders match “{result.query}”. Drive matches from the start of a
         word, so try the beginning of the name.
       </p>
@@ -433,76 +713,84 @@ function SearchResults({
   }
 
   return (
-    <div className={cn(isSearching && 'opacity-60')}>
-      {result.groups.map(group =>
-        group.folders.length === 0 && !group.error ? null : (
-          <div key={group.drive.id} className="pb-1">
-            <div className="flex items-center gap-1.5 px-2 py-1 text-xs text-muted-foreground">
-              <HardDriveIcon className="size-3.5 shrink-0" />
-              <span className="truncate">{group.drive.name}</span>
+    <div className={cn('flex min-w-0 flex-col', isSearching && 'opacity-60')}>
+      <div className="grid h-8 shrink-0 grid-cols-[1fr_200px] items-center gap-3 border-b bg-muted/30 px-3 text-[11px] font-medium text-muted-foreground">
+        <div>
+          {matches.length} match{matches.length === 1 ? '' : 'es'} for “
+          {result.query}”
+        </div>
+        <div>In drive</div>
+      </div>
+      <div className="min-h-0 flex-1 overflow-auto">
+        {failures.map(group => (
+          <p
+            key={group.drive.id}
+            className="flex items-start gap-1.5 border-b border-border/40 px-3 py-1.5 text-xs text-status-danger"
+          >
+            <AlertCircleIcon className="mt-0.5 size-3.5 shrink-0" />
+            <span className="break-words">
+              {group.drive.name}: {group.error}
+            </span>
+          </p>
+        ))}
+        {matches.map(({ folder, group }) => (
+          <button
+            key={`${group.drive.id}:${folder.id}`}
+            type="button"
+            onClick={() => onSelect(folder)}
+            className={cn(
+              'grid h-9 w-full grid-cols-[1fr_200px] items-center gap-3 border-b border-border/40 px-3 text-left text-sm',
+              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/50',
+              selectedId === folder.id
+                ? 'bg-status-info/10'
+                : 'hover:bg-accent/60'
+            )}
+          >
+            <div className="flex min-w-0 items-center gap-2">
+              <FolderIcon className="size-4 shrink-0 text-muted-foreground" />
+              <span className="truncate">{folder.name}</span>
             </div>
-
-            {group.error ? (
-              <p className="flex items-start gap-1.5 px-2 pb-1 pl-7 text-xs text-status-danger">
-                <AlertCircleIcon className="mt-0.5 size-3.5 shrink-0" />
-                <span className="break-words">{group.error}</span>
-              </p>
-            ) : null}
-
-            {group.folders.map(folder => (
-              <button
-                key={folder.id}
-                type="button"
-                onClick={() => onSelect(folder)}
-                className={cn(
-                  'flex w-full min-w-0 items-center gap-1.5 rounded px-2 py-1 pl-7 text-left text-sm',
-                  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
-                  selectedId === folder.id
-                    ? 'bg-status-info/10'
-                    : 'hover:bg-accent/60'
-                )}
-              >
-                <FolderIcon className="size-4 shrink-0 text-muted-foreground" />
-                <span className="truncate">{folder.name}</span>
-              </button>
-            ))}
-
-            {group.folders.length >= MAX_SEARCH_RESULTS ? (
-              <p className="px-2 pl-7 text-xs text-muted-foreground">
-                First {MAX_SEARCH_RESULTS} matches — narrow the search to see
-                the rest.
-              </p>
-            ) : null}
-          </div>
-        )
-      )}
+            <div className="truncate text-xs text-muted-foreground">
+              {group.drive.name}
+            </div>
+          </button>
+        ))}
+        {result.groups.some(
+          group => group.folders.length >= MAX_SEARCH_RESULTS
+        ) ? (
+          <p className="px-3 py-2 text-xs text-muted-foreground">
+            Showing the first {MAX_SEARCH_RESULTS} matches per drive — narrow
+            the search to see the rest.
+          </p>
+        ) : null}
+      </div>
     </div>
   )
 }
 
-function FolderNode({
+function TreeNode({
   folder,
+  trail,
   depth,
   isDrive,
-  state,
+  tree,
   selectedId,
   onToggle,
-  onSelect,
-  onRetry,
+  onOpen,
 }: {
   folder: RemoteFolder
+  trail: RemoteFolder[]
   depth: number
   isDrive: boolean
-  state: BrowserState
+  tree: TreeState
   selectedId: string | null
   onToggle: (folder: RemoteFolder) => void
-  onSelect: (folder: RemoteFolder) => void
-  onRetry: (parentId: string) => void
+  onOpen: (trail: RemoteFolder[]) => void
 }) {
-  const isExpanded = Boolean(state.expandedById[folder.id])
-  const isLoading = Boolean(state.loadingById[folder.id])
-  const error = state.errorById[folder.id]
-  const children = state.childrenById[folder.id]
+  const isExpanded = Boolean(tree.expandedById[folder.id])
+  const isLoading = Boolean(tree.loadingById[folder.id])
+  const error = tree.errorById[folder.id]
+  const children = tree.childrenById[folder.id]
   const isSelected = selectedId === folder.id
   const Icon = isDrive ? HardDriveIcon : FolderIcon
 
@@ -513,7 +801,7 @@ function FolderNode({
           'flex items-center gap-1 rounded px-1',
           isSelected ? 'bg-status-info/10' : 'hover:bg-accent/60'
         )}
-        style={{ paddingLeft: `${depth * 16 + 4}px` }}
+        style={{ paddingLeft: `${depth * 14 + 4}px` }}
       >
         <button
           type="button"
@@ -533,7 +821,7 @@ function FolderNode({
         </button>
         <button
           type="button"
-          onClick={() => onSelect(folder)}
+          onClick={() => onOpen(trail)}
           onDoubleClick={() => onToggle(folder)}
           className="flex min-w-0 flex-1 items-center gap-1.5 py-1 text-left text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
         >
@@ -544,39 +832,31 @@ function FolderNode({
 
       {isExpanded ? (
         error ? (
-          <div
-            className="flex items-center gap-1.5 py-1 text-xs text-status-danger"
-            style={{ paddingLeft: `${(depth + 1) * 16 + 8}px` }}
+          <p
+            className="py-1 pr-2 text-xs break-words text-status-danger"
+            style={{ paddingLeft: `${(depth + 1) * 14 + 8}px` }}
           >
-            <AlertCircleIcon className="size-3.5 shrink-0" />
-            <span className="truncate">{error}</span>
-            <button
-              type="button"
-              onClick={() => onRetry(folder.id)}
-              className="shrink-0 underline underline-offset-2"
-            >
-              Retry
-            </button>
-          </div>
+            {error}
+          </p>
         ) : children && children.length === 0 ? (
           <p
             className="py-1 text-xs text-muted-foreground"
-            style={{ paddingLeft: `${(depth + 1) * 16 + 8}px` }}
+            style={{ paddingLeft: `${(depth + 1) * 14 + 8}px` }}
           >
             No subfolders
           </p>
         ) : (
           (children ?? []).map(child => (
-            <FolderNode
+            <TreeNode
               key={child.id}
               folder={child}
+              trail={[...trail, child]}
               depth={depth + 1}
               isDrive={false}
-              state={state}
+              tree={tree}
               selectedId={selectedId}
               onToggle={onToggle}
-              onSelect={onSelect}
-              onRetry={onRetry}
+              onOpen={onOpen}
             />
           ))
         )

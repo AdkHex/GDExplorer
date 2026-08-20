@@ -19,5 +19,8 @@ tailwind.config.js
 package-lock.json
 .git/
 
+# Scratch UI mockups, not app source
+nimbalyst-local/
+
 # Logs
 *.log
