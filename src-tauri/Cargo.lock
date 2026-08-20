@@ -1406,7 +1406,7 @@ dependencies = [
 
 [[package]]
 name = "gdexplorer"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "fern",
  "libc",
