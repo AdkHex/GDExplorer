@@ -2,7 +2,9 @@ use crate::upload::events::{
     CompletedEvent, FileListEntry, FileListEvent, FileProgressEvent, ItemStatusEvent,
     ProgressEvent, Summary,
 };
-use crate::upload::scheduler::{wait_if_paused, QueueItemInput, UploadControlHandle, CANCELED};
+use crate::upload::scheduler::{
+    wait_if_paused, JobTallies, QueueItemInput, UploadControlHandle, CANCELED,
+};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -56,21 +58,22 @@ const PAUSE_RESTART: &str = "__gdexplorer_pause_restart__";
 /// up the UI tooltip.
 const MAX_ERROR_DETAIL: usize = 600;
 
+/// Runs the worker pool for the lifetime of a job.
+///
+/// The pool used to receive a fixed `Vec` of items and exit once it drained,
+/// which is why starting a second batch had to cancel the first one. It now
+/// pulls from a channel owned by `UploadControl`, so items can be appended to a
+/// running job. Workers exit only when that sender is dropped (cancel, or a new
+/// job replacing this one).
 pub async fn run_rclone_job(
     app: AppHandle,
     control: UploadControlHandle,
     prefs: RclonePreferences,
     max_concurrent: u8,
     service_account_folder: String,
-    queue: Vec<QueueItemInput>,
-    destination_folder_id: String,
+    queue_rx: mpsc::UnboundedReceiver<QueueItemInput>,
+    tallies: Arc<JobTallies>,
 ) -> Result<(), String> {
-    log::debug!(
-        target: "rclone",
-        "queue.received items={} max_concurrent={}",
-        queue.len(),
-        max_concurrent
-    );
     let sa_files = load_service_account_files(&service_account_folder)?;
     if sa_files.is_empty() {
         return Err(
@@ -78,37 +81,15 @@ pub async fn run_rclone_job(
         );
     }
 
+    let concurrency = max_concurrent.clamp(1, 10) as usize;
+    log::debug!(
+        target: "rclone",
+        "queue.worker_pool_started concurrency={concurrency}"
+    );
+
     let sa_pool = Arc::new(Mutex::new(sa_files));
     let sa_tick = Arc::new(AtomicU64::new(0));
-
-    let concurrency = max_concurrent.clamp(1, 10) as usize;
-    let (tx, rx) = mpsc::channel::<QueueItemInput>(concurrency.saturating_mul(2).max(8));
-    let rx = Arc::new(Mutex::new(rx));
-
-    let succeeded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let canceled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-    for item in &queue {
-        log::debug!(
-            target: "rclone",
-            "queue.added id={} kind={} path={}",
-            item.id,
-            item.kind,
-            item.path
-        );
-        let _ = app.emit(
-            "upload:item_status",
-            ItemStatusEvent {
-                item_id: item.id.clone(),
-                path: item.path.clone(),
-                kind: item.kind.clone(),
-                status: "preparing".to_string(),
-                message: None,
-                sa_email: None,
-            },
-        );
-    }
+    let rx = Arc::new(Mutex::new(queue_rx));
 
     let mut worker_handles = Vec::with_capacity(concurrency);
     for _ in 0..concurrency {
@@ -116,12 +97,9 @@ pub async fn run_rclone_job(
         let control = control.clone();
         let rx = rx.clone();
         let prefs = prefs.clone();
-        let destination_folder_id = destination_folder_id.clone();
         let sa_pool = sa_pool.clone();
         let sa_tick = sa_tick.clone();
-        let succeeded = succeeded.clone();
-        let failed = failed.clone();
-        let canceled = canceled.clone();
+        let tallies = tallies.clone();
 
         worker_handles.push(tokio::spawn(async move {
             loop {
@@ -134,25 +112,17 @@ pub async fn run_rclone_job(
                 };
                 let Some(item) = item else { break };
 
-                let result = run_rclone_for_item(
-                    &app,
-                    &control,
-                    &prefs,
-                    &sa_pool,
-                    &sa_tick,
-                    &destination_folder_id,
-                    &item,
-                )
-                .await;
+                let result =
+                    run_rclone_for_item(&app, &control, &prefs, &sa_pool, &sa_tick, &item).await;
 
                 match result {
                     Ok(()) => {
-                        succeeded.fetch_add(1, Ordering::Relaxed);
+                        tallies.succeeded.fetch_add(1, Ordering::Relaxed);
                     }
                     // Cancelling is not a failure. Put the item back in the
                     // queue so it can simply be started again.
                     Err(err) if control.is_canceled() || err == CANCELED => {
-                        canceled.fetch_add(1, Ordering::Relaxed);
+                        tallies.canceled.fetch_add(1, Ordering::Relaxed);
                         let _ = app.emit(
                             "upload:item_status",
                             ItemStatusEvent {
@@ -166,7 +136,7 @@ pub async fn run_rclone_job(
                         );
                     }
                     Err(err) => {
-                        failed.fetch_add(1, Ordering::Relaxed);
+                        tallies.failed.fetch_add(1, Ordering::Relaxed);
                         let _ = app.emit(
                             "upload:item_status",
                             ItemStatusEvent {
@@ -180,49 +150,38 @@ pub async fn run_rclone_job(
                         );
                     }
                 }
+
+                // The batch is finished when the last accepted item settles.
+                // Anything queued after this point starts a fresh batch, so the
+                // tallies are cleared once reported.
+                if tallies.record_finished() {
+                    let (total, succeeded, failed, canceled) = tallies.snapshot();
+                    log::info!(
+                        target: "rclone",
+                        "queue.batch_complete total={total} succeeded={succeeded} failed={failed} canceled={canceled}"
+                    );
+                    let _ = app.emit(
+                        "upload:completed",
+                        CompletedEvent {
+                            summary: Summary {
+                                total,
+                                succeeded,
+                                failed,
+                                canceled,
+                            },
+                        },
+                    );
+                    tallies.reset();
+                }
             }
         }));
     }
-
-    let total_items = queue.len() as u32;
-    for item in queue {
-        if control.is_canceled() {
-            break;
-        }
-        log::debug!(
-            target: "rclone",
-            "queue.enqueued id={} kind={} path={}",
-            item.id,
-            item.kind,
-            item.path
-        );
-        tx.send(item)
-            .await
-            .map_err(|e| format!("Failed to enqueue upload task: {e}"))?;
-    }
-
-    drop(tx);
 
     for handle in worker_handles {
         let _ = handle.await;
     }
 
-    let succeeded = succeeded.load(Ordering::Relaxed) as u32;
-    let failed = failed.load(Ordering::Relaxed) as u32;
-    let canceled = canceled.load(Ordering::Relaxed) as u32;
-
-    let _ = app.emit(
-        "upload:completed",
-        CompletedEvent {
-            summary: Summary {
-                total: total_items,
-                succeeded,
-                failed,
-                canceled,
-            },
-        },
-    );
-
+    log::debug!(target: "rclone", "queue.worker_pool_stopped");
     Ok(())
 }
 
@@ -233,7 +192,6 @@ async fn run_rclone_for_item(
     prefs: &RclonePreferences,
     sa_pool: &Arc<Mutex<Vec<ServiceAccountFile>>>,
     sa_tick: &Arc<AtomicU64>,
-    destination_folder_id: &str,
     item: &QueueItemInput,
 ) -> Result<(), String> {
     if let Some(file_list) = collect_file_list(item) {
@@ -278,17 +236,7 @@ async fn run_rclone_for_item(
 
         let (sa_path, sa_email) = select_service_account(sa_pool, sa_tick).await?;
 
-        match run_rclone_command(
-            app,
-            control,
-            prefs,
-            &sa_path,
-            sa_email,
-            destination_folder_id,
-            item,
-        )
-        .await
-        {
+        match run_rclone_command(app, control, prefs, &sa_path, sa_email, item).await {
             Err(err) if err == PAUSE_RESTART => continue,
             other => return other,
         }
@@ -302,7 +250,6 @@ async fn run_rclone_command(
     prefs: &RclonePreferences,
     sa_path: &Path,
     sa_email: Option<String>,
-    destination_folder_id: &str,
     item: &QueueItemInput,
 ) -> Result<(), String> {
     if control.is_canceled() {
@@ -327,7 +274,7 @@ async fn run_rclone_command(
         },
     );
 
-    let args = build_rclone_args(prefs, destination_folder_id, item, sa_path);
+    let args = build_rclone_args(prefs, item, sa_path);
 
     let mut command = build_rclone_command(&prefs.rclone_path, &args);
 
@@ -774,7 +721,6 @@ pub async fn verify_destination(
 
 fn build_rclone_args(
     prefs: &RclonePreferences,
-    destination_folder_id: &str,
     item: &QueueItemInput,
     sa_path: &Path,
 ) -> Vec<String> {
@@ -795,7 +741,7 @@ fn build_rclone_args(
             }
         ),
         "--drive-root-folder-id".to_string(),
-        destination_folder_id.to_string(),
+        item.destination_folder_id.clone(),
         "--drive-chunk-size".to_string(),
         format!("{}M", prefs.drive_chunk_size_mib),
         // Without this rclone switches to the chunked path at 8 MiB, so most

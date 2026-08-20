@@ -36,11 +36,13 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { useLocalUploadQueue } from '@/store/local-upload-queue-store'
+import { usePreferences } from '@/services/preferences'
 import { useTransferUiStore } from '@/store/transfer-ui-store'
 import { ProgressBar } from './ProgressBar'
 import { TRANSFER_STATUS, type TransferState } from './status'
 import { formatBytes, formatEta, formatSpeed } from './format'
 import { cn } from '@/lib/utils'
+import { extractDriveFolderId } from '@/lib/drive-url'
 import {
   ChevronDownIcon,
   ChevronRightIcon,
@@ -49,6 +51,7 @@ import {
   FolderIcon,
   FolderPlusIcon,
   Loader2Icon,
+  FolderSymlinkIcon,
   MoreHorizontalIcon,
   PauseIcon,
   PlayIcon,
@@ -68,7 +71,7 @@ import {
  * app's 1000px minimum window width with the sidebar open.
  */
 const GRID_COLUMNS =
-  'grid grid-cols-[28px_minmax(150px,2.2fr)_minmax(120px,1.3fr)_92px_68px_80px_64px_28px] items-center gap-x-2.5 px-3'
+  'grid grid-cols-[28px_minmax(140px,2fr)_96px_minmax(110px,1.2fr)_88px_64px_76px_60px_28px] items-center gap-x-2.5 px-3'
 
 function getPathName(path: string): string {
   const normalized = path.replace(/[/\\]+$/g, '')
@@ -112,6 +115,8 @@ interface TransferRowData {
   path: string
   kind: 'file' | 'folder'
   status: UploadRuntimeStatus
+  destinationFolderId: string | null
+  destinationLabel: string | null
   totalBytes: number | null
   bytesSent: number | null
   saEmail: string | null
@@ -141,6 +146,12 @@ export function TransferTable({
 }) {
   const items = useLocalUploadQueue(s => s.items)
   const clear = useLocalUploadQueue(s => s.clear)
+  const setItemsDestination = useLocalUploadQueue(s => s.setItemsDestination)
+  const { data: preferences } = usePreferences()
+  const destinationPresets = useMemo(
+    () => preferences?.destinationPresets ?? [],
+    [preferences?.destinationPresets]
+  )
   const [clearDialogOpen, setClearDialogOpen] = useState(false)
   const [clearPending, setClearPending] = useState(false)
 
@@ -212,6 +223,8 @@ export function TransferTable({
         path: item.path,
         kind: item.kind,
         status: runtime,
+        destinationFolderId: item.destinationFolderId ?? null,
+        destinationLabel: item.destinationLabel ?? null,
         totalBytes: item.totalBytes ?? null,
         bytesSent: item.bytesSent ?? null,
         saEmail: item.saEmail ?? null,
@@ -419,6 +432,25 @@ export function TransferTable({
             </div>
           )
         },
+      },
+      {
+        id: 'destination',
+        header: 'Destination',
+        cell: ({ row }) => (
+          <DestinationCell
+            item={row.original}
+            presets={destinationPresets}
+            onPick={(folderId, label) => {
+              // Changing the destination of a row that is part of the current
+              // selection applies to the whole selection, which is what you
+              // want after selecting five folders that share a target.
+              const ids = row.getIsSelected()
+                ? Object.keys(rowSelection).filter(id => rowSelection[id])
+                : [row.original.id]
+              setItemsDestination(ids, folderId, label)
+            }}
+          />
+        ),
       },
       {
         header: 'Progress',
@@ -922,6 +954,15 @@ export function TransferTable({
                                 Reading folder…
                               </div>
                             </div>
+                            {/* Pad to the full column count so every row in the
+                                grid exposes the same number of cells. */}
+                            {Array.from({ length: 7 }, (_, index) => (
+                              <div
+                                key={index}
+                                role="gridcell"
+                                aria-hidden="true"
+                              />
+                            ))}
                           </div>
                         )
                       ) : null}
@@ -995,6 +1036,7 @@ function FileRow({
           </Tooltip>
         </div>
       </div>
+      <div role="gridcell" aria-hidden="true" />
       <div role="gridcell" className="min-w-0">
         <ProgressBar
           percent={percent}
@@ -1028,6 +1070,71 @@ function FileRow({
       </div>
       <div role="gridcell" aria-hidden="true" />
     </div>
+  )
+}
+
+/**
+ * Per-row destination. A row with no override follows the sidebar, which keeps
+ * the common case (everything to one folder) free of per-row fiddling while
+ * still allowing five folders to target five different Drives.
+ */
+function DestinationCell({
+  item,
+  presets,
+  onPick,
+}: {
+  item: TransferRowData
+  presets: { id: string; name: string; url: string }[]
+  onPick: (folderId: string | null, label: string | null) => void
+}) {
+  const label =
+    item.destinationLabel ?? (item.destinationFolderId ? 'Custom' : 'Default')
+  const isPinned = item.destinationFolderId !== null
+
+  return (
+    <DropdownMenu>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              onClick={event => event.stopPropagation()}
+              className={cn(
+                'flex w-full min-w-0 items-center gap-1 rounded px-1 py-0.5 text-xs transition-colors',
+                'hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
+                isPinned ? 'text-foreground' : 'text-muted-foreground'
+              )}
+            >
+              <FolderSymlinkIcon className="size-3 shrink-0" />
+              <span className="truncate">{label}</span>
+            </button>
+          </DropdownMenuTrigger>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">
+          {isPinned
+            ? `Uploads to ${label}`
+            : 'Follows the destination in the sidebar'}
+        </TooltipContent>
+      </Tooltip>
+      <DropdownMenuContent align="start">
+        <DropdownMenuItem onSelect={() => onPick(null, null)}>
+          Use sidebar destination
+        </DropdownMenuItem>
+        {presets.length > 0 ? <DropdownMenuSeparator /> : null}
+        {presets.map(preset => {
+          const folderId = extractDriveFolderId(preset.url)
+          if (!folderId) return null
+          return (
+            <DropdownMenuItem
+              key={preset.id}
+              onSelect={() => onPick(folderId, preset.name)}
+            >
+              {preset.name}
+            </DropdownMenuItem>
+          )
+        })}
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }
 

@@ -259,81 +259,90 @@ export function BrowseLocalFiles() {
   }, [])
 
   const handleStartSelected = async (selectedIds: string[]) => {
-    // Pressing Start with no destination used to do nothing at all, with no
-    // hint as to why. Say what is wrong and put the caret where the fix goes.
-    if (!destinationFolderId || destinationError) {
-      toast.error(
-        destinationError
-          ? 'That destination is not a Drive folder'
-          : 'Choose a destination folder first',
-        {
-          description: 'Paste a Drive folder link or ID in the sidebar.',
-          action: {
-            label: 'Fix it',
-            onClick: () => focusDestinationInput(),
-          },
-        }
-      )
-      focusDestinationInput()
-      return
-    }
     if (selectedIds.length === 0) return
 
     const selected = items.filter(i => selectedIds.includes(i.id))
+    const toResume = selected.filter(i => i.status === 'paused')
     // 'failed' is startable so Start doubles as retry for a failed item.
     const startable = selected.filter(
-      i =>
-        i.status === 'queued' ||
-        i.status === 'paused' ||
-        i.status === 'failed' ||
-        !i.status
+      i => i.status === 'queued' || i.status === 'failed' || !i.status
     )
 
-    if (isUploading) {
-      const toResume = startable
-        .filter(i => i.status === 'paused')
-        .map(i => i.id)
-      if (toResume.length === 0) {
-        toast.message('Nothing to start', {
-          description: 'Select queued or paused items.',
-        })
-        return
-      }
+    // Resuming is a different mechanism from queueing, so handle it first and
+    // let a mixed selection do both.
+    if (toResume.length > 0) {
       try {
-        await invoke('pause_items', { itemIds: toResume, paused: false })
+        await invoke('pause_items', {
+          itemIds: toResume.map(i => i.id),
+          paused: false,
+        })
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         logger.warn('pause_items resume failed', { error: message })
         toast.error('Could not resume', { description: message })
         return
       }
-      for (const id of toResume) {
-        setItemStatus(id, 'uploading', null, null)
+    }
+
+    if (startable.length === 0) {
+      if (toResume.length === 0) {
+        toast.message('Nothing to start', {
+          description: 'Select queued, paused or failed items.',
+        })
       }
       return
     }
 
-    if (startable.length === 0) {
-      toast.message('Nothing to start', {
-        description: 'Select queued, paused or failed items.',
-      })
+    // Each row uses its own destination when one is pinned, otherwise the
+    // sidebar's. Resolving here means a single run can target several folders.
+    const globalDestination = destinationError ? null : destinationFolderId
+    const resolved = startable.map(item => ({
+      item,
+      destination: item.destinationFolderId ?? globalDestination,
+    }))
+
+    const missing = resolved.filter(entry => !entry.destination)
+    if (missing.length > 0) {
+      toast.error(
+        destinationError
+          ? 'That destination is not a Drive folder'
+          : 'Choose a destination folder first',
+        {
+          description:
+            missing.length === startable.length
+              ? 'Paste a Drive folder link or ID in the sidebar.'
+              : `${missing.length} item(s) have no destination of their own and the sidebar is empty.`,
+          action: { label: 'Fix it', onClick: () => focusDestinationInput() },
+        }
+      )
+      focusDestinationInput()
       return
     }
 
     setIsUploading(true)
 
-    // Check the destination before touching any row state, so a bad folder ID
-    // or a service account without access fails in seconds instead of part-way
-    // through a large transfer.
-    try {
-      await invoke('verify_destination', { args: { destinationFolderId } })
-    } catch (error) {
-      setIsUploading(false)
-      const message = error instanceof Error ? error.message : String(error)
-      toast.error('Cannot reach the destination folder', {
-        description: message,
-      })
-      return
+    // Check every distinct destination before touching any row state, so a bad
+    // folder ID or a service account without access fails in seconds instead of
+    // part-way through a large transfer.
+    const distinctDestinations = [
+      ...new Set(resolved.map(entry => entry.destination as string)),
+    ]
+    for (const destination of distinctDestinations) {
+      try {
+        await invoke('verify_destination', {
+          args: { destinationFolderId: destination },
+        })
+      } catch (error) {
+        setIsUploading(false)
+        const message = error instanceof Error ? error.message : String(error)
+        toast.error('Cannot reach the destination folder', {
+          description:
+            distinctDestinations.length > 1
+              ? `${destination}: ${message}`
+              : message,
+        })
+        return
+      }
     }
 
     clearFileProgress(startable.map(i => i.id))
@@ -343,14 +352,17 @@ export function BrowseLocalFiles() {
     }
 
     try {
+      // The backend appends these to a running job rather than replacing it,
+      // so adding more work mid-upload no longer cancels what is in flight.
       await invoke('start_upload', {
         args: {
-          queueItems: startable.map(item => ({
+          queueItems: resolved.map(({ item, destination }) => ({
             id: item.id,
             path: item.path,
             kind: item.kind,
+            destinationFolderId: destination,
           })),
-          destinationFolderId,
+          destinationFolderId: globalDestination ?? '',
         },
       })
     } catch (error) {

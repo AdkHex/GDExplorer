@@ -9,6 +9,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 mod rclone_tools;
 mod upload;
+
+use upload::events::ItemStatusEvent;
 #[derive(Default)]
 struct UploadControlState(tokio::sync::Mutex<Option<UploadControl>>);
 
@@ -17,17 +19,30 @@ struct UploadControl {
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pause_tx: tokio::sync::watch::Sender<bool>,
     paused_items_tx: tokio::sync::watch::Sender<HashSet<String>>,
+    /// Items are pushed here rather than handed to the job as a fixed list, so
+    /// a running upload can be extended instead of cancelled and restarted.
+    queue_tx: tokio::sync::mpsc::UnboundedSender<upload::scheduler::QueueItemInput>,
+    tallies: std::sync::Arc<upload::scheduler::JobTallies>,
 }
 
 impl UploadControl {
-    fn new() -> Self {
+    fn new() -> (
+        Self,
+        tokio::sync::mpsc::UnboundedReceiver<upload::scheduler::QueueItemInput>,
+    ) {
         let (pause_tx, _pause_rx) = tokio::sync::watch::channel(false);
         let (paused_items_tx, _paused_items_rx) = tokio::sync::watch::channel(HashSet::new());
-        Self {
-            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            pause_tx,
-            paused_items_tx,
-        }
+        let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Self {
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                pause_tx,
+                paused_items_tx,
+                queue_tx,
+                tallies: std::sync::Arc::new(upload::scheduler::JobTallies::default()),
+            },
+            queue_rx,
+        )
     }
 
     fn cancel(&self) {
@@ -35,6 +50,15 @@ impl UploadControl {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         // Ensure any paused workers can wake up and observe cancellation.
         let _ = self.pause_tx.send(false);
+    }
+
+    fn is_canceled(&self) -> bool {
+        self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// True while the worker pool is still reading from the queue.
+    fn accepts_items(&self) -> bool {
+        !self.is_canceled() && !self.queue_tx.is_closed()
     }
 
     fn set_paused(&self, paused: bool) {
@@ -56,6 +80,41 @@ impl UploadControl {
             }
         }
         let _ = self.paused_items_tx.send(next);
+    }
+
+    /// Accept items onto the queue, marking each as preparing so the row does
+    /// not sit on its previous state until a worker picks it up.
+    fn enqueue(
+        &self,
+        app: &AppHandle,
+        items: Vec<upload::scheduler::QueueItemInput>,
+    ) -> Result<(), String> {
+        for item in items {
+            log::debug!(
+                target: "rclone",
+                "queue.enqueued id={} kind={} path={} dest={}",
+                item.id,
+                item.kind,
+                item.path,
+                item.destination_folder_id
+            );
+            self.tallies.record_enqueued();
+            let _ = app.emit(
+                "upload:item_status",
+                ItemStatusEvent {
+                    item_id: item.id.clone(),
+                    path: item.path.clone(),
+                    kind: item.kind.clone(),
+                    status: "preparing".to_string(),
+                    message: None,
+                    sa_email: None,
+                },
+            );
+            self.queue_tx
+                .send(item)
+                .map_err(|e| format!("Failed to enqueue upload task: {e}"))?;
+        }
+        Ok(())
     }
 
     fn handle(&self) -> upload::scheduler::UploadControlHandle {
@@ -117,24 +176,53 @@ async fn start_upload(
 
     let max_concurrent = preferences.max_concurrent_uploads;
 
-    let queue_items = args.queue_items;
-    let destination_folder_id = args.destination_folder_id;
+    // Each item carries its own destination so one run can fan out to several
+    // Drive folders. Anything that arrives without one falls back to the
+    // job-level destination the sidebar supplies.
+    let fallback_destination = args.destination_folder_id.trim().to_string();
+    let mut queue_items = args.queue_items;
+    for item in &mut queue_items {
+        if item.destination_folder_id.trim().is_empty() {
+            item.destination_folder_id = fallback_destination.clone();
+        }
+    }
+    if let Some(missing) = queue_items
+        .iter()
+        .find(|item| item.destination_folder_id.trim().is_empty())
+    {
+        return Err(format!("No destination folder set for {}", missing.path));
+    }
 
-    // Cancel any existing upload job (best-effort).
+    // Appending to a job that is already running is the whole point of keeping
+    // the queue in the control handle: starting a second batch used to cancel
+    // the first one.
+    {
+        let guard = state.0.lock().await;
+        if let Some(existing) = guard.as_ref() {
+            if existing.accepts_items() {
+                log::debug!(
+                    target: "rclone",
+                    "queue.appended_to_running_job items={}",
+                    queue_items.len()
+                );
+                return existing.enqueue(app, queue_items);
+            }
+        }
+    }
+
+    // No live job, so start one. Any stale handle is cancelled first.
+    let (control, queue_rx) = UploadControl::new();
+    let control_handle = control.handle();
+    let tallies = control.tallies.clone();
     {
         let mut guard = state.0.lock().await;
         if let Some(existing) = guard.take() {
             existing.cancel();
         }
+        *guard = Some(control.clone());
     }
 
-    // Create a new upload control handle for this run.
-    let control = UploadControl::new();
-    let control_handle = control.handle();
-    {
-        let mut guard = state.0.lock().await;
-        *guard = Some(control);
-    }
+    control.enqueue(app, queue_items)?;
 
     let app_for_task = app.clone();
     tokio::spawn(async move {
@@ -149,18 +237,28 @@ async fn start_upload(
             exclude_patterns: preferences.rclone_exclude_patterns,
         };
 
-        if let Err(e) = upload::rclone::run_rclone_job(
-            app_for_task,
+        let result = upload::rclone::run_rclone_job(
+            app_for_task.clone(),
             control_handle,
             prefs,
             max_concurrent,
             service_account_folder,
-            queue_items,
-            destination_folder_id,
+            queue_rx,
+            tallies,
         )
-        .await
-        {
+        .await;
+
+        if let Err(e) = result {
             log::error!("Upload job failed: {e}");
+        }
+
+        // The pool has stopped, so this handle can no longer accept items.
+        // Clearing it lets the next Start build a fresh job instead of pushing
+        // into a queue nobody is reading.
+        let state = app_for_task.state::<UploadControlState>();
+        let mut guard = state.0.lock().await;
+        if guard.as_ref().is_some_and(|c| !c.accepts_items()) {
+            *guard = None;
         }
     });
 

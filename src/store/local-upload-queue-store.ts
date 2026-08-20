@@ -13,6 +13,12 @@ export interface LocalUploadItem {
   bytesSent?: number
   totalBytes?: number
   saEmail?: string | null
+  /**
+   * Per-item Drive destination. Null means "use whatever the sidebar is set
+   * to", so existing rows keep working and only overridden ones pin a folder.
+   */
+  destinationFolderId?: string | null
+  destinationLabel?: string | null
 }
 
 interface LocalUploadQueueState {
@@ -31,6 +37,11 @@ interface LocalUploadQueueState {
     itemId: string,
     bytesSent: number,
     totalBytes: number
+  ) => void
+  setItemsDestination: (
+    itemIds: string[],
+    destinationFolderId: string | null,
+    destinationLabel: string | null
   ) => void
   resetUploadState: () => void
   resetItemsUploadState: (itemIds: string[]) => void
@@ -131,6 +142,23 @@ export const useLocalUploadQueue = create<LocalUploadQueueState>()(
             }),
             undefined,
             'setItemProgress'
+          ),
+
+        setItemsDestination: (itemIds, destinationFolderId, destinationLabel) =>
+          set(
+            state => {
+              if (itemIds.length === 0) return state
+              const ids = new Set(itemIds)
+              return {
+                items: state.items.map(item =>
+                  ids.has(item.id)
+                    ? { ...item, destinationFolderId, destinationLabel }
+                    : item
+                ),
+              }
+            },
+            undefined,
+            'setItemsDestination'
           ),
 
         resetUploadState: () =>
