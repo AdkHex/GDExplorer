@@ -44,6 +44,7 @@ export function BrowseLocalFiles() {
     setItemStatus,
     resetItemsUploadState,
     resetStaleUploadState,
+    recordUploadDestination,
     remove: removeItem,
   } = useLocalUploadQueue()
   const recordFileProgress = useTransferUiStore(s => s.recordFileProgress)
@@ -371,8 +372,11 @@ export function BrowseLocalFiles() {
 
     clearFileProgress(startable.map(i => i.id))
     resetItemsUploadState(startable.map(i => i.id))
-    for (const it of startable) {
-      setItemStatus(it.id, 'preparing', null, null)
+    for (const { item, destination } of resolved) {
+      setItemStatus(item.id, 'preparing', null, null)
+      // Remember where this run is sending the item, so its Drive links can
+      // still be found after the sidebar destination changes.
+      recordUploadDestination(item.id, destination as string)
     }
 
     try {

@@ -60,6 +60,7 @@ import {
   resolveItemLinks,
 } from '@/lib/drive-links'
 import { RemoteFolderBrowser } from '@/components/upload/RemoteFolderBrowser'
+import { PreflightDialog } from '@/components/preflight/PreflightPanel'
 import { useUploadDestinationStore } from '@/store/upload-destination-store'
 import { toast } from 'sonner'
 import { logger } from '@/lib/logger'
@@ -72,6 +73,7 @@ import {
   FolderPlusIcon,
   FolderSearchIcon,
   LinkIcon,
+  ShieldCheckIcon,
   Loader2Icon,
   FolderSymlinkIcon,
   MoreHorizontalIcon,
@@ -139,6 +141,7 @@ interface TransferRowData {
   status: UploadRuntimeStatus
   destinationFolderId: string | null
   destinationLabel: string | null
+  uploadedToFolderId: string | null
   totalBytes: number | null
   bytesSent: number | null
   saEmail: string | null
@@ -176,6 +179,7 @@ export function TransferTable({
   )
   const [clearDialogOpen, setClearDialogOpen] = useState(false)
   const [clearPending, setClearPending] = useState(false)
+  const [preflightOpen, setPreflightOpen] = useState(false)
   // Rows awaiting an arbitrary destination from the paste dialog.
   const [customDestinationTargets, setCustomDestinationTargets] = useState<
     string[] | null
@@ -190,7 +194,6 @@ export function TransferTable({
   const fileOrderById = useTransferUiStore(s => s.fileOrderById)
   const fileMetricsById = useTransferUiStore(s => s.fileMetricsById)
   const recordFileList = useTransferUiStore(s => s.recordFileList)
-  const linksById = useTransferUiStore(s => s.linksById)
   const setItemLinks = useTransferUiStore(s => s.setItemLinks)
   const globalDestinationId = useUploadDestinationStore(
     s => s.destinationFolderId
@@ -201,13 +204,26 @@ export function TransferTable({
    * Drive IDs are looked up on demand and cached, rather than tracked through
    * the upload: rclone never reports the IDs it creates, so there is nothing to
    * capture while a transfer runs.
+   *
+   * A lookup that found nothing is never cached. "Nothing in Drive yet" is a
+   * fact about the moment it was asked, not about the item - caching it meant
+   * one click while a folder was still being created left that row without a
+   * link for the rest of the session, long after the upload had finished.
    */
   const ensureLinks = useCallback(
-    async (row: TransferRowData) => {
-      const cached = linksById[row.id]
-      if (cached) return cached
+    async (row: TransferRowData, options?: { refresh?: boolean }) => {
+      // Read the cache from the store instead of subscribing, for the same
+      // reason as `toggleExpanded`: this callback feeds the column definitions,
+      // so any dependency that changes mid-upload remounts every cell.
+      const cached = useTransferUiStore.getState().linksById[row.id]
+      const hasCachedLinks =
+        cached && (cached.folderId || Object.keys(cached.files).length > 0)
+      if (hasCachedLinks && !options?.refresh) return cached
 
-      const destination = row.destinationFolderId ?? globalDestinationId
+      // Where the item actually went wins over where a new upload would go:
+      // the sidebar destination may have changed since this row ran.
+      const destination =
+        row.uploadedToFolderId ?? row.destinationFolderId ?? globalDestinationId
       if (!destination) {
         throw new Error('This item has no destination folder yet.')
       }
@@ -216,10 +232,12 @@ export function TransferTable({
       const files: Record<string, string> = {}
       for (const entry of links.files) files[entry.filePath] = entry.fileId
       const resolved = { folderId: links.folderId, files }
-      setItemLinks(row.id, resolved)
+      if (resolved.folderId || Object.keys(files).length > 0) {
+        setItemLinks(row.id, resolved)
+      }
       return resolved
     },
-    [globalDestinationId, linksById, setItemLinks]
+    [globalDestinationId, setItemLinks]
   )
 
   const copyItemLink = useCallback(
@@ -259,7 +277,11 @@ export function TransferTable({
     async (row: TransferRowData, filePath: string) => {
       try {
         const links = await ensureLinks(row)
-        const fileId = links.files[filePath]
+        // A folder resolved mid-upload only lists the files that had arrived by
+        // then, so a miss is worth one fresh look before saying no.
+        const fileId =
+          links.files[filePath] ??
+          (await ensureLinks(row, { refresh: true })).files[filePath]
         if (!fileId) {
           toast.message('No link yet', {
             description: 'This file has not finished uploading.',
@@ -336,6 +358,7 @@ export function TransferTable({
         status: runtime,
         destinationFolderId: item.destinationFolderId ?? null,
         destinationLabel: item.destinationLabel ?? null,
+        uploadedToFolderId: item.uploadedToFolderId ?? null,
         totalBytes: item.totalBytes ?? null,
         bytesSent: item.bytesSent ?? null,
         saEmail: item.saEmail ?? null,
@@ -395,6 +418,18 @@ export function TransferTable({
   useEffect(() => {
     rowSelectionRef.current = rowSelection
   }, [rowSelection])
+
+  // The host re-renders on every progress event and rebuilds its handlers, so
+  // these props change identity constantly. Calling them through a ref keeps
+  // them out of the column deps and stops that churn remounting the cells.
+  const onRemoveSelectedRef = useRef(onRemoveSelected)
+  useEffect(() => {
+    onRemoveSelectedRef.current = onRemoveSelected
+  }, [onRemoveSelected])
+  const removeSelected = useCallback(
+    (itemIds: string[]) => onRemoveSelectedRef.current(itemIds),
+    []
+  )
   const lastIndexRef = useRef<number | null>(null)
   const [focusedIndex, setFocusedIndex] = useState(0)
   const rowRefs = useRef<Record<string, HTMLDivElement | null>>({})
@@ -436,7 +471,13 @@ export function TransferTable({
       // Only claim the in-flight slot when a fetch actually starts. Claiming it
       // unconditionally meant a first expand that already had data blocked
       // every later fetch.
-      const alreadyListed = (fileOrderById[item.id]?.length ?? 0) > 0
+      //
+      // Read the file list straight from the store rather than subscribing to
+      // it: per-file progress rewrites `fileOrderById` several times a second
+      // during an upload, and depending on it here rebuilt the columns and
+      // remounted every cell, closing any open destination menu.
+      const { fileOrderById: currentFileOrder } = useTransferUiStore.getState()
+      const alreadyListed = (currentFileOrder[item.id]?.length ?? 0) > 0
       if (!isExpanded && !listRequestRef.current[item.id] && !alreadyListed) {
         listRequestRef.current[item.id] = true
         invoke<{ filePath: string; totalBytes: number }[]>('list_item_files', {
@@ -459,7 +500,7 @@ export function TransferTable({
       }
       setExpandedById(prev => ({ ...prev, [item.id]: !isExpanded }))
     },
-    [expandedById, fileOrderById, recordFileList]
+    [expandedById, recordFileList]
   )
 
   /**
@@ -718,7 +759,7 @@ export function TransferTable({
                 <span className="size-5" aria-hidden="true" />
               )}
               {removable ? (
-                <RemoveButton item={item} onRemove={onRemoveSelected} />
+                <RemoveButton item={item} onRemove={removeSelected} />
               ) : null}
             </div>
           )
@@ -731,7 +772,7 @@ export function TransferTable({
       destinationPresets,
       setItemsDestination,
       copyItemLink,
-      onRemoveSelected,
+      removeSelected,
     ]
   )
 
@@ -915,6 +956,23 @@ export function TransferTable({
         {/* One prominent button per HIG guidance: Start carries the accent,
             everything else is secondary or tucked into the overflow menu. */}
         <div className="flex items-center gap-2">
+          {/* Checking the setup is an occasional errand, not part of the
+              upload flow, so it sits at the quiet end as an icon. */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                onClick={() => setPreflightOpen(true)}
+                aria-label="Check setup"
+              >
+                <ShieldCheckIcon />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Check setup</TooltipContent>
+          </Tooltip>
+
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button type="button" variant="outline" size="sm">
@@ -1072,6 +1130,8 @@ export function TransferTable({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <PreflightDialog open={preflightOpen} onOpenChange={setPreflightOpen} />
 
       <CustomDestinationDialog
         open={customDestinationTargets !== null}

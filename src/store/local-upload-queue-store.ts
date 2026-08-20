@@ -19,6 +19,12 @@ export interface LocalUploadItem {
    */
   destinationFolderId?: string | null
   destinationLabel?: string | null
+  /**
+   * The folder this item was actually uploaded into, recorded when the upload
+   * starts. The sidebar destination can change afterwards, and looking a
+   * finished item's Drive links up against the new one finds nothing.
+   */
+  uploadedToFolderId?: string | null
 }
 
 interface LocalUploadQueueState {
@@ -43,6 +49,7 @@ interface LocalUploadQueueState {
     destinationFolderId: string | null,
     destinationLabel: string | null
   ) => void
+  recordUploadDestination: (itemId: string, folderId: string) => void
   resetUploadState: () => void
   resetItemsUploadState: (itemIds: string[]) => void
   resetStaleUploadState: () => void
@@ -159,6 +166,19 @@ export const useLocalUploadQueue = create<LocalUploadQueueState>()(
             },
             undefined,
             'setItemsDestination'
+          ),
+
+        recordUploadDestination: (itemId, folderId) =>
+          set(
+            state => ({
+              items: state.items.map(item =>
+                item.id === itemId
+                  ? { ...item, uploadedToFolderId: folderId }
+                  : item
+              ),
+            }),
+            undefined,
+            'recordUploadDestination'
           ),
 
         resetUploadState: () =>

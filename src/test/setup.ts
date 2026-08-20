@@ -33,6 +33,13 @@ Object.defineProperty(window, 'matchMedia', {
   })),
 })
 
+// Radix primitives use pointer capture and scrollIntoView, neither of which
+// jsdom implements. Without these, opening a menu or select throws.
+Element.prototype.hasPointerCapture = vi.fn(() => false)
+Element.prototype.setPointerCapture = vi.fn()
+Element.prototype.releasePointerCapture = vi.fn()
+Element.prototype.scrollIntoView = vi.fn()
+
 // Mock Tauri APIs for tests
 vi.mock('@tauri-apps/api/event', () => ({
   listen: vi.fn().mockResolvedValue(() => {

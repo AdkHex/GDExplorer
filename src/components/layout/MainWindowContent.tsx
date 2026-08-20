@@ -3,7 +3,6 @@ import { BrowseLocalFiles } from '@/components/upload/BrowseLocalFiles'
 import { LeftSideBar } from '@/components/layout/LeftSideBar'
 import { LogPanel } from '@/components/logs/LogPanel'
 import { DestinationPicker } from '@/components/upload/DestinationPicker'
-import { PreflightSection } from '@/components/preflight/PreflightPanel'
 import { QueueSummary } from '@/components/transfers/QueueSummary'
 import { Separator } from '@/components/ui/separator'
 import { useUIStore } from '@/store/ui-store'
@@ -37,8 +36,6 @@ export function MainWindowContent({
         <LeftSideBar className="w-60 shrink-0">
           <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-4">
             <DestinationPicker />
-            <Separator />
-            <PreflightSection />
             <Separator />
             <QueueSummary />
           </div>

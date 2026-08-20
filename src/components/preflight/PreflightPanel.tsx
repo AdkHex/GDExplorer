@@ -6,7 +6,6 @@ import {
   Loader2Icon,
   MinusCircleIcon,
   RefreshCwIcon,
-  ShieldCheckIcon,
   XCircleIcon,
   type LucideIcon,
 } from 'lucide-react'
@@ -220,27 +219,6 @@ function runChecks(
   return invoke<PreflightCheck[]>('run_preflight', {
     args: { destinationFolderId },
   })
-}
-
-/** Sidebar entry point for the checks. */
-export function PreflightSection() {
-  const [open, setOpen] = useState(false)
-
-  return (
-    <section className="space-y-2">
-      <Button
-        type="button"
-        variant="outline"
-        size="sm"
-        className="w-full"
-        onClick={() => setOpen(true)}
-      >
-        <ShieldCheckIcon />
-        Check setup
-      </Button>
-      <PreflightDialog open={open} onOpenChange={setOpen} />
-    </section>
-  )
 }
 
 export default PreflightDialog
