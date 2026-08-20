@@ -1,12 +1,14 @@
-import { useEffect, useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { openUrl } from '@tauri-apps/plugin-opener'
 import {
   AlertCircleIcon,
   CheckCircle2Icon,
   ExternalLinkIcon,
   FolderIcon,
+  FolderSearchIcon,
   XIcon,
 } from 'lucide-react'
+import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
   Select,
@@ -25,6 +27,8 @@ import { useUploadDestinationStore } from '@/store/upload-destination-store'
 import { usePreferences } from '@/services/preferences'
 import { logger } from '@/lib/logger'
 import { cn } from '@/lib/utils'
+import { driveFolderUrl } from '@/lib/drive-links'
+import { RemoteFolderBrowser } from './RemoteFolderBrowser'
 
 const CUSTOM_VALUE = 'custom'
 
@@ -38,6 +42,7 @@ export function DestinationPicker() {
     clearDestination,
   } = useUploadDestinationStore()
   const { data: preferences } = usePreferences()
+  const [browserOpen, setBrowserOpen] = useState(false)
 
   const destinationPresets = useMemo(
     () => preferences?.destinationPresets ?? [],
@@ -134,6 +139,25 @@ export function DestinationPicker() {
           </Tooltip>
         ) : null}
       </div>
+
+      {/* Pasting a folder URL assumes you have one to hand. Browsing asks
+          rclone what the service accounts can actually see. */}
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        className="w-full"
+        onClick={() => setBrowserOpen(true)}
+      >
+        <FolderSearchIcon />
+        Browse Drive…
+      </Button>
+
+      <RemoteFolderBrowser
+        open={browserOpen}
+        onOpenChange={setBrowserOpen}
+        onSelect={folder => setDestinationUrl(driveFolderUrl(folder.id))}
+      />
 
       {/* Was three stacked lines - "Ready to upload", the folder ID, and an
           "Open in Drive" link. Collapsed to one. */}

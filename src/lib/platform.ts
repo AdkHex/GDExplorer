@@ -3,8 +3,7 @@ export type DesktopPlatform = 'macos' | 'windows' | 'linux' | null
 /**
  * Best-effort platform detection from the webview.
  *
- * Used to pick the right window controls and to hide platform-specific
- * features (the bundled rclone installer only supports Windows).
+ * Used to pick the right window controls.
  */
 export function detectPlatform(): DesktopPlatform {
   const platform = navigator.platform.toLowerCase()
@@ -18,8 +17,4 @@ export function detectPlatform(): DesktopPlatform {
   if (userAgent.includes('linux')) return 'linux'
 
   return null
-}
-
-export function isWindows(): boolean {
-  return detectPlatform() === 'windows'
 }

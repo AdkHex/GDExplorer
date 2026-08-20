@@ -4,12 +4,16 @@ import { PreferencesDialog } from '@/components/preferences/PreferencesDialog'
 import { Toaster } from 'sonner'
 import { useTheme } from '@/hooks/use-theme'
 import { useMainWindowEventListeners } from '@/hooks/useMainWindowEventListeners'
+import { useTrayStatus } from '@/hooks/useTrayStatus'
 
 export function MainWindow() {
   const { theme } = useTheme()
 
   // Set up global event listeners (keyboard shortcuts, etc.)
   useMainWindowEventListeners()
+
+  // Keep the menu bar / tray icon showing how the queue is doing.
+  useTrayStatus()
 
   return (
     <div className="flex h-screen w-full flex-col overflow-hidden rounded-xl bg-background">

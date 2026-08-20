@@ -7,7 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+mod logbuf;
+mod preflight;
 mod rclone_tools;
+mod tray;
 mod upload;
 
 use upload::events::ItemStatusEvent;
@@ -225,18 +228,8 @@ async fn start_upload(
     control.enqueue(app, queue_items)?;
 
     let app_for_task = app.clone();
+    let prefs = rclone_preferences(&preferences);
     tokio::spawn(async move {
-        let prefs = upload::rclone::RclonePreferences {
-            rclone_path: preferences.rclone_path,
-            remote_name: preferences.rclone_remote_name,
-            drive_chunk_size_mib: preferences.upload_chunk_size_mib,
-            transfers: preferences.rclone_transfers,
-            checkers: preferences.rclone_checkers,
-            retries: preferences.rclone_retries,
-            bandwidth_limit: preferences.rclone_bandwidth_limit,
-            exclude_patterns: preferences.rclone_exclude_patterns,
-        };
-
         let result = upload::rclone::run_rclone_job(
             app_for_task.clone(),
             control_handle,
@@ -271,27 +264,95 @@ struct VerifyDestinationArgs {
     destination_folder_id: String,
 }
 
-#[tauri::command]
-async fn verify_destination(app: AppHandle, args: VerifyDestinationArgs) -> Result<(), String> {
+/// The rclone-facing slice of the preferences, built in one place instead of
+/// field by field in every command that shells out to rclone.
+fn rclone_preferences(preferences: &AppPreferences) -> upload::rclone::RclonePreferences {
+    upload::rclone::RclonePreferences {
+        rclone_path: preferences.rclone_path.clone(),
+        remote_name: preferences.rclone_remote_name.clone(),
+        drive_chunk_size_mib: preferences.upload_chunk_size_mib,
+        transfers: preferences.rclone_transfers,
+        checkers: preferences.rclone_checkers,
+        retries: preferences.rclone_retries,
+        bandwidth_limit: preferences.rclone_bandwidth_limit.clone(),
+        exclude_patterns: preferences.rclone_exclude_patterns.clone(),
+    }
+}
+
+/// Everything an rclone call needs: how to run it, and where the service
+/// accounts live. Fails the same way for every command when the folder has not
+/// been chosen yet.
+async fn rclone_context(
+    app: AppHandle,
+) -> Result<(upload::rclone::RclonePreferences, String), String> {
     let preferences = load_preferences(app).await?;
     let service_account_folder = preferences
         .service_account_folder_path
         .clone()
         .ok_or_else(|| "Service Account folder path is not set in Preferences.".to_string())?;
 
-    let prefs = upload::rclone::RclonePreferences {
-        rclone_path: preferences.rclone_path,
-        remote_name: preferences.rclone_remote_name,
-        drive_chunk_size_mib: preferences.upload_chunk_size_mib,
-        transfers: preferences.rclone_transfers,
-        checkers: preferences.rclone_checkers,
-        retries: preferences.rclone_retries,
-        bandwidth_limit: preferences.rclone_bandwidth_limit,
-        exclude_patterns: preferences.rclone_exclude_patterns,
-    };
+    Ok((rclone_preferences(&preferences), service_account_folder))
+}
+
+#[tauri::command]
+async fn verify_destination(app: AppHandle, args: VerifyDestinationArgs) -> Result<(), String> {
+    let (prefs, service_account_folder) = rclone_context(app).await?;
 
     upload::rclone::verify_destination(&prefs, &service_account_folder, &args.destination_folder_id)
         .await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreflightArgs {
+    /// Optional: the destination checks are skipped when nothing is set yet.
+    destination_folder_id: Option<String>,
+}
+
+/// Verifies the whole setup - rclone, the remote, the service accounts and the
+/// destination - before an upload rather than during one.
+#[tauri::command]
+async fn run_preflight(
+    app: AppHandle,
+    args: PreflightArgs,
+) -> Result<Vec<preflight::PreflightCheck>, String> {
+    let preferences = load_preferences(app).await?;
+    let prefs = rclone_preferences(&preferences);
+
+    Ok(preflight::run(
+        &prefs,
+        preferences.service_account_folder_path.clone(),
+        args.destination_folder_id,
+    )
+    .await)
+}
+
+/// Shared drives the configured service accounts can see. The root of the
+/// destination browser.
+#[tauri::command]
+async fn list_shared_drives(app: AppHandle) -> Result<Vec<upload::rclone::RemoteFolder>, String> {
+    let (prefs, service_account_folder) = rclone_context(app).await?;
+    upload::rclone::list_shared_drives(&prefs, &service_account_folder).await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListRemoteFoldersArgs {
+    folder_id: String,
+}
+
+/// Subfolders of one Drive folder, so the browser can descend a level at a time.
+#[tauri::command]
+async fn list_remote_folders(
+    app: AppHandle,
+    args: ListRemoteFoldersArgs,
+) -> Result<Vec<upload::rclone::RemoteFolder>, String> {
+    let folder_id = args.folder_id.trim();
+    if folder_id.is_empty() {
+        return Err("No folder to list.".to_string());
+    }
+    let (prefs, service_account_folder) = rclone_context(app).await?;
+    upload::rclone::list_remote_folders(&prefs, &service_account_folder, folder_id).await
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -310,22 +371,7 @@ async fn resolve_item_links(
     app: AppHandle,
     args: ResolveItemLinksArgs,
 ) -> Result<upload::rclone::ItemLinks, String> {
-    let preferences = load_preferences(app).await?;
-    let service_account_folder = preferences
-        .service_account_folder_path
-        .clone()
-        .ok_or_else(|| "Service Account folder path is not set in Preferences.".to_string())?;
-
-    let prefs = upload::rclone::RclonePreferences {
-        rclone_path: preferences.rclone_path,
-        remote_name: preferences.rclone_remote_name,
-        drive_chunk_size_mib: preferences.upload_chunk_size_mib,
-        transfers: preferences.rclone_transfers,
-        checkers: preferences.rclone_checkers,
-        retries: preferences.rclone_retries,
-        bandwidth_limit: preferences.rclone_bandwidth_limit,
-        exclude_patterns: preferences.rclone_exclude_patterns,
-    };
+    let (prefs, service_account_folder) = rclone_context(app).await?;
 
     upload::rclone::resolve_item_links(
         &prefs,
@@ -592,6 +638,18 @@ pub struct AppPreferences {
     pub theme: String,
     #[serde(default = "default_auto_check_updates")]
     pub auto_check_updates: bool,
+    /// Post a system notification when a batch finishes. On by default because
+    /// a long upload is something you leave running in the background.
+    #[serde(default = "default_notify_on_completion")]
+    pub notify_on_completion: bool,
+    /// Show the menu bar / tray icon with upload progress.
+    #[serde(default = "default_show_tray_icon")]
+    pub show_tray_icon: bool,
+    /// Closing the window hides it instead of quitting, leaving the upload
+    /// running. Off by default: a window that vanishes on close surprises
+    /// people, so it is opt-in and only honoured while the tray icon is shown.
+    #[serde(default)]
+    pub close_to_tray: bool,
     #[serde(alias = "serviceAccountJsonPath")]
     pub service_account_folder_path: Option<String>,
     pub max_concurrent_uploads: u8,
@@ -620,6 +678,9 @@ impl Default for AppPreferences {
         Self {
             theme: "system".to_string(),
             auto_check_updates: true,
+            notify_on_completion: true,
+            show_tray_icon: true,
+            close_to_tray: false,
             service_account_folder_path: None,
             max_concurrent_uploads: 3,
             // Peak rclone memory is roughly
@@ -652,6 +713,14 @@ fn default_auto_check_updates() -> bool {
     true
 }
 
+fn default_notify_on_completion() -> bool {
+    true
+}
+
+fn default_show_tray_icon() -> bool {
+    true
+}
+
 fn default_rclone_remote_name() -> String {
     "gdrive".to_string()
 }
@@ -675,6 +744,19 @@ fn get_preferences_path(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|e| format!("Failed to create app data directory: {e}"))?;
 
     Ok(app_data_dir.join("preferences.json"))
+}
+
+/// Preferences read on the calling thread, falling back to defaults.
+///
+/// The tray setup and the window close handler are synchronous, so they cannot
+/// await the command above; both only need a best-effort snapshot.
+fn preferences_snapshot(app: &AppHandle) -> AppPreferences {
+    get_preferences_path(app)
+        .ok()
+        .filter(|path| path.exists())
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|contents| serde_json::from_str(&contents).ok())
+        .unwrap_or_default()
 }
 
 #[tauri::command]
@@ -752,7 +834,29 @@ async fn send_native_notification(
 
     #[cfg(not(mobile))]
     {
-        use tauri_plugin_notification::NotificationExt;
+        use tauri_plugin_notification::{NotificationExt, PermissionState};
+
+        // Notifications need the user's consent before anything can be posted,
+        // and the prompt only appears if we ask for it.
+        match app.notification().permission_state() {
+            Ok(PermissionState::Granted) => {}
+            Ok(_) => match app.notification().request_permission() {
+                Ok(PermissionState::Granted) => {}
+                Ok(state) => {
+                    log::info!("Notification permission not granted: {state:?}");
+                    return Err("Notifications are not allowed for this app.".to_string());
+                }
+                Err(e) => {
+                    log::warn!("Failed to request notification permission: {e}");
+                    return Err(format!("Failed to request notification permission: {e}"));
+                }
+            },
+            Err(e) => {
+                // Not fatal: some platforms have no permission concept, so try
+                // to show the notification anyway.
+                log::warn!("Failed to read notification permission state: {e}");
+            }
+        }
 
         let mut notification = app.notification().builder().title(title);
 
@@ -942,6 +1046,39 @@ async fn cleanup_old_recovery_files(app: AppHandle) -> Result<u32, String> {
     Ok(removed_count)
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrayStatusArgs {
+    /// Short text beside the menu bar icon, e.g. "42%". None clears it.
+    title: Option<String>,
+    tooltip: Option<String>,
+}
+
+/// Mirrors upload progress into the menu bar so a hidden window is not a blind
+/// spot. No-op when the tray icon is turned off.
+#[tauri::command]
+fn update_tray_status(app: AppHandle, args: TrayStatusArgs) {
+    tray::set_status(&app, args.title, args.tooltip);
+}
+
+/// Applies the "show tray icon" preference without a restart.
+#[tauri::command]
+fn set_tray_visible(app: AppHandle, visible: bool) -> Result<(), String> {
+    tray::set_visible(&app, visible)
+}
+
+/// Feeds the log panel. The caller polls with the highest sequence it already
+/// holds, so each line is only ever sent once.
+#[tauri::command]
+fn get_log_entries(after_seq: u64, limit: Option<usize>) -> logbuf::LogSnapshot {
+    logbuf::snapshot(after_seq, limit.unwrap_or(1_000).clamp(1, 5_000))
+}
+
+#[tauri::command]
+fn clear_log_entries() {
+    logbuf::clear();
+}
+
 #[tauri::command]
 async fn classify_paths(paths: Vec<String>) -> Vec<ClassifiedPath> {
     paths
@@ -991,6 +1128,11 @@ fn create_app_menu(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error
                 .accelerator("CmdOrCtrl+1")
                 .build(app)?,
         )
+        .item(
+            &MenuItemBuilder::with_id("toggle-log-panel", "Toggle Log")
+                .accelerator("CmdOrCtrl+2")
+                .build(app)?,
+        )
         .build()?;
 
     #[cfg(target_os = "macos")]
@@ -1023,6 +1165,13 @@ fn create_app_menu(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+/// Keeps rclone's per-second debug chatter out of the log file, stdout and the
+/// webview console in a release build. The log panel is unaffected: its buffer
+/// is a separate target with no filter.
+fn skip_debug_in_release(metadata: &log::Metadata<'_>) -> bool {
+    cfg!(debug_assertions) || metadata.level() <= log::Level::Info
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1038,16 +1187,29 @@ pub fn run() {
                 } else {
                     log::LevelFilter::Info
                 })
+                // rclone's raw output is only ever logged at debug level. Without
+                // this the log panel would be empty in a release build, which is
+                // exactly where a user needs to see why a transfer failed.
+                .level_for("rclone", log::LevelFilter::Debug)
                 .targets([
                     // Always log to stdout for development
-                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout)
+                        .filter(skip_debug_in_release),
                     // Log to webview console for development
-                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Webview),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Webview)
+                        .filter(skip_debug_in_release),
                     // Log to system logs on macOS (appears in Console.app)
                     #[cfg(target_os = "macos")]
                     tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
                         file_name: None,
-                    }),
+                    })
+                    .filter(skip_debug_in_release),
+                    // Mirror every record into the in-memory buffer the log
+                    // panel reads from.
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Dispatch(
+                        fern::Dispatch::new()
+                            .chain(Box::new(logbuf::BufferLogger) as Box<dyn log::Log>),
+                    )),
                 ])
                 .build(),
         )
@@ -1067,6 +1229,14 @@ pub fn run() {
             if let Err(e) = create_app_menu(app) {
                 log::error!("Failed to create app menu: {e}");
                 return Err(e);
+            }
+
+            // The tray is a user preference, so a failure to build it must not
+            // stop the app from starting.
+            if preferences_snapshot(app.handle()).show_tray_icon {
+                if let Err(e) = tray::create(app.handle()) {
+                    log::error!("Failed to create the tray icon: {e}");
+                }
             }
 
             // Set up menu event handlers
@@ -1110,6 +1280,18 @@ pub fn run() {
                             }
                         }
                     }
+                    "toggle-log-panel" => {
+                        log::info!("Toggle Log menu item clicked");
+                        // Emit event to React for handling
+                        match app.emit("menu-toggle-log-panel", ()) {
+                            Ok(_) => {
+                                log::debug!("Successfully emitted menu-toggle-log-panel event")
+                            }
+                            Err(e) => {
+                                log::error!("Failed to emit menu-toggle-log-panel event: {e}")
+                            }
+                        }
+                    }
                     _ => {
                         log::debug!("Unhandled menu event: {:?}", event.id());
                     }
@@ -1125,6 +1307,19 @@ pub fn run() {
 
             Ok(())
         })
+        // Closing the window ends the app by default. With the tray icon
+        // showing and the preference on, it hides instead so an upload keeps
+        // running - the tray menu and the Dock icon bring it back.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let app = window.app_handle();
+                let preferences = preferences_snapshot(app);
+                if preferences.close_to_tray && app.tray_by_id(tray::TRAY_ID).is_some() {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             load_preferences,
             save_preferences,
@@ -1133,16 +1328,37 @@ pub fn run() {
             load_emergency_data,
             cleanup_old_recovery_files,
             classify_paths,
+            get_log_entries,
+            clear_log_entries,
+            update_tray_status,
+            set_tray_visible,
             start_upload,
             verify_destination,
+            list_shared_drives,
+            list_remote_folders,
+            run_preflight,
             pause_upload,
             pause_items,
             resolve_item_links,
             cancel_upload,
             list_item_files,
-            rclone_tools::install_rclone_windows,
+            rclone_tools::install_rclone,
+            rclone_tools::detect_rclone,
             rclone_tools::configure_rclone_remote
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|_app, _event| {
+            // Clicking the Dock icon has to bring a hidden window back, or
+            // close-to-tray would leave the app reachable only from the menu
+            // bar.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows: false,
+                ..
+            } = _event
+            {
+                tray::show_main_window(_app);
+            }
+        });
 }

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -645,7 +645,7 @@ async fn monitor_pause_state(
 
 /// Build an rclone command with piped output, hiding the console window on
 /// Windows so the app does not flash a terminal for every invocation.
-fn build_rclone_command(rclone_path: &str, args: &[String]) -> Command {
+pub(crate) fn build_rclone_command(rclone_path: &str, args: &[String]) -> Command {
     #[cfg(windows)]
     let command = {
         use std::os::windows::process::CommandExt;
@@ -668,6 +668,144 @@ fn build_rclone_command(rclone_path: &str, args: &[String]) -> Command {
         command
     };
     command
+}
+
+/// Runs rclone to completion. Newer callers use this instead of repeating the
+/// spawn/timeout dance; each one still words its own failure message.
+pub(crate) async fn run_rclone_to_completion(
+    prefs: &RclonePreferences,
+    args: &[String],
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    let mut command = build_rclone_command(&prefs.rclone_path, args);
+    tokio::time::timeout(timeout, command.output())
+        .await
+        .map_err(|_| "rclone did not finish in time.".to_string())?
+        .map_err(|e| format!("Failed to run rclone: {e}"))
+}
+
+/// The most useful part of a failed rclone run: what it logged as an error, or
+/// the last thing it said before giving up.
+pub(crate) fn describe_command_failure(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let error_lines: Vec<String> = stderr.lines().filter_map(extract_log_error).collect();
+    let detail = if error_lines.is_empty() {
+        stderr.lines().rev().take(2).collect::<Vec<_>>().join("; ")
+    } else {
+        error_lines.join("; ")
+    };
+    detail.trim().to_string()
+}
+
+/// What the preflight panel reports about the service account folder.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceAccountSummary {
+    pub valid: usize,
+    /// File names that look like credentials but could not be parsed.
+    pub invalid: Vec<String>,
+}
+
+/// Counts usable service account files without loading a job's worth of state,
+/// so the preflight panel can say "4 of 5 usable" instead of just failing.
+pub fn inspect_service_account_files(folder: &str) -> Result<ServiceAccountSummary, String> {
+    let entries = std::fs::read_dir(folder)
+        .map_err(|e| format!("Failed to read service account folder: {e}"))?;
+
+    let mut summary = ServiceAccountSummary::default();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read folder entry: {e}"))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let is_json = path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+        if !is_json {
+            continue;
+        }
+
+        match read_service_account_email(&path) {
+            Ok(_) => summary.valid += 1,
+            Err(_) => summary.invalid.push(
+                path.file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.to_string_lossy().to_string()),
+            ),
+        }
+    }
+
+    Ok(summary)
+}
+
+/// Outcome of the write test.
+pub enum WriteCheck {
+    Writable,
+    /// Writing worked, but the folder created to prove it is still there.
+    WritableWithLeftover {
+        folder: String,
+    },
+}
+
+/// Creates and removes a folder in the destination.
+///
+/// Listing a folder only proves it can be read: a service account is regularly
+/// given viewer access to a shared drive, which passes `verify_destination` and
+/// then fails on the first file. This is the only check that answers the
+/// question the upload actually asks.
+pub async fn check_destination_writable(
+    prefs: &RclonePreferences,
+    service_account_folder: &str,
+    destination_folder_id: &str,
+) -> Result<WriteCheck, String> {
+    let sa_files = load_service_account_files(service_account_folder)?;
+    let sa = sa_files
+        .first()
+        .ok_or("No valid service account JSON files found in the selected folder.")?;
+
+    // Unique per run so two windows checking at once cannot collide, and
+    // obvious enough that a leftover folder is recognisable.
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let probe = format!("gdrive-upload-write-test-{stamp}");
+
+    let target = format!("{}:{}", prefs.remote_name, probe);
+    let common = [
+        "--drive-root-folder-id".to_string(),
+        destination_folder_id.to_string(),
+        "--drive-service-account-file".to_string(),
+        sa.path.to_string_lossy().to_string(),
+    ];
+
+    let mut mkdir_args = vec!["mkdir".to_string(), target.clone()];
+    mkdir_args.extend_from_slice(&common);
+    let output = run_rclone_to_completion(prefs, &mkdir_args, Duration::from_secs(30)).await?;
+
+    if !output.status.success() {
+        let detail = describe_command_failure(&output);
+        return Err(if detail.is_empty() {
+            "The service accounts cannot create folders here.".to_string()
+        } else {
+            format!("The service accounts cannot create folders here: {detail}")
+        });
+    }
+
+    let mut rmdir_args = vec!["rmdir".to_string(), target];
+    rmdir_args.extend_from_slice(&common);
+    let cleanup = run_rclone_to_completion(prefs, &rmdir_args, Duration::from_secs(30)).await;
+
+    match cleanup {
+        Ok(output) if output.status.success() => Ok(WriteCheck::Writable),
+        // Writing worked, which is what was being tested. Report that rather
+        // than failing the check, but name the folder left behind.
+        Ok(_) | Err(_) => {
+            log::warn!(target: "rclone", "preflight.cleanup_failed folder={probe}");
+            Ok(WriteCheck::WritableWithLeftover { folder: probe })
+        }
+    }
 }
 
 /// Check that the destination folder is reachable with the configured remote
@@ -751,11 +889,23 @@ pub struct ItemLinks {
     pub files: Vec<DriveFileLink>,
 }
 
+/// What a listing should cover. Drive charges a round trip per level, so each
+/// caller asks for the narrowest listing that answers its question.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LsMode {
+    /// Everything directly inside the folder.
+    TopLevel,
+    /// Subfolders of the folder, for the destination browser.
+    TopLevelDirs,
+    /// Every file underneath the folder, at any depth.
+    RecursiveFiles,
+}
+
 async fn run_lsjson(
     prefs: &RclonePreferences,
     sa_path: &Path,
     root_folder_id: &str,
-    recursive: bool,
+    mode: LsMode,
 ) -> Result<Vec<LsJsonEntry>, String> {
     let mut args = vec![
         "lsjson".to_string(),
@@ -765,12 +915,18 @@ async fn run_lsjson(
         "--drive-service-account-file".to_string(),
         sa_path.to_string_lossy().to_string(),
     ];
-    if recursive {
-        args.push("-R".to_string());
-        args.push("--files-only".to_string());
-    } else {
-        args.push("--max-depth".to_string());
-        args.push("1".to_string());
+    match mode {
+        LsMode::RecursiveFiles => {
+            args.push("-R".to_string());
+            args.push("--files-only".to_string());
+        }
+        LsMode::TopLevel | LsMode::TopLevelDirs => {
+            args.push("--max-depth".to_string());
+            args.push("1".to_string());
+            if mode == LsMode::TopLevelDirs {
+                args.push("--dirs-only".to_string());
+            }
+        }
     }
 
     let mut command = build_rclone_command(&prefs.rclone_path, &args);
@@ -817,7 +973,7 @@ pub async fn resolve_item_links(
         .unwrap_or(path)
         .to_string();
 
-    let top = run_lsjson(prefs, &sa.path, destination_folder_id, false).await?;
+    let top = run_lsjson(prefs, &sa.path, destination_folder_id, LsMode::TopLevel).await?;
     let Some(entry) = top.into_iter().find(|entry| entry.name == name) else {
         return Ok(ItemLinks::default());
     };
@@ -837,7 +993,7 @@ pub async fn resolve_item_links(
 
     // Scope the recursive listing to the uploaded folder rather than walking the
     // whole destination, which may hold plenty of unrelated content.
-    let files = run_lsjson(prefs, &sa.path, &id, true)
+    let files = run_lsjson(prefs, &sa.path, &id, LsMode::RecursiveFiles)
         .await
         .unwrap_or_default()
         .into_iter()
@@ -854,6 +1010,106 @@ pub async fn resolve_item_links(
         folder_id: Some(id),
         files,
     })
+}
+
+/// A folder the destination browser can show: a shared drive, or a folder
+/// inside one.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteFolder {
+    /// Drive folder ID, usable directly as an upload destination.
+    pub id: String,
+    pub name: String,
+}
+
+/// One entry of `rclone backend drives remote:`.
+#[derive(Debug, Deserialize)]
+struct SharedDriveEntry {
+    #[serde(rename = "id")]
+    id: String,
+    #[serde(rename = "name")]
+    name: String,
+}
+
+/// Shared drives the service accounts can reach.
+///
+/// This is the root of the destination browser: a service account has its own
+/// empty My Drive, so the only folders worth browsing are the shared drives it
+/// has been granted access to.
+pub async fn list_shared_drives(
+    prefs: &RclonePreferences,
+    service_account_folder: &str,
+) -> Result<Vec<RemoteFolder>, String> {
+    let sa_files = load_service_account_files(service_account_folder)?;
+    let sa = sa_files
+        .first()
+        .ok_or("No valid service account JSON files found in the selected folder.")?;
+
+    let args = vec![
+        "backend".to_string(),
+        "drives".to_string(),
+        format!("{}:", prefs.remote_name),
+        "--drive-service-account-file".to_string(),
+        sa.path.to_string_lossy().to_string(),
+    ];
+
+    let mut command = build_rclone_command(&prefs.rclone_path, &args);
+    let output = tokio::time::timeout(Duration::from_secs(60), command.output())
+        .await
+        .map_err(|_| "Timed out listing shared drives.".to_string())?
+        .map_err(|e| format!("Failed to run rclone: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.lines().rev().take(2).collect::<Vec<_>>().join("; ");
+        return Err(if detail.trim().is_empty() {
+            "Could not list shared drives.".to_string()
+        } else {
+            format!("Could not list shared drives: {}", detail.trim())
+        });
+    }
+
+    let drives: Vec<SharedDriveEntry> = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("Could not read the shared drive listing: {e}"))?;
+
+    Ok(drives
+        .into_iter()
+        .map(|drive| RemoteFolder {
+            id: drive.id,
+            name: drive.name,
+        })
+        .collect())
+}
+
+/// Subfolders of a Drive folder, so the browser can descend one level at a
+/// time instead of walking a whole drive up front.
+pub async fn list_remote_folders(
+    prefs: &RclonePreferences,
+    service_account_folder: &str,
+    folder_id: &str,
+) -> Result<Vec<RemoteFolder>, String> {
+    let sa_files = load_service_account_files(service_account_folder)?;
+    let sa = sa_files
+        .first()
+        .ok_or("No valid service account JSON files found in the selected folder.")?;
+
+    let mut folders: Vec<RemoteFolder> =
+        run_lsjson(prefs, &sa.path, folder_id, LsMode::TopLevelDirs)
+            .await?
+            .into_iter()
+            .filter(|entry| entry.is_dir)
+            .filter_map(|entry| {
+                entry.id.map(|id| RemoteFolder {
+                    id,
+                    name: entry.name,
+                })
+            })
+            .collect();
+
+    // Drive returns folders in an order of its own; the picker reads better
+    // alphabetically, the way a file browser lists them.
+    folders.sort_by_key(|folder| folder.name.to_lowercase());
+    Ok(folders)
 }
 
 fn build_rclone_args(

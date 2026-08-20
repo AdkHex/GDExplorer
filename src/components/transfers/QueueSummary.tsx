@@ -2,7 +2,7 @@ import { useMemo } from 'react'
 import { useLocalUploadQueue } from '@/store/local-upload-queue-store'
 import { useTransferUiStore } from '@/store/transfer-ui-store'
 import { ProgressBar } from './ProgressBar'
-import type { TransferState } from './status'
+import { summarizeQueue } from './summary'
 import { formatBytes, formatEta, formatSpeed } from './format'
 
 /**
@@ -14,64 +14,10 @@ export function QueueSummary() {
   const metrics = useTransferUiStore(s => s.metricsById)
   const pausedById = useTransferUiStore(s => s.pausedById)
 
-  const summary = useMemo(() => {
-    const counts: Record<TransferState, number> = {
-      queued: 0,
-      uploading: 0,
-      paused: 0,
-      completed: 0,
-      failed: 0,
-    }
-
-    let totalBytes = 0
-    let sentBytes = 0
-    let speed = 0
-    let isActive = false
-
-    for (const item of items) {
-      const status = item.status ?? 'queued'
-      const total = typeof item.totalBytes === 'number' ? item.totalBytes : 0
-      const sent = typeof item.bytesSent === 'number' ? item.bytesSent : 0
-
-      const state: TransferState =
-        status === 'done'
-          ? 'completed'
-          : status === 'failed'
-            ? 'failed'
-            : status === 'paused' || pausedById[item.id]
-              ? 'paused'
-              : status === 'uploading' || status === 'preparing'
-                ? 'uploading'
-                : 'queued'
-
-      counts[state] += 1
-      totalBytes += total
-      // A finished item counts as fully sent even if the last progress event
-      // undershot its total, so the bar reaches 100% when the batch is done.
-      sentBytes += state === 'completed' ? total : Math.min(sent, total)
-
-      if (state === 'uploading') {
-        isActive = true
-        speed += metrics[item.id]?.speedBytesPerSec ?? 0
-      }
-    }
-
-    const percent = totalBytes > 0 ? (sentBytes / totalBytes) * 100 : 0
-    const remaining = Math.max(0, totalBytes - sentBytes)
-    const etaSeconds = isActive && speed > 0 ? remaining / speed : null
-
-    const state: TransferState = counts.uploading
-      ? 'uploading'
-      : counts.paused
-        ? 'paused'
-        : counts.queued
-          ? 'queued'
-          : counts.failed
-            ? 'failed'
-            : 'completed'
-
-    return { counts, totalBytes, sentBytes, percent, speed, etaSeconds, state }
-  }, [items, metrics, pausedById])
+  const summary = useMemo(
+    () => summarizeQueue(items, metrics, pausedById),
+    [items, metrics, pausedById]
+  )
 
   if (items.length === 0) return null
 
@@ -96,8 +42,8 @@ export function QueueSummary() {
         {summary.totalBytes > 0
           ? `${formatBytes(summary.sentBytes)} of ${formatBytes(summary.totalBytes)}`
           : 'Size not known yet'}
-        {isActive && summary.speed > 0
-          ? ` · ${formatSpeed(summary.speed)}`
+        {isActive && summary.speedBytesPerSec > 0
+          ? ` · ${formatSpeed(summary.speedBytesPerSec)}`
           : ''}
         {isActive && summary.etaSeconds !== null
           ? ` · ${formatEta(summary.etaSeconds)} left`

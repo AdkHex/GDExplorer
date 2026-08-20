@@ -3,6 +3,12 @@
 export interface AppPreferences {
   theme: string
   autoCheckUpdates: boolean
+  /** Post a system notification when a batch of uploads finishes. */
+  notifyOnCompletion: boolean
+  /** Show the menu bar / tray icon with upload progress. */
+  showTrayIcon: boolean
+  /** Closing the window hides it instead of quitting. Needs the tray icon. */
+  closeToTray: boolean
   serviceAccountFolderPath: string | null
   maxConcurrentUploads: number
   uploadChunkSizeMib: number
@@ -27,6 +33,9 @@ export interface DestinationPreset {
 export const defaultPreferences: AppPreferences = {
   theme: 'system',
   autoCheckUpdates: true,
+  notifyOnCompletion: true,
+  showTrayIcon: true,
+  closeToTray: false,
   serviceAccountFolderPath: null,
   maxConcurrentUploads: 3,
   uploadChunkSizeMib: 256,

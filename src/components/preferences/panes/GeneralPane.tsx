@@ -7,10 +7,15 @@ import { Label } from '@/components/ui/label'
 import { Separator } from '@/components/ui/separator'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
+import { Switch } from '@/components/ui/switch'
 import { usePreferences, useSavePreferences } from '@/services/preferences'
 import type { DestinationPreset } from '@/types/preferences'
 import { extractDriveFolderId } from '@/lib/drive-url'
-import { isWindows } from '@/lib/platform'
+
+interface DetectedRclone {
+  path: string
+  version: string
+}
 
 const SettingsField: React.FC<{
   label: string
@@ -89,6 +94,9 @@ export const GeneralPane: React.FC = () => {
       rcloneBandwidthLimit: preferences.rcloneBandwidthLimit ?? '',
       rcloneExcludePatterns: preferences.rcloneExcludePatterns ?? [],
       destinationPresets: preferences.destinationPresets ?? [],
+      notifyOnCompletion: preferences.notifyOnCompletion ?? true,
+      showTrayIcon: preferences.showTrayIcon ?? true,
+      closeToTray: preferences.closeToTray ?? false,
     })
   }, [preferences])
 
@@ -169,7 +177,17 @@ const GeneralPaneForm: React.FC<{
     (preferences.rcloneExcludePatterns ?? []).join('\n')
   )
   const [isInstallingRclone, setIsInstallingRclone] = useState(false)
+  const [isDetectingRclone, setIsDetectingRclone] = useState(false)
   const [isConfiguringRclone, setIsConfiguringRclone] = useState(false)
+  const [notifyOnCompletion, setNotifyOnCompletion] = useState(
+    () => preferences.notifyOnCompletion ?? true
+  )
+  const [showTrayIcon, setShowTrayIcon] = useState(
+    () => preferences.showTrayIcon ?? true
+  )
+  const [closeToTray, setCloseToTray] = useState(
+    () => preferences.closeToTray ?? false
+  )
 
   const [destinationPresetsDraft, setDestinationPresetsDraft] = useState<
     DestinationPreset[]
@@ -400,18 +418,46 @@ const GeneralPaneForm: React.FC<{
       .catch(() => setExcludePatternsInput(lastSavedExcludePatterns))
   }
 
+  const applyRclonePath = async (path: string) => {
+    await savePreferences.mutateAsync({ rclonePath: path })
+    setRclonePathInput(path)
+    setLastSavedRclonePath(path)
+  }
+
   const handleInstallRclone = async () => {
     setIsInstallingRclone(true)
     try {
-      const path = await invoke<string>('install_rclone_windows')
-      await savePreferences.mutateAsync({ rclonePath: path })
-      setRclonePathInput(path)
-      setLastSavedRclonePath(path)
+      const path = await invoke<string>('install_rclone')
+      await applyRclonePath(path)
+      toast.success('rclone installed', { description: path })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       toast.error('Failed to install rclone', { description: message })
     } finally {
       setIsInstallingRclone(false)
+    }
+  }
+
+  // A GUI app inherits a minimal PATH on macOS, so an rclone installed with
+  // Homebrew is not found by name - detection looks where it actually lives.
+  const handleDetectRclone = async () => {
+    setIsDetectingRclone(true)
+    try {
+      const found = await invoke<DetectedRclone | null>('detect_rclone')
+      if (!found) {
+        toast.message('No rclone found', {
+          description:
+            'Install it below, or type the full path to an existing binary.',
+        })
+        return
+      }
+      await applyRclonePath(found.path)
+      toast.success(`Found ${found.version}`, { description: found.path })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      toast.error('Could not look for rclone', { description: message })
+    } finally {
+      setIsDetectingRclone(false)
     }
   }
 
@@ -545,6 +591,32 @@ const GeneralPaneForm: React.FC<{
         </SettingsField>
 
         <SettingsField
+          label="Notify when a batch finishes"
+          description="Posts a system notification with the result. Only when the window is in the background - a window you are looking at gets the in-app message instead."
+        >
+          <div className="flex items-center justify-between gap-4">
+            <p className="text-sm text-muted-foreground">
+              {notifyOnCompletion ? 'Notifications on' : 'Notifications off'}
+            </p>
+            <Switch
+              checked={notifyOnCompletion}
+              disabled={savePreferences.isPending}
+              aria-label="Notify when a batch finishes"
+              onCheckedChange={checked => {
+                setNotifyOnCompletion(checked)
+                savePreferences
+                  .mutateAsync({ notifyOnCompletion: checked })
+                  .catch(() => {
+                    setNotifyOnCompletion(
+                      preferences.notifyOnCompletion ?? true
+                    )
+                  })
+              }}
+            />
+          </div>
+        </SettingsField>
+
+        <SettingsField
           label="Bandwidth limit"
           description="Caps upload speed (rclone --bwlimit). For example 10M for 10 MiB/s. Leave empty for unlimited."
         >
@@ -617,44 +689,38 @@ const GeneralPaneForm: React.FC<{
           </div>
         </SettingsField>
 
-        {/* These call Windows-only commands that hard-error elsewhere, so they
-            are only offered on Windows. */}
-        {isWindows() ? (
-          <SettingsField
-            label="Rclone setup"
-            description="Download rclone and configure the remote automatically."
-          >
-            <div className="flex flex-wrap gap-2">
-              <Button
-                type="button"
-                onClick={handleInstallRclone}
-                disabled={isInstallingRclone}
-              >
-                {isInstallingRclone ? 'Installing…' : 'Install rclone'}
-              </Button>
-              <Button
-                type="button"
-                variant="secondary"
-                onClick={handleConfigureRclone}
-                disabled={
-                  isConfiguringRclone || !serviceAccountFolder.trim().length
-                }
-              >
-                {isConfiguringRclone ? 'Configuring…' : 'Configure remote'}
-              </Button>
-            </div>
-          </SettingsField>
-        ) : (
-          <SettingsField
-            label="Rclone setup"
-            description="Automatic setup is Windows-only. On this platform install rclone yourself (for example `brew install rclone`) and point the path above at it."
-          >
-            <p className="text-sm text-muted-foreground">
-              See{' '}
-              <span className="font-mono">https://rclone.org/downloads/</span>
-            </p>
-          </SettingsField>
-        )}
+        <SettingsField
+          label="Rclone setup"
+          description="Find an rclone you already have, download one into the app, and point the remote at your service accounts. Works on macOS, Windows and Linux."
+        >
+          <div className="flex flex-wrap gap-2">
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={handleDetectRclone}
+              disabled={isDetectingRclone}
+            >
+              {isDetectingRclone ? 'Looking…' : 'Detect rclone'}
+            </Button>
+            <Button
+              type="button"
+              onClick={handleInstallRclone}
+              disabled={isInstallingRclone}
+            >
+              {isInstallingRclone ? 'Installing…' : 'Install rclone'}
+            </Button>
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={handleConfigureRclone}
+              disabled={
+                isConfiguringRclone || !serviceAccountFolder.trim().length
+              }
+            >
+              {isConfiguringRclone ? 'Configuring…' : 'Configure remote'}
+            </Button>
+          </div>
+        </SettingsField>
 
         <SettingsField
           label="Destination presets"
@@ -743,6 +809,61 @@ const GeneralPaneForm: React.FC<{
                 ))
               )}
             </div>
+          </div>
+        </SettingsField>
+      </SettingsSection>
+
+      <SettingsSection title="Menu bar">
+        <SettingsField
+          label="Show the menu bar icon"
+          description="Adds an icon showing upload progress, with shortcuts to the window and Preferences."
+        >
+          <div className="flex items-center justify-between gap-4">
+            <p className="text-sm text-muted-foreground">
+              {showTrayIcon ? 'Icon shown' : 'Icon hidden'}
+            </p>
+            <Switch
+              checked={showTrayIcon}
+              disabled={savePreferences.isPending}
+              aria-label="Show the menu bar icon"
+              onCheckedChange={checked => {
+                setShowTrayIcon(checked)
+                savePreferences
+                  .mutateAsync({ showTrayIcon: checked })
+                  // Applied immediately rather than on next launch: a toggle
+                  // that does nothing until a restart reads as broken.
+                  .then(() => invoke('set_tray_visible', { visible: checked }))
+                  .catch(() => {
+                    setShowTrayIcon(preferences.showTrayIcon ?? true)
+                  })
+              }}
+            />
+          </div>
+        </SettingsField>
+
+        <SettingsField
+          label="Keep running when the window is closed"
+          description="Closing the window hides it instead of quitting, so an upload carries on. Reopen it from the menu bar icon. Needs the icon above."
+        >
+          <div className="flex items-center justify-between gap-4">
+            <p className="text-sm text-muted-foreground">
+              {closeToTray && showTrayIcon
+                ? 'Closing hides the window'
+                : 'Closing quits the app'}
+            </p>
+            <Switch
+              checked={closeToTray}
+              disabled={savePreferences.isPending || !showTrayIcon}
+              aria-label="Keep running when the window is closed"
+              onCheckedChange={checked => {
+                setCloseToTray(checked)
+                savePreferences
+                  .mutateAsync({ closeToTray: checked })
+                  .catch(() => {
+                    setCloseToTray(preferences.closeToTray ?? false)
+                  })
+              }}
+            />
           </div>
         </SettingsField>
       </SettingsSection>

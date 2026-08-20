@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { open } from '@tauri-apps/plugin-dialog'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
@@ -10,6 +10,8 @@ import { useUIStore } from '@/store/ui-store'
 import { TransferTable } from '@/components/transfers/TransferTable'
 import { toast } from 'sonner'
 import { logger } from '@/lib/logger'
+import { notifyIfUnfocused } from '@/lib/notifications'
+import { usePreferences } from '@/services/preferences'
 
 function normalizeSelection(
   selection: string | string[] | null
@@ -48,6 +50,11 @@ export function BrowseLocalFiles() {
   const recordFileList = useTransferUiStore(s => s.recordFileList)
   const clearFileProgress = useTransferUiStore(s => s.clearFileProgress)
   const { destinationError, destinationFolderId } = useUploadDestinationStore()
+  const { data: preferences } = usePreferences()
+  // Read through a ref inside the event listener: putting `preferences` in the
+  // effect deps would tear down and re-register every upload listener whenever
+  // a setting changes.
+  const notifyOnCompletionRef = useRef(true)
   const [isBrowsing, setIsBrowsing] = useState(false)
   const [isDropActive, setIsDropActive] = useState(false)
   const [isUploading, setIsUploading] = useState(false)
@@ -72,6 +79,10 @@ export function BrowseLocalFiles() {
       setIsBrowsing(false)
     }
   }
+
+  useEffect(() => {
+    notifyOnCompletionRef.current = preferences?.notifyOnCompletion ?? true
+  }, [preferences])
 
   useEffect(() => {
     let unlistenStatus: (() => void) | null = null
@@ -145,12 +156,25 @@ export function BrowseLocalFiles() {
         if (canceled > 0) parts.push(`${canceled} canceled`)
         const description = parts.join(', ')
 
+        const title =
+          failed > 0
+            ? 'Upload Finished With Errors'
+            : canceled > 0
+              ? 'Upload Canceled'
+              : 'Upload Complete'
+
         if (failed > 0) {
           toast.error('Upload finished with errors', { description })
         } else if (canceled > 0) {
           toast.message('Upload canceled', { description })
         } else {
           toast.success('Upload completed', { description })
+        }
+
+        // A batch can run for hours, so the result is worth a system
+        // notification when the user has moved on to something else.
+        if (notifyOnCompletionRef.current) {
+          void notifyIfUnfocused(title, description)
         }
       })
     }

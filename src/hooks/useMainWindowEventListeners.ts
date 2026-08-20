@@ -55,6 +55,11 @@ export function useMainWindowEventListeners() {
             setLeftSidebarVisible(!leftSidebarVisible)
             break
           }
+          case '2': {
+            e.preventDefault()
+            useUIStore.getState().toggleLogPanel()
+            break
+          }
         }
       }
     }
@@ -89,6 +94,11 @@ export function useMainWindowEventListeners() {
           const { leftSidebarVisible, setLeftSidebarVisible } =
             useUIStore.getState()
           setLeftSidebarVisible(!leftSidebarVisible)
+        }),
+
+        listen('menu-toggle-log-panel', () => {
+          logger.debug('Toggle log panel menu event received')
+          useUIStore.getState().toggleLogPanel()
         }),
       ])
 

@@ -1,5 +1,7 @@
 # Logs
-logs
+# Anchored to the root: an unanchored "logs" also matched source folders such
+# as src/components/logs, silently keeping them out of the repo.
+/logs
 *.log
 npm-debug.log*
 yarn-debug.log*

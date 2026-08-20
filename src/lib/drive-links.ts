@@ -1,6 +1,9 @@
 import { invoke } from '@tauri-apps/api/core'
-import { writeText } from '@tauri-apps/plugin-clipboard-manager'
-import { logger } from '@/lib/logger'
+
+// Copying links is not the only thing that reaches the clipboard any more (the
+// log panel does too), so the implementation lives in its own module and is
+// re-exported here for the call sites that already import it from here.
+export { copyText } from '@/lib/clipboard'
 
 export interface DriveFileLink {
   /** Path relative to the uploaded item, matching what the file rows show. */
@@ -38,21 +41,4 @@ export function resolveItemLinks(
   return invoke<ItemLinks>('resolve_item_links', {
     args: { path, kind, destinationFolderId },
   })
-}
-
-export async function copyText(text: string): Promise<void> {
-  try {
-    await writeText(text)
-    return
-  } catch (error) {
-    // `removeUnusedCommands` is enabled in tauri.conf.json, and it strips
-    // plugin commands it cannot see used in the frontend - the clipboard
-    // commands were being removed before this feature existed. If the native
-    // command is missing, the webview's own clipboard still works.
-    logger.debug('Native clipboard unavailable, using the webview clipboard', {
-      error: String(error),
-    })
-  }
-
-  await navigator.clipboard.writeText(text)
 }

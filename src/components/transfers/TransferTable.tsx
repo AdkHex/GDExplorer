@@ -59,6 +59,7 @@ import {
   driveFolderUrl,
   resolveItemLinks,
 } from '@/lib/drive-links'
+import { RemoteFolderBrowser } from '@/components/upload/RemoteFolderBrowser'
 import { useUploadDestinationStore } from '@/store/upload-destination-store'
 import { toast } from 'sonner'
 import { logger } from '@/lib/logger'
@@ -69,6 +70,7 @@ import {
   FilePlusIcon,
   FolderIcon,
   FolderPlusIcon,
+  FolderSearchIcon,
   LinkIcon,
   Loader2Icon,
   FolderSymlinkIcon,
@@ -1406,9 +1408,9 @@ function DestinationCell({
         })}
         {presets.length > 0 ? <DropdownMenuSeparator /> : null}
         {/* Saved presets alone are not enough: sending five folders to five
-            different places only works if an arbitrary folder can be pasted. */}
+            different places only works if any folder can be chosen. */}
         <DropdownMenuItem onSelect={onPickCustom}>
-          Paste folder link…
+          Choose another folder…
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
@@ -1426,14 +1428,27 @@ function CustomDestinationDialog({
   onConfirm: (folderId: string, label: string) => void
 }) {
   const [value, setValue] = useState('')
+  // Only set when the folder came from the browser, which is the one case
+  // where its real name is known - a pasted URL carries no name.
+  const [pickedName, setPickedName] = useState<string | null>(null)
+  const [browserOpen, setBrowserOpen] = useState(false)
   const folderId = extractDriveFolderId(value)
   const isInvalid = value.trim().length > 0 && !folderId
 
   // Clearing on close happens in the event handler rather than an effect;
   // setState inside an effect body just triggers a cascading render.
   const handleOpenChange = (next: boolean) => {
-    if (!next) setValue('')
+    if (!next) {
+      setValue('')
+      setPickedName(null)
+    }
     onOpenChange(next)
+  }
+
+  const confirm = () => {
+    if (!folderId) return
+    onConfirm(folderId, pickedName ?? 'Custom')
+    handleOpenChange(false)
   }
 
   return (
@@ -1442,29 +1457,52 @@ function CustomDestinationDialog({
         <DialogHeader>
           <DialogTitle>Destination for the selected items</DialogTitle>
           <DialogDescription>
-            Paste a Drive folder link or ID. It applies only to the rows you
-            picked, so other rows keep their own destination.
+            Browse your shared drives, or paste a Drive folder link or ID. It
+            applies only to the rows you picked, so other rows keep their own
+            destination.
           </DialogDescription>
         </DialogHeader>
-        <Input
-          autoFocus
-          value={value}
-          onChange={event => setValue(event.target.value)}
-          placeholder="https://drive.google.com/drive/folders/…"
-          spellCheck={false}
-          autoComplete="off"
-          aria-invalid={isInvalid}
-          aria-label="Destination folder link or ID"
-          onKeyDown={event => {
-            if (event.key === 'Enter' && folderId) {
-              onConfirm(folderId, 'Custom')
-              handleOpenChange(false)
-            }
-          }}
-        />
+        <div className="flex items-center gap-2">
+          <Input
+            autoFocus
+            value={value}
+            onChange={event => {
+              setValue(event.target.value)
+              setPickedName(null)
+            }}
+            placeholder="https://drive.google.com/drive/folders/…"
+            spellCheck={false}
+            autoComplete="off"
+            aria-invalid={isInvalid}
+            aria-label="Destination folder link or ID"
+            onKeyDown={event => {
+              if (event.key === 'Enter') confirm()
+            }}
+          />
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => setBrowserOpen(true)}
+          >
+            <FolderSearchIcon />
+            Browse
+          </Button>
+        </div>
         {isInvalid ? (
           <p className="text-xs text-status-danger">Not a Drive folder link</p>
+        ) : pickedName ? (
+          <p className="text-xs text-muted-foreground">
+            Uploads into {pickedName}
+          </p>
         ) : null}
+        <RemoteFolderBrowser
+          open={browserOpen}
+          onOpenChange={setBrowserOpen}
+          onSelect={folder => {
+            setValue(driveFolderUrl(folder.id))
+            setPickedName(folder.name)
+          }}
+        />
         <DialogFooter>
           <Button
             type="button"
@@ -1473,15 +1511,7 @@ function CustomDestinationDialog({
           >
             Cancel
           </Button>
-          <Button
-            type="button"
-            disabled={!folderId}
-            onClick={() => {
-              if (!folderId) return
-              onConfirm(folderId, 'Custom')
-              handleOpenChange(false)
-            }}
-          >
+          <Button type="button" disabled={!folderId} onClick={confirm}>
             Use folder
           </Button>
         </DialogFooter>

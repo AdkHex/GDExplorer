@@ -3,6 +3,7 @@
  */
 
 import { invoke } from '@tauri-apps/api/core'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import { toast } from 'sonner'
 import { logger } from './logger'
 
@@ -80,6 +81,33 @@ export async function notify(
     if (native) {
       toast.error(`${title}${message ? `: ${message}` : ''}`)
     }
+  }
+}
+
+/**
+ * Post a native notification only when the window is in the background.
+ *
+ * The system does not show banners for the frontmost app, and duplicating what
+ * the window already displays is exactly what the HIG warns against - a focused
+ * window gets the in-app toast on its own. Failures are logged rather than
+ * surfaced, because the caller has already shown the same information.
+ */
+export async function notifyIfUnfocused(
+  title: string,
+  message?: string
+): Promise<void> {
+  try {
+    if (await getCurrentWindow().isFocused()) return
+  } catch (error) {
+    // No Tauri window (tests, plain browser): nothing to notify from.
+    logger.debug('Window focus state unavailable', { error: String(error) })
+    return
+  }
+
+  try {
+    await invoke('send_native_notification', { title, body: message })
+  } catch (error) {
+    logger.warn('Failed to send native notification', { error: String(error) })
   }
 }
 

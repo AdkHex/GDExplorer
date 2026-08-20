@@ -5,6 +5,7 @@ export type PreferencePane = 'general' | 'appearance' | 'about'
 
 interface UIState {
   leftSidebarVisible: boolean
+  logPanelVisible: boolean
   preferencesOpen: boolean
   preferencesPane: PreferencePane
   updateDownloading: boolean
@@ -16,6 +17,8 @@ interface UIState {
 
   toggleLeftSidebar: () => void
   setLeftSidebarVisible: (visible: boolean) => void
+  toggleLogPanel: () => void
+  setLogPanelVisible: (visible: boolean) => void
   togglePreferences: () => void
   setPreferencesOpen: (open: boolean) => void
   setPreferencesPane: (pane: PreferencePane) => void
@@ -31,6 +34,7 @@ export const useUIStore = create<UIState>()(
   devtools(
     set => ({
       leftSidebarVisible: true,
+      logPanelVisible: false,
       preferencesOpen: false,
       preferencesPane: 'general',
       updateDownloading: false,
@@ -53,6 +57,16 @@ export const useUIStore = create<UIState>()(
           undefined,
           'setLeftSidebarVisible'
         ),
+
+      toggleLogPanel: () =>
+        set(
+          state => ({ logPanelVisible: !state.logPanelVisible }),
+          undefined,
+          'toggleLogPanel'
+        ),
+
+      setLogPanelVisible: visible =>
+        set({ logPanelVisible: visible }, undefined, 'setLogPanelVisible'),
 
       togglePreferences: () =>
         set(

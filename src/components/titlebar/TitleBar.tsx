@@ -19,6 +19,7 @@ import {
   Loader2,
   PanelLeft,
   PanelLeftClose,
+  ScrollText,
   Settings,
 } from 'lucide-react'
 import {
@@ -42,6 +43,8 @@ export function TitleBar({
   const {
     leftSidebarVisible,
     toggleLeftSidebar,
+    logPanelVisible,
+    toggleLogPanel,
     setPreferencesOpen,
     updateReady,
     updateDownloading,
@@ -86,6 +89,28 @@ export function TitleBar({
             <TooltipContent side="bottom">
               {leftSidebarVisible ? 'Hide sidebar' : 'Show sidebar'}
               <span className="ml-2 opacity-60">⌘1</span>
+            </TooltipContent>
+          </Tooltip>
+
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                onClick={toggleLogPanel}
+                variant="ghost"
+                size="icon"
+                className={cn(
+                  'size-7 text-foreground/70 hover:text-foreground',
+                  logPanelVisible && 'text-foreground'
+                )}
+                aria-label={logPanelVisible ? 'Hide log' : 'Show log'}
+                aria-pressed={logPanelVisible}
+              >
+                <ScrollText className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              {logPanelVisible ? 'Hide log' : 'Show log'}
+              <span className="ml-2 opacity-60">⌘2</span>
             </TooltipContent>
           </Tooltip>
         </div>
