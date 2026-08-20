@@ -29,6 +29,15 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -154,6 +163,10 @@ export function TransferTable({
   )
   const [clearDialogOpen, setClearDialogOpen] = useState(false)
   const [clearPending, setClearPending] = useState(false)
+  // Rows awaiting an arbitrary destination from the paste dialog.
+  const [customDestinationTargets, setCustomDestinationTargets] = useState<
+    string[] | null
+  >(null)
 
   const clearRemoved = useTransferUiStore(s => s.clearRemoved)
   const tick = useTransferUiStore(s => s.tick)
@@ -448,6 +461,12 @@ export function TransferTable({
                 ? Object.keys(rowSelection).filter(id => rowSelection[id])
                 : [row.original.id]
               setItemsDestination(ids, folderId, label)
+            }}
+            onPickCustom={() => {
+              const ids = row.getIsSelected()
+                ? Object.keys(rowSelection).filter(id => rowSelection[id])
+                : [row.original.id]
+              setCustomDestinationTargets(ids)
             }}
           />
         ),
@@ -849,6 +868,19 @@ export function TransferTable({
         </AlertDialogContent>
       </AlertDialog>
 
+      <CustomDestinationDialog
+        open={customDestinationTargets !== null}
+        onOpenChange={open => {
+          if (!open) setCustomDestinationTargets(null)
+        }}
+        onConfirm={(folderId, label) => {
+          if (customDestinationTargets) {
+            setItemsDestination(customDestinationTargets, folderId, label)
+          }
+          setCustomDestinationTargets(null)
+        }}
+      />
+
       <div className="relative min-h-0 flex-1 overflow-hidden rounded-lg border bg-card">
         <div className="h-full overflow-auto">
           <div role="treegrid" aria-label="Transfers" aria-multiselectable>
@@ -1077,15 +1109,22 @@ function FileRow({
  * Per-row destination. A row with no override follows the sidebar, which keeps
  * the common case (everything to one folder) free of per-row fiddling while
  * still allowing five folders to target five different Drives.
+ *
+ * The trigger deliberately has no Tooltip wrapper. `TooltipTrigger asChild`
+ * around `DropdownMenuTrigger asChild` makes the tooltip win the prop merge and
+ * replace the dropdown's pointer handler, so the button kept its ARIA
+ * attributes but the menu never opened.
  */
 function DestinationCell({
   item,
   presets,
   onPick,
+  onPickCustom,
 }: {
   item: TransferRowData
   presets: { id: string; name: string; url: string }[]
   onPick: (folderId: string | null, label: string | null) => void
+  onPickCustom: () => void
 }) {
   const label =
     item.destinationLabel ?? (item.destinationFolderId ? 'Custom' : 'Default')
@@ -1093,34 +1132,31 @@ function DestinationCell({
 
   return (
     <DropdownMenu>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <DropdownMenuTrigger asChild>
-            <button
-              type="button"
-              onClick={event => event.stopPropagation()}
-              className={cn(
-                'flex w-full min-w-0 items-center gap-1 rounded px-1 py-0.5 text-xs transition-colors',
-                'hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
-                isPinned ? 'text-foreground' : 'text-muted-foreground'
-              )}
-            >
-              <FolderSymlinkIcon className="size-3 shrink-0" />
-              <span className="truncate">{label}</span>
-            </button>
-          </DropdownMenuTrigger>
-        </TooltipTrigger>
-        <TooltipContent side="bottom">
-          {isPinned
-            ? `Uploads to ${label}`
-            : 'Follows the destination in the sidebar'}
-        </TooltipContent>
-      </Tooltip>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          onClick={event => event.stopPropagation()}
+          title={
+            isPinned
+              ? `Uploads to ${label}`
+              : 'Follows the destination in the sidebar'
+          }
+          className={cn(
+            'flex w-full min-w-0 items-center gap-1 rounded px-1 py-0.5 text-xs transition-colors',
+            'hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
+            isPinned ? 'text-foreground' : 'text-muted-foreground'
+          )}
+        >
+          <FolderSymlinkIcon className="size-3 shrink-0" />
+          <span className="truncate">{label}</span>
+          <ChevronDownIcon className="ml-auto size-3 shrink-0 opacity-50" />
+        </button>
+      </DropdownMenuTrigger>
       <DropdownMenuContent align="start">
         <DropdownMenuItem onSelect={() => onPick(null, null)}>
           Use sidebar destination
         </DropdownMenuItem>
-        {presets.length > 0 ? <DropdownMenuSeparator /> : null}
+        <DropdownMenuSeparator />
         {presets.map(preset => {
           const folderId = extractDriveFolderId(preset.url)
           if (!folderId) return null
@@ -1133,8 +1169,89 @@ function DestinationCell({
             </DropdownMenuItem>
           )
         })}
+        {presets.length > 0 ? <DropdownMenuSeparator /> : null}
+        {/* Saved presets alone are not enough: sending five folders to five
+            different places only works if an arbitrary folder can be pasted. */}
+        <DropdownMenuItem onSelect={onPickCustom}>
+          Paste folder link…
+        </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
+  )
+}
+
+/** Prompts for an arbitrary Drive folder to pin onto the selected rows. */
+function CustomDestinationDialog({
+  open,
+  onOpenChange,
+  onConfirm,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  onConfirm: (folderId: string, label: string) => void
+}) {
+  const [value, setValue] = useState('')
+  const folderId = extractDriveFolderId(value)
+  const isInvalid = value.trim().length > 0 && !folderId
+
+  // Clearing on close happens in the event handler rather than an effect;
+  // setState inside an effect body just triggers a cascading render.
+  const handleOpenChange = (next: boolean) => {
+    if (!next) setValue('')
+    onOpenChange(next)
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Destination for the selected items</DialogTitle>
+          <DialogDescription>
+            Paste a Drive folder link or ID. It applies only to the rows you
+            picked, so other rows keep their own destination.
+          </DialogDescription>
+        </DialogHeader>
+        <Input
+          autoFocus
+          value={value}
+          onChange={event => setValue(event.target.value)}
+          placeholder="https://drive.google.com/drive/folders/…"
+          spellCheck={false}
+          autoComplete="off"
+          aria-invalid={isInvalid}
+          aria-label="Destination folder link or ID"
+          onKeyDown={event => {
+            if (event.key === 'Enter' && folderId) {
+              onConfirm(folderId, 'Custom')
+              handleOpenChange(false)
+            }
+          }}
+        />
+        {isInvalid ? (
+          <p className="text-xs text-status-danger">Not a Drive folder link</p>
+        ) : null}
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="secondary"
+            onClick={() => handleOpenChange(false)}
+          >
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            disabled={!folderId}
+            onClick={() => {
+              if (!folderId) return
+              onConfirm(folderId, 'Custom')
+              handleOpenChange(false)
+            }}
+          >
+            Use folder
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
 
