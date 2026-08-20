@@ -1,11 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import {
-  CopyIcon,
-  PauseIcon,
-  PlayIcon,
-  Trash2Icon,
-  XIcon,
-} from 'lucide-react'
+import { CopyIcon, PauseIcon, PlayIcon, Trash2Icon, XIcon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -20,7 +14,11 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
-import { useLogStream, type LogEntry, type LogLevel } from '@/hooks/useLogStream'
+import {
+  useLogStream,
+  type LogEntry,
+  type LogLevel,
+} from '@/hooks/useLogStream'
 import { copyText } from '@/lib/clipboard'
 import { logger } from '@/lib/logger'
 import { cn } from '@/lib/utils'
@@ -177,7 +175,11 @@ export function LogPanel({ onClose }: { onClose: () => void }) {
           value={levelFilter}
           onValueChange={value => setLevelFilter(value as LevelFilterValue)}
         >
-          <SelectTrigger size="sm" className="w-40 text-xs" aria-label="Log level">
+          <SelectTrigger
+            size="sm"
+            className="w-40 text-xs"
+            aria-label="Log level"
+          >
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -193,7 +195,11 @@ export function LogPanel({ onClose }: { onClose: () => void }) {
           value={sourceFilter}
           onValueChange={value => setSourceFilter(value as SourceFilterValue)}
         >
-          <SelectTrigger size="sm" className="w-32 text-xs" aria-label="Log source">
+          <SelectTrigger
+            size="sm"
+            className="w-32 text-xs"
+            aria-label="Log source"
+          >
             <SelectValue />
           </SelectTrigger>
           <SelectContent>

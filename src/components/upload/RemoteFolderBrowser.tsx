@@ -8,8 +8,11 @@ import {
   HardDriveIcon,
   Loader2Icon,
   RefreshCwIcon,
+  SearchIcon,
+  XIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import {
   Dialog,
   DialogContent,
@@ -53,6 +56,56 @@ function fetchFolders(parentId: string): Promise<RemoteFolder[]> {
       })
 }
 
+/** Short searches match half a drive, so they are not worth a round trip. */
+const MIN_SEARCH_LENGTH = 2
+
+/** Long enough that typing does not fire a search per keystroke. */
+const SEARCH_DEBOUNCE_MS = 400
+
+/** Matches the backend cap, so the UI can say when it was hit. */
+const MAX_SEARCH_RESULTS = 200
+
+interface SearchGroup {
+  drive: RemoteFolder
+  folders: RemoteFolder[]
+  error?: string
+}
+
+interface SearchResult {
+  query: string
+  groups: SearchGroup[]
+}
+
+/**
+ * Searches every reachable drive at once.
+ *
+ * Drive runs each search server-side, so this is a handful of quick calls
+ * rather than a walk of the tree. One drive failing does not lose the others -
+ * its own row reports why.
+ */
+async function searchAllDrives(
+  drives: RemoteFolder[],
+  query: string
+): Promise<SearchGroup[]> {
+  return Promise.all(
+    drives.map(async drive => {
+      try {
+        const folders = await invoke<RemoteFolder[]>('search_remote_folders', {
+          args: { driveId: drive.id, query },
+        })
+        return { drive, folders }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        logger.warn('Drive folder search failed', {
+          drive: drive.name,
+          error: message,
+        })
+        return { drive, folders: [], error: message }
+      }
+    })
+  )
+}
+
 /**
  * Picks a Drive destination from a tree instead of a pasted URL.
  *
@@ -93,6 +146,9 @@ function FolderTree({
 }) {
   const [state, setState] = useState<BrowserState>(INITIAL_STATE)
   const [selected, setSelected] = useState<RemoteFolder | null>(null)
+  const [query, setQuery] = useState('')
+  const [debouncedQuery, setDebouncedQuery] = useState('')
+  const [searchResult, setSearchResult] = useState<SearchResult | null>(null)
 
   const applyFolders = useCallback(
     (parentId: string, folders: RemoteFolder[]) =>
@@ -173,64 +229,135 @@ function FolderTree({
   const rootError = state.errorById[ROOT_KEY]
   const isLoadingRoots = Boolean(state.loadingById[ROOT_KEY])
 
+  const trimmedQuery = query.trim()
+  const isSearchActive = trimmedQuery.length >= MIN_SEARCH_LENGTH
+  // No separate loading flag: results carry the term they belong to, so
+  // anything else means the answer for what is typed has not arrived. That
+  // also makes a stale response from a previous term impossible to show.
+  const isSearching = isSearchActive && searchResult?.query !== debouncedQuery
+
+  useEffect(() => {
+    const timer = setTimeout(
+      () => setDebouncedQuery(query.trim()),
+      SEARCH_DEBOUNCE_MS
+    )
+    return () => clearTimeout(timer)
+  }, [query])
+
+  useEffect(() => {
+    if (debouncedQuery.length < MIN_SEARCH_LENGTH) return
+    if (!roots || roots.length === 0) return
+
+    let cancelled = false
+    searchAllDrives(roots, debouncedQuery)
+      .then(groups => {
+        if (!cancelled) setSearchResult({ query: debouncedQuery, groups })
+      })
+      .catch(error => {
+        logger.warn('Folder search failed', { error: String(error) })
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [debouncedQuery, roots])
+
   return (
     <>
       <DialogHeader>
         <DialogTitle>Choose a destination folder</DialogTitle>
         <DialogDescription>
           Shared drives your service accounts can reach. Expand one to pick a
-          folder inside it.
+          folder inside it, or search every drive by name.
         </DialogDescription>
       </DialogHeader>
 
-      <div
-        className="h-72 overflow-auto rounded-md border bg-card p-1"
-        role="tree"
-        aria-label="Drive folders"
-      >
-        {isLoadingRoots ? (
-          <p className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
-            <Loader2Icon className="size-4 animate-spin" />
-            Loading shared drives…
-          </p>
-        ) : rootError ? (
-          <div className="space-y-3 px-3 py-8 text-center">
-            <p className="flex items-center justify-center gap-1.5 text-sm text-status-danger">
-              <AlertCircleIcon className="size-4 shrink-0" />
-              Could not list shared drives
-            </p>
-            <p className="text-xs text-muted-foreground">{rootError}</p>
-            <Button
-              type="button"
-              variant="secondary"
-              size="sm"
-              onClick={() => reload(ROOT_KEY)}
-            >
-              <RefreshCwIcon />
-              Try again
-            </Button>
-          </div>
-        ) : roots && roots.length === 0 ? (
-          <p className="px-3 py-8 text-center text-xs text-muted-foreground">
-            No shared drives are visible to your service accounts. Share a drive
-            with them, or paste a folder link instead.
-          </p>
-        ) : (
-          (roots ?? []).map(root => (
-            <FolderNode
-              key={root.id}
-              folder={root}
-              depth={0}
-              isDrive
-              state={state}
-              selectedId={selected?.id ?? null}
-              onToggle={toggle}
-              onSelect={setSelected}
-              onRetry={reload}
-            />
-          ))
-        )}
+      <div className="relative">
+        <SearchIcon className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          value={query}
+          onChange={event => setQuery(event.target.value)}
+          placeholder="Search folders in all drives…"
+          spellCheck={false}
+          autoComplete="off"
+          aria-label="Search folders by name"
+          disabled={!roots || roots.length === 0}
+          className="px-8"
+        />
+        {query ? (
+          <button
+            type="button"
+            onClick={() => setQuery('')}
+            aria-label="Clear the search"
+            className="absolute right-2 top-1/2 flex size-5 -translate-y-1/2 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          >
+            <XIcon className="size-3.5" />
+          </button>
+        ) : null}
       </div>
+
+      {isSearchActive ? (
+        <div
+          className="h-72 overflow-auto rounded-md border bg-card p-1"
+          aria-label="Search results"
+          aria-busy={isSearching}
+        >
+          <SearchResults
+            isSearching={isSearching}
+            result={searchResult}
+            selectedId={selected?.id ?? null}
+            onSelect={setSelected}
+          />
+        </div>
+      ) : (
+        <div
+          className="h-72 overflow-auto rounded-md border bg-card p-1"
+          role="tree"
+          aria-label="Drive folders"
+        >
+          {isLoadingRoots ? (
+            <p className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
+              <Loader2Icon className="size-4 animate-spin" />
+              Loading shared drives…
+            </p>
+          ) : rootError ? (
+            <div className="space-y-3 px-3 py-8 text-center">
+              <p className="flex items-center justify-center gap-1.5 text-sm text-status-danger">
+                <AlertCircleIcon className="size-4 shrink-0" />
+                Could not list shared drives
+              </p>
+              <p className="text-xs text-muted-foreground">{rootError}</p>
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                onClick={() => reload(ROOT_KEY)}
+              >
+                <RefreshCwIcon />
+                Try again
+              </Button>
+            </div>
+          ) : roots && roots.length === 0 ? (
+            <p className="px-3 py-8 text-center text-xs text-muted-foreground">
+              No shared drives are visible to your service accounts. Share a
+              drive with them, or paste a folder link instead.
+            </p>
+          ) : (
+            (roots ?? []).map(root => (
+              <FolderNode
+                key={root.id}
+                folder={root}
+                depth={0}
+                isDrive
+                state={state}
+                selectedId={selected?.id ?? null}
+                onToggle={toggle}
+                onSelect={setSelected}
+                onRetry={reload}
+              />
+            ))
+          )}
+        </div>
+      )}
 
       <DialogFooter className="sm:items-center sm:justify-between">
         <p className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
@@ -258,6 +385,98 @@ function FolderTree({
         </div>
       </DialogFooter>
     </>
+  )
+}
+
+/**
+ * Flat list of matches, grouped by the drive they were found in.
+ *
+ * A match has no path shown: Drive returns parent IDs, not names, and turning
+ * each one into a readable path would cost a call per result. The drive it
+ * lives in is the context that fits in one line.
+ */
+function SearchResults({
+  isSearching,
+  result,
+  selectedId,
+  onSelect,
+}: {
+  isSearching: boolean
+  result: SearchResult | null
+  selectedId: string | null
+  onSelect: (folder: RemoteFolder) => void
+}) {
+  if (isSearching && !result) {
+    return (
+      <p className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
+        <Loader2Icon className="size-4 animate-spin" />
+        Searching every drive…
+      </p>
+    )
+  }
+
+  if (!result) return null
+
+  const matchCount = result.groups.reduce(
+    (total, group) => total + group.folders.length,
+    0
+  )
+  const failures = result.groups.filter(group => group.error)
+
+  if (matchCount === 0 && failures.length === 0) {
+    return (
+      <p className="px-6 py-8 text-center text-xs text-muted-foreground">
+        No folders match “{result.query}”. Drive matches from the start of a
+        word, so try the beginning of the name.
+      </p>
+    )
+  }
+
+  return (
+    <div className={cn(isSearching && 'opacity-60')}>
+      {result.groups.map(group =>
+        group.folders.length === 0 && !group.error ? null : (
+          <div key={group.drive.id} className="pb-1">
+            <div className="flex items-center gap-1.5 px-2 py-1 text-xs text-muted-foreground">
+              <HardDriveIcon className="size-3.5 shrink-0" />
+              <span className="truncate">{group.drive.name}</span>
+            </div>
+
+            {group.error ? (
+              <p className="flex items-start gap-1.5 px-2 pb-1 pl-7 text-xs text-status-danger">
+                <AlertCircleIcon className="mt-0.5 size-3.5 shrink-0" />
+                <span className="break-words">{group.error}</span>
+              </p>
+            ) : null}
+
+            {group.folders.map(folder => (
+              <button
+                key={folder.id}
+                type="button"
+                onClick={() => onSelect(folder)}
+                className={cn(
+                  'flex w-full min-w-0 items-center gap-1.5 rounded px-2 py-1 pl-7 text-left text-sm',
+                  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
+                  selectedId === folder.id
+                    ? 'bg-status-info/10'
+                    : 'hover:bg-accent/60'
+                )}
+              >
+                <FolderIcon className="size-4 shrink-0 text-muted-foreground" />
+                <span className="truncate">{folder.name}</span>
+              </button>
+            ))}
+
+            {group.folders.length >= MAX_SEARCH_RESULTS ? (
+              <p className="px-2 pl-7 text-xs text-muted-foreground">
+                First {MAX_SEARCH_RESULTS} matches — narrow the search to see
+                the rest.
+              </p>
+            ) : null}
+          </div>
+        )
+      )}
+    </div>
   )
 }
 

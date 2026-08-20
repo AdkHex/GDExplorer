@@ -357,6 +357,29 @@ async fn list_remote_folders(
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SearchRemoteFoldersArgs {
+    drive_id: String,
+    query: String,
+}
+
+/// Finds folders by name anywhere in one shared drive, so a destination deep in
+/// a tree does not have to be clicked down to.
+#[tauri::command]
+async fn search_remote_folders(
+    app: AppHandle,
+    args: SearchRemoteFoldersArgs,
+) -> Result<Vec<upload::rclone::RemoteFolder>, String> {
+    let drive_id = args.drive_id.trim();
+    if drive_id.is_empty() {
+        return Err("No drive to search.".to_string());
+    }
+    let (prefs, service_account_folder) = rclone_context(app).await?;
+    upload::rclone::search_remote_folders(&prefs, &service_account_folder, drive_id, &args.query)
+        .await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ResolveItemLinksArgs {
     path: String,
     kind: String,
@@ -1336,6 +1359,7 @@ pub fn run() {
             verify_destination,
             list_shared_drives,
             list_remote_folders,
+            search_remote_folders,
             run_preflight,
             pause_upload,
             pause_items,

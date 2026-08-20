@@ -1112,6 +1112,100 @@ pub async fn list_remote_folders(
     Ok(folders)
 }
 
+/// One entry of `rclone backend query`, which returns raw Drive file objects.
+#[derive(Debug, Deserialize)]
+struct DriveQueryEntry {
+    id: Option<String>,
+    name: Option<String>,
+    #[serde(rename = "mimeType")]
+    mime_type: Option<String>,
+}
+
+const DRIVE_FOLDER_MIME: &str = "application/vnd.google-apps.folder";
+
+/// Keeps the search term inside its quoted literal. Drive's query language
+/// escapes with backslashes, so a folder called `Bob's` would otherwise close
+/// the string early and produce a syntax error rather than a result.
+fn escape_drive_query_value(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+/// Most matches anyone scrolls through. A two-letter search can match thousands
+/// of folders; the UI says when it hit this ceiling.
+pub const MAX_SEARCH_RESULTS: usize = 200;
+
+/// Finds folders anywhere in one shared drive whose name matches `query`.
+///
+/// Drive does the searching, so a drive with thousands of folders answers about
+/// as fast as an empty one - walking the tree with recursive listings would
+/// take a call per folder. `--drive-team-drive` is what scopes the search to
+/// the drive: rclone only asks the API for `corpora=drive` when that option is
+/// set, and without it the search does not reach shared drives at all.
+///
+/// Note that Drive's `contains` matches from the start of a word rather than
+/// anywhere in the name, so "Ato" finds "Atomic" but "tomic" does not. That is
+/// the API's behaviour, not a filter applied here.
+pub async fn search_remote_folders(
+    prefs: &RclonePreferences,
+    service_account_folder: &str,
+    drive_id: &str,
+    query: &str,
+) -> Result<Vec<RemoteFolder>, String> {
+    let needle = query.trim();
+    if needle.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let sa_files = load_service_account_files(service_account_folder)?;
+    let sa = sa_files
+        .first()
+        .ok_or("No valid service account JSON files found in the selected folder.")?;
+
+    let drive_query = format!(
+        "name contains '{}' and mimeType = '{DRIVE_FOLDER_MIME}' and trashed = false",
+        escape_drive_query_value(needle)
+    );
+
+    let args = vec![
+        "backend".to_string(),
+        "query".to_string(),
+        format!("{}:", prefs.remote_name),
+        drive_query,
+        "--drive-service-account-file".to_string(),
+        sa.path.to_string_lossy().to_string(),
+        "--drive-team-drive".to_string(),
+        drive_id.to_string(),
+    ];
+
+    let output = run_rclone_to_completion(prefs, &args, Duration::from_secs(60)).await?;
+
+    if !output.status.success() {
+        let detail = describe_command_failure(&output);
+        return Err(if detail.is_empty() {
+            "Could not search this drive.".to_string()
+        } else {
+            format!("Could not search this drive: {detail}")
+        });
+    }
+
+    let entries: Vec<DriveQueryEntry> = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("Could not read the search results: {e}"))?;
+
+    let mut folders: Vec<RemoteFolder> = entries
+        .into_iter()
+        .filter(|entry| entry.mime_type.as_deref() == Some(DRIVE_FOLDER_MIME))
+        .filter_map(|entry| {
+            let id = entry.id?;
+            let name = entry.name?;
+            Some(RemoteFolder { id, name })
+        })
+        .collect();
+
+    folders.sort_by_key(|folder| folder.name.to_lowercase());
+    folders.truncate(MAX_SEARCH_RESULTS);
+    Ok(folders)
+}
+
 fn build_rclone_args(
     prefs: &RclonePreferences,
     item: &QueueItemInput,
@@ -1454,5 +1548,19 @@ async fn read_rclone_stream<R: tokio::io::AsyncRead + Unpin>(
         if !line.is_empty() {
             let _ = tx.send(line).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escapes_quotes_in_a_search_term() {
+        // A folder called "Bob's" would otherwise close the quoted literal and
+        // turn the search into a Drive query syntax error.
+        assert_eq!(escape_drive_query_value("Bob's"), r"Bob\'s");
+        assert_eq!(escape_drive_query_value(r"back\slash"), r"back\\slash");
+        assert_eq!(escape_drive_query_value("plain"), "plain");
     }
 }
