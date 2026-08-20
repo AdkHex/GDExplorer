@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "GDExplorer",
+  "productName": "GDrive-Upload",
   "version": "0.2.5",
   "identifier": "com.vo1x.gdexplorer",
   "build": {
@@ -13,7 +13,7 @@
   "app": {
     "windows": [
       {
-        "title": "GDExplorer",
+        "title": "GDrive-Upload by Ionicboy",
         "width": 1200,
         "height": 800,
         "minWidth": 1000,
@@ -53,7 +53,7 @@
     "publisher": "vo1x",
     "category": "DeveloperTool",
     "shortDescription": "Google Drive Shared Drive uploader",
-    "longDescription": "GDExplorer is a Tauri desktop app for managing and uploading local files/folders to Google Drive Shared Drives using Service Accounts.",
+    "longDescription": "GDrive-Upload by Ionicboy is a Tauri desktop app for uploading local files and folders to Google Drive Shared Drives using service accounts.",
     "copyright": "Copyright © 2025 vo1x. All rights reserved.",
     "macOS": {
       "frameworks": [],

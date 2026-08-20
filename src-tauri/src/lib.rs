@@ -199,8 +199,10 @@ async fn verify_destination(app: AppHandle, args: VerifyDestinationArgs) -> Resu
 #[tauri::command]
 async fn pause_upload(state: State<'_, UploadControlState>, paused: bool) -> Result<(), String> {
     let guard = state.0.lock().await;
+    // Returning Ok() with no control handle let the UI paint rows as paused
+    // while rclone kept running. Report it instead so the caller can react.
     let Some(control) = guard.as_ref() else {
-        return Ok(());
+        return Err("No upload is running".to_string());
     };
     control.set_paused(paused);
     Ok(())
@@ -213,8 +215,14 @@ async fn pause_items(
 ) -> Result<(), String> {
     let guard = state.0.lock().await;
     let Some(control) = guard.as_ref() else {
-        return Ok(());
+        return Err("No upload is running".to_string());
     };
+    log::debug!(
+        target: "rclone",
+        "upload.pause_request ids={:?} paused={}",
+        args.item_ids,
+        args.paused
+    );
     control.set_items_paused(&args.item_ids, args.paused);
     Ok(())
 }
@@ -473,11 +481,16 @@ impl Default for AppPreferences {
             auto_check_updates: true,
             service_account_folder_path: None,
             max_concurrent_uploads: 3,
-            upload_chunk_size_mib: 128,
+            // Peak rclone memory is roughly
+            //   max_concurrent_uploads * rclone_transfers * upload_chunk_size
+            // so these three defaults are chosen together: 3 * 16 * 256 MiB is
+            // about 12 GiB. Raise transfers for more throughput only if the
+            // machine has the RAM for it.
+            upload_chunk_size_mib: 256,
             rclone_path: "rclone".to_string(),
             rclone_remote_name: "gdrive".to_string(),
-            rclone_transfers: 4,
-            rclone_checkers: 8,
+            rclone_transfers: 16,
+            rclone_checkers: 16,
             rclone_retries: default_rclone_retries(),
             rclone_bandwidth_limit: String::new(),
             rclone_exclude_patterns: Vec::new(),
@@ -503,11 +516,11 @@ fn default_rclone_remote_name() -> String {
 }
 
 fn default_rclone_transfers() -> u16 {
-    4
+    16
 }
 
 fn default_rclone_checkers() -> u16 {
-    8
+    16
 }
 
 fn get_preferences_path(app: &AppHandle) -> Result<PathBuf, String> {

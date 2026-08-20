@@ -299,9 +299,14 @@ export function BrowseLocalFiles() {
         })
         return
       }
-      invoke('pause_items', { itemIds: toResume, paused: false }).catch(err => {
-        logger.debug('pause_items resume failed', { error: String(err) })
-      })
+      try {
+        await invoke('pause_items', { itemIds: toResume, paused: false })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        logger.warn('pause_items resume failed', { error: message })
+        toast.error('Could not resume', { description: message })
+        return
+      }
       for (const id of toResume) {
         setItemStatus(id, 'uploading', null, null)
       }
@@ -386,11 +391,17 @@ export function BrowseLocalFiles() {
 
     if (toPause.length === 0) return
 
-    invoke('pause_items', { itemIds: toPause, paused: true }).catch(err => {
-      logger.debug('pause_items pause failed', { error: String(err) })
-    })
-    for (const id of toPause) {
-      setItemStatus(id, 'paused', null, null)
+    // Wait for the backend to accept the request, and do NOT mark the rows
+    // paused here. rclone stops asynchronously and the backend emits the
+    // authoritative `paused` status once the process is actually down.
+    // Painting rows yellow optimistically is what made a pause that never
+    // happened look like one that did.
+    try {
+      await invoke('pause_items', { itemIds: toPause, paused: true })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      logger.warn('pause_items failed', { error: message })
+      toast.error('Could not pause', { description: message })
     }
   }
 

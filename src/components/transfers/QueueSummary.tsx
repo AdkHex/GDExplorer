@@ -2,17 +2,8 @@ import { useMemo } from 'react'
 import { useLocalUploadQueue } from '@/store/local-upload-queue-store'
 import { useTransferUiStore } from '@/store/transfer-ui-store'
 import { ProgressBar } from './ProgressBar'
-import { TRANSFER_STATUS, type TransferState } from './status'
+import type { TransferState } from './status'
 import { formatBytes, formatEta, formatSpeed } from './format'
-import { cn } from '@/lib/utils'
-
-const COUNT_ORDER: { state: TransferState; label: string }[] = [
-  { state: 'uploading', label: 'uploading' },
-  { state: 'queued', label: 'queued' },
-  { state: 'paused', label: 'paused' },
-  { state: 'completed', label: 'done' },
-  { state: 'failed', label: 'failed' },
-]
 
 /**
  * Per-row progress answers "how is this file doing"; this answers "how is the
@@ -112,28 +103,6 @@ export function QueueSummary() {
           ? ` · ${formatEta(summary.etaSeconds)} left`
           : ''}
       </p>
-
-      <ul className="flex flex-wrap gap-x-3 gap-y-1">
-        {COUNT_ORDER.filter(entry => summary.counts[entry.state] > 0).map(
-          entry => (
-            <li
-              key={entry.state}
-              className="flex items-center gap-1.5 text-xs text-muted-foreground"
-            >
-              <span
-                aria-hidden="true"
-                className={cn(
-                  'size-1.5 shrink-0 rounded-full',
-                  TRANSFER_STATUS[entry.state].fill
-                )}
-              />
-              <span className="tabular-nums">
-                {summary.counts[entry.state]} {entry.label}
-              </span>
-            </li>
-          )
-        )}
-      </ul>
     </section>
   )
 }

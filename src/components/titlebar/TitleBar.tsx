@@ -34,7 +34,10 @@ interface TitleBarProps {
   title?: string
 }
 
-export function TitleBar({ className, title = 'GDExplorer' }: TitleBarProps) {
+export function TitleBar({
+  className,
+  title = 'GDrive-Upload',
+}: TitleBarProps) {
   const [confirmOpen, setConfirmOpen] = useState(false)
   const {
     leftSidebarVisible,
@@ -89,8 +92,9 @@ export function TitleBar({ className, title = 'GDExplorer' }: TitleBarProps) {
       </div>
 
       {/* Center - Title */}
-      <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2">
+      <div className="absolute left-1/2 top-1/2 flex -translate-x-1/2 -translate-y-1/2 items-baseline gap-1.5">
         <span className="text-sm font-medium text-foreground/80">{title}</span>
+        <span className="text-[10px] text-muted-foreground">by ionicboy</span>
       </div>
 
       {/* Right side - Right Actions */}
@@ -154,7 +158,7 @@ export function TitleBar({ className, title = 'GDExplorer' }: TitleBarProps) {
           <AlertDialogHeader>
             <AlertDialogTitle>Restart to update?</AlertDialogTitle>
             <AlertDialogDescription>
-              GDExplorer will restart to install the update.
+              GDrive-Upload will restart to install the update.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

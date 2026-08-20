@@ -47,7 +47,10 @@ export const AboutPane: React.FC = () => {
         <Separator className="mt-2" />
       </div>
       <div className="space-y-1">
-        <p className="text-sm text-foreground">GDExplorer</p>
+        <p className="text-sm text-foreground">
+          GDrive-Upload{' '}
+          <span className="text-xs text-muted-foreground">by ionicboy</span>
+        </p>
         <p className="text-sm text-muted-foreground">Version {appVersion}</p>
       </div>
       <div className="space-y-2">
@@ -133,7 +136,7 @@ export const AboutPane: React.FC = () => {
           <AlertDialogHeader>
             <AlertDialogTitle>Restart to update?</AlertDialogTitle>
             <AlertDialogDescription>
-              GDExplorer will restart to install the update.
+              GDrive-Upload will restart to install the update.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
