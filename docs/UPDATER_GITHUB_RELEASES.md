@@ -45,24 +45,33 @@ Updater artifacts are signed, and the app refuses an update whose signature does
 not match the public key it was built with.
 
 - Public key: `plugins.updater.pubkey` in `src-tauri/tauri.conf.json`.
-- Private key: the `TAURI_SIGNING_PRIVATE_KEY` repository secret, with
-  `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` for its password (empty here).
+- Private key: the `TAURI_SIGNING_PRIVATE_KEY` repository secret, unlocked by
+  `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
 
-**Keep a backup of the private key.** Losing it means no future release can be
-signed for the apps already out there: you would have to generate a new pair,
-ship a build carrying the new public key, and get everyone to install that one
-by hand, because their current app will reject everything signed with the new
-key.
+The pair currently in use was generated on the macOS machine and lives in
+`~/.tauri/`: `gdrive-upload-updater.key`, its `.pub`, and
+`gdrive-upload-updater.password`.
+
+**Keep a backup of the private key and its password**, somewhere that is not
+that one laptop. Losing them means no future release can be signed for the apps
+already installed: you would have to generate a new pair, ship a build carrying
+the new public key, and get everyone to install that one by hand, because their
+current app rejects everything signed with a key it does not know.
 
 To generate a fresh pair:
 
 ```sh
-npx tauri signer generate -w ~/.tauri/gdrive-upload-updater.key --password ""
+# Use a real password. A key generated with --password "" is rejected by the
+# bundler as having the wrong password, and the build fails after producing the
+# installer.
+npx tauri signer generate -w ~/.tauri/gdrive-upload-updater.key --password "$PW"
 gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/gdrive-upload-updater.key
+printf '%s' "$PW" | gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 ```
 
 Then copy the contents of `~/.tauri/gdrive-upload-updater.key.pub` into
-`plugins.updater.pubkey`.
+`plugins.updater.pubkey`. Everyone already running the app has to reinstall
+after that, so only do it if the old key is genuinely gone.
 
 ## In the app
 
