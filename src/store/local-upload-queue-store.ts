@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { createJSONStorage, devtools, persist } from 'zustand/middleware'
+import { devtools } from 'zustand/middleware'
 
 export type LocalUploadItemKind = 'file' | 'folder'
 
@@ -81,202 +81,198 @@ function addUniqueItems(
   return existing.concat(newItems)
 }
 
+// The queue used to be persisted here. Drop what earlier versions wrote so the
+// dead entry does not sit in localStorage forever.
+try {
+  localStorage.removeItem('gdexplorer-upload-queue')
+} catch {
+  // Storage can be unavailable (private mode, embedded webview); nothing to do.
+}
+
+/**
+ * The queue is intentionally not persisted. Rehydrated rows came back as plain
+ * "queued" entries with no progress, so a finished batch reappeared on every
+ * launch looking like work still to do.
+ */
 export const useLocalUploadQueue = create<LocalUploadQueueState>()(
   devtools(
-    persist(
-      set => ({
-        items: [],
+    set => ({
+      items: [],
 
-        addItems: incoming =>
-          set(
-            state => ({
-              items: addUniqueItems(state.items, incoming),
-            }),
-            undefined,
-            'addItems'
-          ),
+      addItems: incoming =>
+        set(
+          state => ({
+            items: addUniqueItems(state.items, incoming),
+          }),
+          undefined,
+          'addItems'
+        ),
 
-        addFiles: paths =>
-          set(
-            state => ({
-              items: addUniqueItems(
-                state.items,
-                paths.map(path => ({ path, kind: 'file' as const }))
-              ),
-            }),
-            undefined,
-            'addFiles'
-          ),
+      addFiles: paths =>
+        set(
+          state => ({
+            items: addUniqueItems(
+              state.items,
+              paths.map(path => ({ path, kind: 'file' as const }))
+            ),
+          }),
+          undefined,
+          'addFiles'
+        ),
 
-        addFolders: paths =>
-          set(
-            state => ({
-              items: addUniqueItems(
-                state.items,
-                paths.map(path => ({ path, kind: 'folder' as const }))
-              ),
-            }),
-            undefined,
-            'addFolders'
-          ),
+      addFolders: paths =>
+        set(
+          state => ({
+            items: addUniqueItems(
+              state.items,
+              paths.map(path => ({ path, kind: 'folder' as const }))
+            ),
+          }),
+          undefined,
+          'addFolders'
+        ),
 
-        // Not every status event carries the service account (pause/resume events
-        // omit it), so keep the last known value instead of blanking it out.
-        setItemStatus: (itemId, status, message = null, saEmail = null) =>
-          set(
-            state => ({
+      // Not every status event carries the service account (pause/resume events
+      // omit it), so keep the last known value instead of blanking it out.
+      setItemStatus: (itemId, status, message = null, saEmail = null) =>
+        set(
+          state => ({
+            items: state.items.map(item =>
+              item.id === itemId
+                ? {
+                    ...item,
+                    status,
+                    message,
+                    saEmail: saEmail ?? item.saEmail ?? null,
+                  }
+                : item
+            ),
+          }),
+          undefined,
+          'setItemStatus'
+        ),
+
+      setItemProgress: (itemId, bytesSent, totalBytes) =>
+        set(
+          state => ({
+            items: state.items.map(item =>
+              item.id === itemId ? { ...item, bytesSent, totalBytes } : item
+            ),
+          }),
+          undefined,
+          'setItemProgress'
+        ),
+
+      setItemsDestination: (itemIds, destinationFolderId, destinationLabel) =>
+        set(
+          state => {
+            if (itemIds.length === 0) return state
+            const ids = new Set(itemIds)
+            return {
               items: state.items.map(item =>
-                item.id === itemId
+                ids.has(item.id)
+                  ? { ...item, destinationFolderId, destinationLabel }
+                  : item
+              ),
+            }
+          },
+          undefined,
+          'setItemsDestination'
+        ),
+
+      recordUploadDestination: (itemId, folderId) =>
+        set(
+          state => ({
+            items: state.items.map(item =>
+              item.id === itemId
+                ? { ...item, uploadedToFolderId: folderId }
+                : item
+            ),
+          }),
+          undefined,
+          'recordUploadDestination'
+        ),
+
+      resetUploadState: () =>
+        set(
+          state => ({
+            items: state.items.map(item => ({
+              ...item,
+              status: 'queued',
+              message: null,
+              bytesSent: undefined,
+              totalBytes: undefined,
+              saEmail: null,
+            })),
+          }),
+          undefined,
+          'resetUploadState'
+        ),
+
+      resetItemsUploadState: itemIds =>
+        set(
+          state => {
+            if (itemIds.length === 0) return state
+            const ids = new Set(itemIds)
+            return {
+              items: state.items.map(item =>
+                ids.has(item.id)
                   ? {
                       ...item,
-                      status,
-                      message,
-                      saEmail: saEmail ?? item.saEmail ?? null,
+                      status: 'queued',
+                      message: null,
+                      bytesSent: undefined,
+                      totalBytes: undefined,
+                      saEmail: null,
                     }
                   : item
               ),
-            }),
-            undefined,
-            'setItemStatus'
-          ),
+            }
+          },
+          undefined,
+          'resetItemsUploadState'
+        ),
 
-        setItemProgress: (itemId, bytesSent, totalBytes) =>
-          set(
-            state => ({
+      // When a job ends, anything still shown as in-flight never got a terminal
+      // status from the backend (typically it was never dequeued before a
+      // cancel). Put those rows back to "queued" instead of leaving them stuck
+      // on "Preparing" forever.
+      resetStaleUploadState: () =>
+        set(
+          state => {
+            const inFlight = new Set(['preparing', 'uploading', 'paused'])
+            if (!state.items.some(item => inFlight.has(item.status ?? ''))) {
+              return state
+            }
+            return {
               items: state.items.map(item =>
-                item.id === itemId ? { ...item, bytesSent, totalBytes } : item
-              ),
-            }),
-            undefined,
-            'setItemProgress'
-          ),
-
-        setItemsDestination: (itemIds, destinationFolderId, destinationLabel) =>
-          set(
-            state => {
-              if (itemIds.length === 0) return state
-              const ids = new Set(itemIds)
-              return {
-                items: state.items.map(item =>
-                  ids.has(item.id)
-                    ? { ...item, destinationFolderId, destinationLabel }
-                    : item
-                ),
-              }
-            },
-            undefined,
-            'setItemsDestination'
-          ),
-
-        recordUploadDestination: (itemId, folderId) =>
-          set(
-            state => ({
-              items: state.items.map(item =>
-                item.id === itemId
-                  ? { ...item, uploadedToFolderId: folderId }
+                inFlight.has(item.status ?? '')
+                  ? {
+                      ...item,
+                      status: 'queued' as const,
+                      message: null,
+                      bytesSent: undefined,
+                      totalBytes: undefined,
+                    }
                   : item
               ),
-            }),
-            undefined,
-            'recordUploadDestination'
-          ),
+            }
+          },
+          undefined,
+          'resetStaleUploadState'
+        ),
 
-        resetUploadState: () =>
-          set(
-            state => ({
-              items: state.items.map(item => ({
-                ...item,
-                status: 'queued',
-                message: null,
-                bytesSent: undefined,
-                totalBytes: undefined,
-                saEmail: null,
-              })),
-            }),
-            undefined,
-            'resetUploadState'
-          ),
+      remove: path =>
+        set(
+          state => ({
+            items: state.items.filter(item => item.path !== path),
+          }),
+          undefined,
+          'remove'
+        ),
 
-        resetItemsUploadState: itemIds =>
-          set(
-            state => {
-              if (itemIds.length === 0) return state
-              const ids = new Set(itemIds)
-              return {
-                items: state.items.map(item =>
-                  ids.has(item.id)
-                    ? {
-                        ...item,
-                        status: 'queued',
-                        message: null,
-                        bytesSent: undefined,
-                        totalBytes: undefined,
-                        saEmail: null,
-                      }
-                    : item
-                ),
-              }
-            },
-            undefined,
-            'resetItemsUploadState'
-          ),
-
-        // When a job ends, anything still shown as in-flight never got a terminal
-        // status from the backend (typically it was never dequeued before a
-        // cancel). Put those rows back to "queued" instead of leaving them stuck
-        // on "Preparing" forever.
-        resetStaleUploadState: () =>
-          set(
-            state => {
-              const inFlight = new Set(['preparing', 'uploading', 'paused'])
-              if (!state.items.some(item => inFlight.has(item.status ?? ''))) {
-                return state
-              }
-              return {
-                items: state.items.map(item =>
-                  inFlight.has(item.status ?? '')
-                    ? {
-                        ...item,
-                        status: 'queued' as const,
-                        message: null,
-                        bytesSent: undefined,
-                        totalBytes: undefined,
-                      }
-                    : item
-                ),
-              }
-            },
-            undefined,
-            'resetStaleUploadState'
-          ),
-
-        remove: path =>
-          set(
-            state => ({
-              items: state.items.filter(item => item.path !== path),
-            }),
-            undefined,
-            'remove'
-          ),
-
-        clear: () => set({ items: [] }, undefined, 'clear'),
-      }),
-      {
-        name: 'gdexplorer-upload-queue',
-        storage: createJSONStorage(() => localStorage),
-        // Only the durable identity of a queued item survives a restart.
-        // Progress, status and the service account used are all specific to a
-        // run, so rehydrated rows come back as plain queued entries.
-        partialize: state => ({
-          items: state.items.map(({ id, path, kind, addedAt }) => ({
-            id,
-            path,
-            kind,
-            addedAt,
-          })),
-        }),
-      }
-    ),
+      clear: () => set({ items: [] }, undefined, 'clear'),
+    }),
     { name: 'local-upload-queue' }
   )
 )

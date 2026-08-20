@@ -7,6 +7,8 @@ import {
   FolderIcon,
   HardDriveIcon,
   LinkIcon,
+  PinIcon,
+  PinOffIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -26,11 +28,12 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
 import { useUploadDestinationStore } from '@/store/upload-destination-store'
-import { usePreferences } from '@/services/preferences'
+import { usePreferences, useSavePreferences } from '@/services/preferences'
 import { logger } from '@/lib/logger'
 import { cn } from '@/lib/utils'
 import { extractDriveFolderId } from '@/lib/drive-url'
 import { driveFolderUrl } from '@/lib/drive-links'
+import type { DestinationPreset } from '@/types/preferences'
 import { RemoteFolderBrowser } from './RemoteFolderBrowser'
 
 export function DestinationPicker() {
@@ -50,15 +53,70 @@ export function DestinationPicker() {
   const [browserOpen, setBrowserOpen] = useState(false)
   const [pasteOpen, setPasteOpen] = useState(false)
 
+  const savePreferences = useSavePreferences()
+
   const destinationPresets = useMemo(
     () => preferences?.destinationPresets ?? [],
     [preferences?.destinationPresets]
   )
 
+  // Pinned destinations earn a permanent row in the sidebar; the rest stay one
+  // click away in the dropdown.
+  const pinnedPresets = useMemo(
+    () => destinationPresets.filter(preset => preset.pinned),
+    [destinationPresets]
+  )
+  const unpinnedPresets = useMemo(
+    () => destinationPresets.filter(preset => !preset.pinned),
+    [destinationPresets]
+  )
+
+  const setPinned = (presetId: string, pinned: boolean) => {
+    const next = destinationPresets.map(preset =>
+      preset.id === presetId ? { ...preset, pinned } : preset
+    )
+    savePreferences.mutateAsync({ destinationPresets: next }).catch(error => {
+      logger.warn('Could not change the pinned destinations', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    })
+  }
+
+  /** Save the current destination as a pinned preset. */
+  const pinCurrent = () => {
+    if (!destinationFolderId) return
+    const name = destinationName ?? destinationFolderId
+    const existing = destinationPresets.find(
+      preset => extractDriveFolderId(preset.url) === destinationFolderId
+    )
+    if (existing) {
+      setPinned(existing.id, true)
+      return
+    }
+    const preset: DestinationPreset = {
+      id: `pin-${destinationFolderId}`,
+      name,
+      url: driveFolderUrl(destinationFolderId),
+      pinned: true,
+    }
+    savePreferences
+      .mutateAsync({ destinationPresets: [preset, ...destinationPresets] })
+      .catch(error => {
+        logger.warn('Could not pin the destination', {
+          error: error instanceof Error ? error.message : String(error),
+        })
+      })
+  }
+
+  const currentPreset = destinationPresets.find(
+    preset => extractDriveFolderId(preset.url) === destinationFolderId
+  )
+  const isCurrentPinned = Boolean(currentPreset?.pinned)
+
   useEffect(() => {
     const firstPreset = destinationPresets[0]
     if (!firstPreset) return
-    applyDefaultDestination(firstPreset.url)
+    applyDefaultDestination(firstPreset.url, firstPreset.name)
   }, [destinationPresets, applyDefaultDestination])
 
   // A pasted link carries only an ID, so ask rclone what the folder is called.
@@ -156,7 +214,7 @@ export function DestinationPicker() {
         </DropdownMenuTrigger>
 
         <DropdownMenuContent align="start" className="w-[220px]">
-          {destinationPresets.map(preset => {
+          {unpinnedPresets.map(preset => {
             const presetId = extractDriveFolderId(preset.url)
             const isActive =
               presetId !== null && presetId === destinationFolderId
@@ -177,7 +235,7 @@ export function DestinationPicker() {
               </DropdownMenuItem>
             )
           })}
-          {destinationPresets.length > 0 ? <DropdownMenuSeparator /> : null}
+          {unpinnedPresets.length > 0 ? <DropdownMenuSeparator /> : null}
 
           <DropdownMenuItem onSelect={() => setBrowserOpen(true)}>
             <HardDriveIcon />
@@ -204,6 +262,16 @@ export function DestinationPicker() {
                 Open in Drive
               </DropdownMenuItem>
               <DropdownMenuItem
+                onSelect={() =>
+                  isCurrentPinned && currentPreset
+                    ? setPinned(currentPreset.id, false)
+                    : pinCurrent()
+                }
+              >
+                {isCurrentPinned ? <PinOffIcon /> : <PinIcon />}
+                {isCurrentPinned ? 'Unpin from sidebar' : 'Pin to sidebar'}
+              </DropdownMenuItem>
+              <DropdownMenuItem
                 variant="destructive"
                 onSelect={clearDestination}
               >
@@ -213,6 +281,49 @@ export function DestinationPicker() {
           ) : null}
         </DropdownMenuContent>
       </DropdownMenu>
+
+      {pinnedPresets.length > 0 ? (
+        <ul className="space-y-0.5">
+          {pinnedPresets.map(preset => {
+            const presetId = extractDriveFolderId(preset.url)
+            const isActive =
+              presetId !== null && presetId === destinationFolderId
+            return (
+              <li key={preset.id} className="group flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setDestinationFolder(preset.url, preset.name, [preset.name])
+                  }
+                  className={cn(
+                    'flex min-w-0 flex-1 items-center gap-1.5 rounded px-1.5 py-1 text-left text-xs transition-colors',
+                    'hover:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
+                    isActive
+                      ? 'bg-status-info/15 text-foreground'
+                      : 'text-muted-foreground'
+                  )}
+                >
+                  <FolderIcon className="size-3.5 shrink-0" />
+                  <span className="truncate">{preset.name}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPinned(preset.id, false)}
+                  className={cn(
+                    'flex size-6 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors',
+                    'hover:bg-accent hover:text-foreground',
+                    'opacity-0 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
+                    'group-hover:opacity-100'
+                  )}
+                  aria-label={`Unpin ${preset.name}`}
+                >
+                  <PinOffIcon className="size-3" />
+                </button>
+              </li>
+            )
+          })}
+        </ul>
+      ) : null}
 
       <RemoteFolderBrowser
         open={browserOpen}

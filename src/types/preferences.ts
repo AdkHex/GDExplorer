@@ -28,6 +28,8 @@ export interface DestinationPreset {
   id: string
   name: string
   url: string
+  /** Pinned entries show in the sidebar; the rest live in its dropdown. */
+  pinned?: boolean
 }
 
 export const defaultPreferences: AppPreferences = {

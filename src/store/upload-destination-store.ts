@@ -25,7 +25,7 @@ export interface UploadDestinationState {
    * destination - otherwise clearing the input to paste a new URL instantly
    * refilled it with the first preset.
    */
-  applyDefaultDestination: (url: string) => void
+  applyDefaultDestination: (url: string, name?: string) => void
   clearDestination: () => void
 }
 
@@ -59,10 +59,18 @@ export const useUploadDestinationStore = create<UploadDestinationState>()(
           'setDestinationUrl'
         ),
 
-      applyDefaultDestination: url => {
+      applyDefaultDestination: (url, name) => {
         const { hasUserSetDestination, destinationUrl } = get()
         if (hasUserSetDestination || destinationUrl.trim()) return
-        set(derive(url), undefined, 'applyDefaultDestination')
+        // `derive` clears the name, because typing a new URL invalidates it.
+        // A preset already knows what it is called, so put that straight back -
+        // otherwise the card showed a raw ID on every launch while it waited on
+        // a Drive lookup that may never answer.
+        set(
+          { ...derive(url), destinationName: name ?? null },
+          undefined,
+          'applyDefaultDestination'
+        )
       },
 
       setDestinationFolder: (url, name, path) =>

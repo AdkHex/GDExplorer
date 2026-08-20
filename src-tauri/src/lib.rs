@@ -682,6 +682,10 @@ pub struct DestinationPreset {
     pub id: String,
     pub name: String,
     pub url: String,
+    /// Pinned destinations are listed in the sidebar; the rest stay in its
+    /// dropdown. Defaults to false so presets saved before this existed load.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
