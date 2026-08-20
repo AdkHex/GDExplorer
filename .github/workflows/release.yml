@@ -1,15 +1,32 @@
-name: 'Release GDExplorer'
+name: 'Release GDrive-Upload'
 
+# Every push to main publishes a new release, which is what makes installed
+# apps update: the updater only offers a release whose version is higher than
+# the one it is running, so each push bumps the patch version first.
+#
+# Doc-only pushes are skipped - they would otherwise churn out releases with no
+# change to install.
 on:
   push:
-    tags: ['v*']
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.vscode/**'
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Release version (e.g., v1.0.0)'
-        required: true
-        type: string
+      bump:
+        description: 'Which part of the version to raise'
+        default: patch
+        type: choice
+        options: [patch, minor, major]
+      include_macos:
+        description: 'Also build the macOS bundle'
+        default: false
+        type: boolean
 
+# Releases are serialised. Two runs bumping the version at once would race on
+# the push to main, and the loser would fail after a full build.
 concurrency:
   group: gdexplorer-release
   cancel-in-progress: false
@@ -19,14 +36,40 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  publish-tauri-macos:
+  windows:
+    name: Windows installer
+    runs-on: windows-latest
     permissions:
       contents: write
-    runs-on: macos-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify updater public key is configured
+      # Release whatever main currently is, not the sha that triggered this
+      # run. Two pushes in quick succession queue on the concurrency group, and
+      # the second would otherwise try to push its version bump onto a main
+      # that had moved on - failing after a full build.
+      - name: Move to the tip of main
+        shell: bash
+        run: |
+          git fetch origin main
+          git checkout -B main origin/main
+
+      # Both checks run before anything is built or committed: a missing key
+      # otherwise fails deep inside the bundler, after a version bump has
+      # already been pushed.
+      - name: Check the updater signing key is available
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set. Add it under Settings > Secrets and variables > Actions. Without it the updater artifacts cannot be signed, and installed apps would never see this release."
+            exit 1
+          fi
+
+      - name: Check the updater public key is configured
         shell: bash
         run: |
           node -e "const c=require('./src-tauri/tauri.conf.json'); const k=c?.plugins?.updater?.pubkey; if(!k||k.includes('YOUR_UPDATER_PUBLIC_KEY_HERE')){ console.error('Updater pubkey is not configured in src-tauri/tauri.conf.json (plugins.updater.pubkey).'); process.exit(1);} console.log('Updater pubkey is configured.');"
@@ -61,16 +104,118 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile --prefer-offline
 
-      - name: Build and release
+      # Every push ships to users, so a broken commit must not become a
+      # release. The Rust side needs no separate step - it has to compile for
+      # the bundle to exist at all.
+      - name: Run checks
+        shell: bash
+        run: pnpm run typecheck && pnpm run lint && pnpm run test:run
+
+      - name: Raise the version
+        id: bump
+        shell: bash
+        run: |
+          version="$(node scripts/bump-version.js "${{ inputs.bump || 'patch' }}")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing v$version"
+
+      - name: Commit and tag the version
+        shell: bash
+        run: |
+          version="${{ steps.bump.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
+          git commit -m "chore(release): v$version [skip ci]"
+          git tag "v$version"
+          # A push made with GITHUB_TOKEN does not start another workflow run,
+          # so this cannot loop. The [skip ci] marker says so out loud too.
+          git push origin HEAD:main
+          git push origin "v$version"
+
+      # NSIS only, deliberately. Shipping an .msi as well would let someone
+      # install one flavour and be updated into the other, ending up with two
+      # copies of the app; the NSIS installer also installs per-user, so
+      # neither installing nor updating needs an admin prompt.
+      - name: Build and publish
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # Developer ID signing + notarization. When these secrets are absent
-          # the build falls back to the ad-hoc signature from tauri.conf.json,
-          # which still produces a working artifact but one that Gatekeeper
-          # blocks on other machines ("app is damaged").
+        with:
+          tagName: v${{ steps.bump.outputs.version }}
+          releaseName: 'GDrive-Upload v${{ steps.bump.outputs.version }}'
+          releaseBody: |
+            Download `GDrive-Upload_${{ steps.bump.outputs.version }}_x64-setup.exe` and run it.
+
+            Already have it installed? You do not need this page — the app
+            checks for updates on startup and offers this version itself.
+
+            **Changes**: https://github.com/${{ github.repository }}/commits/v${{ steps.bump.outputs.version }}
+          # Published, not a draft. The updater reads
+          # /releases/latest/download/latest.json, and a draft release is never
+          # "latest" - leaving it as a draft is what makes every client report
+          # that it is already up to date.
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+          args: --bundles nsis
+
+  macos:
+    name: macOS bundle
+    # Not part of the automatic path: the Mac here is only used to write the
+    # code, and an unsigned bundle is blocked by Gatekeeper anyway. Run the
+    # workflow by hand with "Also build the macOS bundle" when one is wanted.
+    if: github.event_name == 'workflow_dispatch' && inputs.include_macos
+    needs: windows
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.windows.outputs.version }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 10
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+          cache-on-failure: true
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: Build and attach to the release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Developer ID signing + notarization. Without these the bundle still
+          # builds, but Gatekeeper blocks it on any other machine.
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -78,87 +223,9 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
-          tagName: ${{ github.ref_name || inputs.version }}
-          releaseName: 'GDExplorer ${{ github.ref_name || inputs.version }}'
-          releaseBody: |
-            ## 🚀 GDExplorer ${{ github.ref_name || inputs.version }}
-
-            ### Installation Instructions
-            - **Windows**: Download the installer (`.msi` or `.exe`) and run it
-            - **macOS**: Download the `.dmg` file and drag to Applications folder
-
-            ### Auto-Updates
-            Existing users will receive automatic update notifications.
-
-            **Full Changelog**: https://github.com/${{ github.repository }}/commits/${{ github.ref_name || inputs.version }}
-          releaseDraft: true
+          tagName: v${{ needs.windows.outputs.version }}
+          releaseName: 'GDrive-Upload v${{ needs.windows.outputs.version }}'
+          releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
           args: --bundles app,dmg
-
-  publish-tauri-windows:
-    permissions:
-      contents: write
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Verify updater public key is configured
-        shell: bash
-        run: |
-          node -e "const c=require('./src-tauri/tauri.conf.json'); const k=c?.plugins?.updater?.pubkey; if(!k||k.includes('YOUR_UPDATER_PUBLIC_KEY_HERE')){ console.error('Updater pubkey is not configured in src-tauri/tauri.conf.json (plugins.updater.pubkey).'); process.exit(1);} console.log('Updater pubkey is configured.');"
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 'lts/*'
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v2
-        with:
-          version: 10
-
-      - name: Cache pnpm store
-        uses: actions/cache@v4
-        with:
-          path: ~/.pnpm-store
-          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('pnpm-lock.yaml') }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-store-
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: './src-tauri -> target'
-          cache-on-failure: true
-
-      - name: Install frontend dependencies
-        run: pnpm install --frozen-lockfile --prefer-offline
-
-      - name: Build and release
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          tagName: ${{ github.ref_name || inputs.version }}
-          releaseName: 'GDExplorer ${{ github.ref_name || inputs.version }}'
-          releaseBody: |
-            ## 🚀 GDExplorer ${{ github.ref_name || inputs.version }}
-
-            ### Installation Instructions
-            - **Windows**: Download the installer (`.msi` or `.exe`) and run it
-            - **macOS**: Download the `.dmg` file and drag to Applications folder
-
-            ### Auto-Updates
-            Existing users will receive automatic update notifications.
-
-            **Full Changelog**: https://github.com/${{ github.repository }}/commits/${{ github.ref_name || inputs.version }}
-          releaseDraft: true
-          prerelease: false
-          includeUpdaterJson: true
-          args: --bundles msi
