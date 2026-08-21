@@ -98,7 +98,7 @@ describe('transferUiStore file progress keying', () => {
   })
 })
 
-describe('transferUiStore reported speeds', () => {
+describe('transferUiStore speed is measured, not reported', () => {
   beforeEach(() => {
     useTransferUiStore.setState({
       pausedById: {},
@@ -113,17 +113,22 @@ describe('transferUiStore reported speeds', () => {
     })
   })
 
-  it('shows the rclone-reported file speed instead of a byte-delta estimate', () => {
+  it('ignores rclone speedAvg for a file and measures byte progress', () => {
+    // speedAvg counts buffered bytes, so a huge reported value must not be
+    // displayed when almost nothing has actually moved.
     seedList(['/root/a.txt'])
 
     useTransferUiStore
       .getState()
-      .recordFileProgress(ITEM, '/root/a.txt', 50, 100, 12345)
+      .recordFileProgress(ITEM, '/root/a.txt', 50, 100, 999_999_999)
 
-    expect(
+    const speed =
       useTransferUiStore.getState().fileMetricsById[ITEM]?.['/root/a.txt']
-        ?.speedBytesPerSec
-    ).toBe(12345)
+        ?.speedBytesPerSec ?? 0
+    expect(speed).not.toBe(999_999_999)
+    // The seeded list gives a 0-byte baseline, so this is a real measurement:
+    // 50 bytes over the minimum 250ms window = 200 B/s.
+    expect(speed).toBe(200)
   })
 
   it('zeroes the file speed once the file is complete', () => {
@@ -131,10 +136,10 @@ describe('transferUiStore reported speeds', () => {
 
     useTransferUiStore
       .getState()
-      .recordFileProgress(ITEM, '/root/a.txt', 50, 100, 500)
+      .recordFileProgress(ITEM, '/root/a.txt', 50, 100)
     useTransferUiStore
       .getState()
-      .recordFileProgress(ITEM, '/root/a.txt', 100, 100, 500)
+      .recordFileProgress(ITEM, '/root/a.txt', 100, 100)
 
     expect(
       useTransferUiStore.getState().fileMetricsById[ITEM]?.['/root/a.txt']
@@ -142,8 +147,10 @@ describe('transferUiStore reported speeds', () => {
     ).toBe(0)
   })
 
-  it('uses a fresh reported item speed in tick', () => {
-    useTransferUiStore.getState().recordItemSpeed(ITEM, 777)
+  it('ignores a reported item speed in tick', () => {
+    // The headline symptom: rclone claims a high rate while the transfer is
+    // barely moving. The row must reflect the bytes, not the claim.
+    useTransferUiStore.getState().recordItemSpeed(ITEM, 999_999_999)
     useTransferUiStore
       .getState()
       .tick([
@@ -152,18 +159,17 @@ describe('transferUiStore reported speeds', () => {
 
     expect(
       useTransferUiStore.getState().metricsById[ITEM]?.speedBytesPerSec
-    ).toBe(777)
+    ).not.toBe(999_999_999)
   })
 
-  it('falls back to the delta estimate when no speed was reported', () => {
+  it('measures the item rate from byte deltas', () => {
     useTransferUiStore
       .getState()
       .tick([
         { id: ITEM, status: 'uploading', bytesSent: 10, totalBytes: 1000 },
       ])
 
-    // No reported sample: the legacy estimate (average since the transfer
-    // started, min 250ms window) still applies. 10 bytes / 250ms = 40 B/s.
+    // Average since start over the minimum 250ms window: 10 bytes -> 40 B/s.
     expect(
       useTransferUiStore.getState().metricsById[ITEM]?.speedBytesPerSec
     ).toBe(40)

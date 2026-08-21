@@ -12,11 +12,11 @@ type UploadRuntimeStatus =
 const SPEED_SMOOTHING = 0.3
 
 /**
- * How long an rclone-reported speed sample stays authoritative. Past this the
- * process has stopped reporting (stall, pause, finalize) and the fallback
- * delta-based estimate takes over.
+ * rclone's reported speed is recorded for diagnostics but is deliberately NOT
+ * displayed: `speedAvg` counts bytes as they enter the upload buffer, so with
+ * large chunks it reports the disk read rate rather than what Drive has
+ * actually accepted. Displayed rates are measured from byte progress instead.
  */
-const REPORTED_SPEED_TTL_MS = 3000
 
 export interface TransferMetrics {
   speedBytesPerSec: number
@@ -57,19 +57,21 @@ interface TransferUiState {
   >
   _lastSampleById: Record<string, { bytesSent: number; atMs: number }>
   _startedAtById: Record<string, number>
-  /** Speeds rclone itself reported, per item. Authoritative while fresh. */
+  /** Speeds rclone itself reported, per item. Diagnostics only - see above. */
   _reportedSpeedById: Record<string, { speed: number; atMs: number }>
 
   isPaused: (id: string) => boolean
   setPaused: (id: string, paused: boolean) => void
   pauseAll: (ids: string[]) => void
   resumeAll: (ids: string[]) => void
+  /** Records rclone's self-reported rate. Kept for diagnostics only. */
   recordItemSpeed: (itemId: string, speedBytesPerSec: number | null) => void
   recordFileProgress: (
     itemId: string,
     filePath: string,
     bytesSent: number,
     totalBytes: number,
+    /** rclone's self-reported rate; recorded but not displayed. */
     reportedSpeedBytesPerSec?: number | null
   ) => void
   recordFileList: (itemId: string, files: FileProgressByPath[]) => void
@@ -145,13 +147,7 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       return { pausedById: next }
     }),
 
-  recordFileProgress: (
-    itemId,
-    filePath,
-    bytesSent,
-    totalBytes,
-    reportedSpeedBytesPerSec
-  ) =>
+  recordFileProgress: (itemId, filePath, bytesSent, totalBytes) =>
     set(state => {
       const trimmed = filePath.trim()
       if (!trimmed) return state
@@ -186,16 +182,14 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       const delta = Math.max(0, bytesSent - prevSent)
       const prevSpeed = existingMetrics?.[resolvedKey]?.speedBytesPerSec ?? 0
       const complete = totalBytes > 0 && bytesSent >= totalBytes
-      // rclone's moving average is authoritative when present; the byte-delta
-      // estimate only covers older backends / the plain-text progress path.
+      // Measured from byte progress rather than rclone's `speedAvg`, which
+      // counts buffered-but-not-yet-uploaded bytes and so reads high. See the
+      // longer note in `tick`.
       const speed = complete
         ? 0
-        : typeof reportedSpeedBytesPerSec === 'number' &&
-            Number.isFinite(reportedSpeedBytesPerSec)
-          ? Math.max(0, Math.round(reportedSpeedBytesPerSec))
-          : delta > 0
-            ? Math.max(0, Math.round((delta * 1000) / dtMs))
-            : prevSpeed
+        : delta > 0
+          ? Math.max(0, Math.round((delta * 1000) / dtMs))
+          : prevSpeed
       const remaining = Math.max(
         0,
         totalBytes - Math.min(bytesSent, totalBytes)
@@ -462,30 +456,29 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
               ? (sent * 1000) / baselineDtMs
               : null
 
-        // Prefer the speed rclone itself reported (already a moving average,
-        // and consistent with the per-file rows it was summed from). The
-        // delta-based estimate below only covers stale/absent reports.
-        const reported = state._reportedSpeedById[id]
-        const reportedIsFresh =
-          reported !== undefined && now - reported.atMs <= REPORTED_SPEED_TTL_MS
-
-        // rclone reports in ~1s bursts, so raw samples swing wildly. Smooth them
-        // exponentially; the displayed rate settles instead of flickering.
+        // Measured from actual byte progress, NOT rclone's `speedAvg`.
+        //
+        // `speedAvg` counts bytes as they enter the upload buffer, so with
+        // large chunks it reports the disk read rate while the chunk is still
+        // being sent to Drive. That reads high and steady while the transfer
+        // is really slower - the same reason rclone can sit at "100%, ETA 0s"
+        // for minutes. Byte deltas over a rolling window cannot outrun what
+        // has genuinely been transferred.
+        //
+        // rclone reports in ~1s bursts, so raw samples swing wildly. Smooth
+        // them exponentially; the displayed rate settles instead of flickering.
         const speed = !isActive
           ? 0
-          : reportedIsFresh
-            ? reported.speed
-            : sample === null
-              ? previousSpeed
-              : Math.max(
-                  0,
-                  Math.round(
-                    previousSpeed > 0
-                      ? previousSpeed +
-                          SPEED_SMOOTHING * (sample - previousSpeed)
-                      : sample
-                  )
+          : sample === null
+            ? previousSpeed
+            : Math.max(
+                0,
+                Math.round(
+                  previousSpeed > 0
+                    ? previousSpeed + SPEED_SMOOTHING * (sample - previousSpeed)
+                    : sample
                 )
+              )
 
         const etaSeconds =
           isActive && total > 0 && speed > 0
