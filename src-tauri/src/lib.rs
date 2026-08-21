@@ -757,14 +757,21 @@ impl Default for AppPreferences {
             max_concurrent_uploads: 3,
             // Peak rclone memory is roughly
             //   max_concurrent_uploads * rclone_transfers * upload_chunk_size
-            // so these three defaults are chosen together: 3 * 16 * 256 MiB is
-            // about 12 GiB. Raise transfers for more throughput only if the
-            // machine has the RAM for it.
-            upload_chunk_size_mib: 256,
+            // so these three defaults are chosen together: 3 * 32 * 128 MiB is
+            // about 12 GiB, the same budget as before.
+            //
+            // Throughput is (files in flight) x (per-file speed). Google caps a
+            // single file at roughly 200-300 Mbps and will not parallelize one
+            // file, so the only way up is more files at once. Chunk size stops
+            // helping above ~128 MiB - past that it just buys fewer, larger
+            // requests and stalls while each one is buffered - so spending the
+            // memory budget on streams instead of chunk size doubles the
+            // parallelism for free.
+            upload_chunk_size_mib: 128,
             rclone_path: "rclone".to_string(),
             rclone_remote_name: "gdrive".to_string(),
-            rclone_transfers: 16,
-            rclone_checkers: 16,
+            rclone_transfers: 32,
+            rclone_checkers: 32,
             rclone_retries: default_rclone_retries(),
             rclone_bandwidth_limit: String::new(),
             rclone_exclude_patterns: Vec::new(),
@@ -806,11 +813,11 @@ fn default_rclone_remote_name() -> String {
 }
 
 fn default_rclone_transfers() -> u16 {
-    16
+    32
 }
 
 fn default_rclone_checkers() -> u16 {
-    16
+    32
 }
 
 fn get_preferences_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -854,13 +861,36 @@ async fn load_preferences(app: AppHandle) -> Result<AppPreferences, String> {
         format!("Failed to read preferences file: {e}")
     })?;
 
-    let preferences: AppPreferences = serde_json::from_str(&contents).map_err(|e| {
+    let mut preferences: AppPreferences = serde_json::from_str(&contents).map_err(|e| {
         log::error!("Failed to parse preferences JSON: {e}");
         format!("Failed to parse preferences: {e}")
     })?;
 
+    migrate_throughput_defaults(&mut preferences);
+
     log::info!("Successfully loaded preferences");
     Ok(preferences)
+}
+
+/// Moves the old 256 MiB / 16-transfer tuning onto the current defaults.
+///
+/// Those values were saved to disk, so raising the defaults alone would leave
+/// every existing install on the slow settings. 256 MiB chunks buy nothing over
+/// 128 MiB and stall while each one buffers, and the memory they cost is what
+/// caps the number of parallel streams - which is the only thing that actually
+/// raises throughput, because Google will not parallelize a single file.
+///
+/// Only the exact old defaults are touched, so a deliberately customised value
+/// is left alone.
+fn migrate_throughput_defaults(preferences: &mut AppPreferences) {
+    if preferences.upload_chunk_size_mib == 256 && preferences.rclone_transfers == 16 {
+        log::info!("Migrating upload tuning from 256MiB/16 transfers to 128MiB/32 transfers");
+        preferences.upload_chunk_size_mib = 128;
+        preferences.rclone_transfers = 32;
+        if preferences.rclone_checkers == 16 {
+            preferences.rclone_checkers = 32;
+        }
+    }
 }
 
 #[tauri::command]
@@ -1523,4 +1553,62 @@ pub fn run() {
                 tray::show_main_window(_app);
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn legacy_prefs() -> AppPreferences {
+        AppPreferences {
+            upload_chunk_size_mib: 256,
+            rclone_transfers: 16,
+            rclone_checkers: 16,
+            ..AppPreferences::default()
+        }
+    }
+
+    #[test]
+    fn migrates_the_old_slow_upload_tuning() {
+        // The old values were written to disk, so raising the defaults alone
+        // would leave existing installs capped at 16 parallel streams.
+        let mut prefs = legacy_prefs();
+        migrate_throughput_defaults(&mut prefs);
+        assert_eq!(prefs.upload_chunk_size_mib, 128);
+        assert_eq!(prefs.rclone_transfers, 32);
+        assert_eq!(prefs.rclone_checkers, 32);
+    }
+
+    #[test]
+    fn leaves_a_customised_tuning_alone() {
+        let mut prefs = AppPreferences {
+            upload_chunk_size_mib: 64,
+            rclone_transfers: 8,
+            ..AppPreferences::default()
+        };
+        migrate_throughput_defaults(&mut prefs);
+        assert_eq!(prefs.upload_chunk_size_mib, 64);
+        assert_eq!(prefs.rclone_transfers, 8);
+    }
+
+    #[test]
+    fn keeps_a_custom_checkers_value_during_migration() {
+        let mut prefs = AppPreferences {
+            rclone_checkers: 4,
+            ..legacy_prefs()
+        };
+        migrate_throughput_defaults(&mut prefs);
+        assert_eq!(prefs.rclone_transfers, 32);
+        assert_eq!(prefs.rclone_checkers, 4);
+    }
+
+    #[test]
+    fn the_new_defaults_pass_validation() {
+        let prefs = AppPreferences::default();
+        assert!(validate_upload_chunk_size_mib(prefs.upload_chunk_size_mib).is_ok());
+        assert!(validate_rclone_transfers(prefs.rclone_transfers).is_ok());
+        assert!(validate_rclone_checkers(prefs.rclone_checkers).is_ok());
+        // Drive requires a power-of-two chunk size.
+        assert_eq!(prefs.upload_chunk_size_mib.count_ones(), 1);
+    }
 }
