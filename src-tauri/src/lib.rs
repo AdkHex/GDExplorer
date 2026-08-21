@@ -889,7 +889,6 @@ async fn save_preferences(app: AppHandle, preferences: AppPreferences) -> Result
     Ok(())
 }
 
-#[tauri::command]
 /// The platform's default alert sound. Windows parses this name into its
 /// `Sound` enum, where "Default" is the standard notification chime; macOS
 /// takes an `NSSound` name, and "Ping" is the one always present in
