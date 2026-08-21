@@ -50,7 +50,7 @@ import { usePreferences } from '@/services/preferences'
 import { useTransferUiStore } from '@/store/transfer-ui-store'
 import { ProgressBar } from './ProgressBar'
 import { TRANSFER_STATUS, type TransferState } from './status'
-import { formatBytes, formatEta, formatSpeed } from './format'
+import { formatBytes, formatEta, formatSpeed, type SpeedUnit } from './format'
 import { cn } from '@/lib/utils'
 import { extractDriveFolderId } from '@/lib/drive-url'
 import {
@@ -177,6 +177,7 @@ export function TransferTable({
   const addItems = useLocalUploadQueue(s => s.addItems)
   const setItemsDestination = useLocalUploadQueue(s => s.setItemsDestination)
   const { data: preferences } = usePreferences()
+  const speedUnit: SpeedUnit = preferences?.speedUnit ?? 'bytes'
   const destinationPresets = useMemo(
     () => preferences?.destinationPresets ?? [],
     [preferences?.destinationPresets]
@@ -346,7 +347,7 @@ export function TransferTable({
       // value" rather than the previous "0 B/s" and "∞".
       const speedLabel =
         progressState === 'uploading'
-          ? formatSpeed(rowMetrics?.speedBytesPerSec ?? 0)
+          ? formatSpeed(rowMetrics?.speedBytesPerSec ?? 0, speedUnit)
           : '—'
 
       const etaLabel =
@@ -377,7 +378,7 @@ export function TransferTable({
         etaLabel,
       }
     })
-  }, [items, metrics, paused])
+  }, [items, metrics, paused, speedUnit])
 
   // `items` gets a new identity on every progress event. Effects that only care
   // about which rows exist key off `itemIdsKey` instead, and the metrics timer
@@ -1267,6 +1268,7 @@ export function TransferTable({
                               parentState={item.progressState}
                               progress={fileProgress[filePath]}
                               metrics={fileMetrics[filePath]}
+                              speedUnit={speedUnit}
                               onCopyLink={() =>
                                 void copyFileLink(
                                   item,
@@ -1324,12 +1326,14 @@ function FileRow({
   parentState,
   progress,
   metrics,
+  speedUnit,
   onCopyLink,
 }: {
   name: string
   parentState: TransferState
   progress?: { bytesSent: number; totalBytes: number }
   metrics?: { speedBytesPerSec: number; etaSeconds: number | null }
+  speedUnit: SpeedUnit
   onCopyLink: () => void
 }) {
   const total =
@@ -1399,7 +1403,9 @@ function FileRow({
         role="gridcell"
         className="truncate tabular-nums text-muted-foreground"
       >
-        {isActive ? formatSpeed(metrics?.speedBytesPerSec ?? 0) : '—'}
+        {isActive
+          ? formatSpeed(metrics?.speedBytesPerSec ?? 0, speedUnit)
+          : '—'}
       </div>
       <div
         role="gridcell"

@@ -554,6 +554,13 @@ fn validate_theme(theme: &str) -> Result<(), String> {
     }
 }
 
+fn validate_speed_unit(unit: &str) -> Result<(), String> {
+    match unit {
+        "bytes" | "bits" => Ok(()),
+        _ => Err("Invalid speed unit: must be 'bytes' or 'bits'".to_string()),
+    }
+}
+
 fn validate_max_concurrent_uploads(value: u8) -> Result<(), String> {
     if (1..=10).contains(&value) {
         Ok(())
@@ -702,6 +709,9 @@ pub struct AppPreferences {
     /// Play a sound with the completion notification.
     #[serde(default = "default_notification_sound")]
     pub notification_sound: bool,
+    /// Show transfer rates in bytes ("bytes" -> MiB/s) or bits ("bits" -> Mbps).
+    #[serde(default = "default_speed_unit")]
+    pub speed_unit: String,
     /// Show the menu bar / tray icon with upload progress.
     #[serde(default = "default_show_tray_icon")]
     pub show_tray_icon: bool,
@@ -740,6 +750,7 @@ impl Default for AppPreferences {
             auto_check_updates: true,
             notify_on_completion: true,
             notification_sound: true,
+            speed_unit: default_speed_unit(),
             show_tray_icon: true,
             close_to_tray: false,
             service_account_folder_path: None,
@@ -780,6 +791,10 @@ fn default_notify_on_completion() -> bool {
 
 fn default_notification_sound() -> bool {
     true
+}
+
+fn default_speed_unit() -> String {
+    "bytes".to_string()
 }
 
 fn default_show_tray_icon() -> bool {
@@ -852,6 +867,7 @@ async fn load_preferences(app: AppHandle) -> Result<AppPreferences, String> {
 async fn save_preferences(app: AppHandle, preferences: AppPreferences) -> Result<(), String> {
     // Validate theme value
     validate_theme(&preferences.theme)?;
+    validate_speed_unit(&preferences.speed_unit)?;
     validate_max_concurrent_uploads(preferences.max_concurrent_uploads)?;
     validate_upload_chunk_size_mib(preferences.upload_chunk_size_mib)?;
     validate_rclone_path(&preferences.rclone_path)?;

@@ -7,6 +7,8 @@ export interface AppPreferences {
   notifyOnCompletion: boolean
   /** Play a sound with the completion notification. */
   notificationSound: boolean
+  /** Show transfer rates in bytes (MiB/s) or bits (Mbps). */
+  speedUnit: 'bytes' | 'bits'
   /** Show the menu bar / tray icon with upload progress. */
   showTrayIcon: boolean
   /** Closing the window hides it instead of quitting. Needs the tray icon. */
@@ -39,6 +41,7 @@ export const defaultPreferences: AppPreferences = {
   autoCheckUpdates: true,
   notifyOnCompletion: true,
   notificationSound: true,
+  speedUnit: 'bytes',
   showTrayIcon: true,
   closeToTray: false,
   serviceAccountFolderPath: null,

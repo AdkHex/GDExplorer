@@ -25,6 +25,26 @@ describe('formatSpeed', () => {
     expect(formatSpeed(0)).toBe('0 B/s')
     expect(formatSpeed(1024 * 1024)).toBe('1.0 MiB/s')
   })
+
+  it('defaults to bytes when no unit is given', () => {
+    expect(formatSpeed(1024 * 1024, 'bytes')).toBe('1.0 MiB/s')
+  })
+
+  it('renders bitrates in decimal units', () => {
+    // Bitrates are quoted per 1000, not 1024: 125,000 B/s is exactly 1 Mbps.
+    expect(formatSpeed(125_000, 'bits')).toBe('1.0 Mbps')
+    expect(formatSpeed(0, 'bits')).toBe('0 bps')
+  })
+
+  it('converts a real transfer rate to the figure ISPs quote', () => {
+    // 112 MiB/s is ~940 Mbps - the 8x gap that makes MiB/s look slow.
+    expect(formatSpeed(112 * 1024 * 1024, 'bits')).toBe('940 Mbps')
+    expect(formatSpeed(112 * 1024 * 1024, 'bytes')).toBe('112 MiB/s')
+  })
+
+  it('steps up to Gbps', () => {
+    expect(formatSpeed(250_000_000, 'bits')).toBe('2.0 Gbps')
+  })
 })
 
 describe('formatEta', () => {

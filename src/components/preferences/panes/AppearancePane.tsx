@@ -9,7 +9,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { useTheme } from '@/hooks/use-theme'
-import { useSavePreferences } from '@/services/preferences'
+import { usePreferences, useSavePreferences } from '@/services/preferences'
 
 const SettingsField: React.FC<{
   label: string
@@ -41,6 +41,15 @@ const SettingsSection: React.FC<{
 export const AppearancePane: React.FC = () => {
   const { theme, setTheme } = useTheme()
   const savePreferences = useSavePreferences()
+  const { data: preferences } = usePreferences()
+  const speedUnit = preferences?.speedUnit ?? 'bytes'
+
+  const handleSpeedUnitChange = useCallback(
+    (value: 'bytes' | 'bits') => {
+      savePreferences.mutate({ speedUnit: value })
+    },
+    [savePreferences]
+  )
 
   const handleThemeChange = useCallback(
     async (value: 'light' | 'dark' | 'system') => {
@@ -72,6 +81,27 @@ export const AppearancePane: React.FC = () => {
               <SelectItem value="light">Light</SelectItem>
               <SelectItem value="dark">Dark</SelectItem>
               <SelectItem value="system">System</SelectItem>
+            </SelectContent>
+          </Select>
+        </SettingsField>
+      </SettingsSection>
+
+      <SettingsSection title="Transfers">
+        <SettingsField
+          label="Speed units"
+          description="MiB/s matches the file sizes shown next to it. Mbps matches how ISPs and speed tests quote a connection - the same rate looks 8x larger in Mbps."
+        >
+          <Select
+            value={speedUnit}
+            onValueChange={handleSpeedUnitChange}
+            disabled={savePreferences.isPending}
+          >
+            <SelectTrigger>
+              <SelectValue placeholder="Select speed units" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="bytes">Bytes per second (MiB/s)</SelectItem>
+              <SelectItem value="bits">Bits per second (Mbps)</SelectItem>
             </SelectContent>
           </Select>
         </SettingsField>

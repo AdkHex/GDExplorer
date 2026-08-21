@@ -3,7 +3,8 @@ import { useLocalUploadQueue } from '@/store/local-upload-queue-store'
 import { useTransferUiStore } from '@/store/transfer-ui-store'
 import { ProgressBar } from './ProgressBar'
 import { summarizeQueue } from './summary'
-import { formatBytes, formatEta, formatSpeed } from './format'
+import { formatBytes, formatEta, formatSpeed, type SpeedUnit } from './format'
+import { usePreferences } from '@/services/preferences'
 
 /**
  * Per-row progress answers "how is this file doing"; this answers "how is the
@@ -13,6 +14,8 @@ export function QueueSummary() {
   const items = useLocalUploadQueue(s => s.items)
   const metrics = useTransferUiStore(s => s.metricsById)
   const pausedById = useTransferUiStore(s => s.pausedById)
+  const { data: preferences } = usePreferences()
+  const speedUnit: SpeedUnit = preferences?.speedUnit ?? 'bytes'
 
   const summary = useMemo(
     () => summarizeQueue(items, metrics, pausedById),
@@ -51,7 +54,7 @@ export function QueueSummary() {
         <div className="text-xs tabular-nums text-muted-foreground">
           {[
             summary.speedBytesPerSec > 0
-              ? formatSpeed(summary.speedBytesPerSec)
+              ? formatSpeed(summary.speedBytesPerSec, speedUnit)
               : null,
             summary.etaSeconds !== null
               ? `${formatEta(summary.etaSeconds)} left`

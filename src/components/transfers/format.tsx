@@ -12,9 +12,37 @@ export function formatBytes(bytes: number): string {
   return `${value.toFixed(value < 10 && unitIndex > 0 ? 1 : 0)} ${units[unitIndex]}`
 }
 
-export function formatSpeed(bytesPerSec: number): string {
-  if (!Number.isFinite(bytesPerSec) || bytesPerSec <= 0) return '0 B/s'
+/**
+ * How transfer rates are displayed. Bytes (MiB/s) matches the file sizes shown
+ * beside them; bits (Mbps) matches how ISPs and speed tests quote a connection.
+ * The two differ by 8x, which is a very easy thing to misread.
+ */
+export type SpeedUnit = 'bytes' | 'bits'
+
+export function formatSpeed(
+  bytesPerSec: number,
+  unit: SpeedUnit = 'bytes'
+): string {
+  if (!Number.isFinite(bytesPerSec) || bytesPerSec <= 0) {
+    return unit === 'bits' ? '0 bps' : '0 B/s'
+  }
+  if (unit === 'bits') return formatBitrate(bytesPerSec * 8)
   return `${formatBytes(bytesPerSec)}/s`
+}
+
+/**
+ * Bitrates are quoted in decimal units - 1 Mbps is 1,000,000 bits per second,
+ * not 1,048,576 - so this cannot reuse the 1024-based `formatBytes`.
+ */
+function formatBitrate(bitsPerSec: number): string {
+  const units = ['bps', 'Kbps', 'Mbps', 'Gbps', 'Tbps'] as const
+  let value = bitsPerSec
+  let unitIndex = 0
+  while (value >= 1000 && unitIndex < units.length - 1) {
+    value /= 1000
+    unitIndex += 1
+  }
+  return `${value.toFixed(value < 10 && unitIndex > 0 ? 1 : 0)} ${units[unitIndex]}`
 }
 
 export function formatEta(seconds: number | null | undefined): string {

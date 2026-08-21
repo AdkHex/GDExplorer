@@ -96,6 +96,7 @@ export const GeneralPane: React.FC = () => {
       destinationPresets: preferences.destinationPresets ?? [],
       notifyOnCompletion: preferences.notifyOnCompletion ?? true,
       notificationSound: preferences.notificationSound ?? true,
+      speedUnit: preferences.speedUnit ?? 'bytes',
       showTrayIcon: preferences.showTrayIcon ?? true,
       closeToTray: preferences.closeToTray ?? false,
     })
