@@ -18,6 +18,10 @@ pub struct ProgressEvent {
     pub path: String,
     pub bytes_sent: u64,
     pub total_bytes: u64,
+    /// rclone's own measurement (sum of the per-file moving averages). None
+    /// when progress came from a source that does not report speed, in which
+    /// case the frontend falls back to computing it from byte deltas.
+    pub speed_bytes_per_sec: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +31,8 @@ pub struct FileProgressEvent {
     pub file_path: String,
     pub bytes_sent: u64,
     pub total_bytes: u64,
+    /// rclone's moving-average speed for this file, when reported.
+    pub speed_bytes_per_sec: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

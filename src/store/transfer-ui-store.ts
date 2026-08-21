@@ -11,6 +11,13 @@ type UploadRuntimeStatus =
 /** Weight given to the newest speed sample when smoothing (0-1). */
 const SPEED_SMOOTHING = 0.3
 
+/**
+ * How long an rclone-reported speed sample stays authoritative. Past this the
+ * process has stopped reporting (stall, pause, finalize) and the fallback
+ * delta-based estimate takes over.
+ */
+const REPORTED_SPEED_TTL_MS = 3000
+
 export interface TransferMetrics {
   speedBytesPerSec: number
   etaSeconds: number | null
@@ -50,16 +57,20 @@ interface TransferUiState {
   >
   _lastSampleById: Record<string, { bytesSent: number; atMs: number }>
   _startedAtById: Record<string, number>
+  /** Speeds rclone itself reported, per item. Authoritative while fresh. */
+  _reportedSpeedById: Record<string, { speed: number; atMs: number }>
 
   isPaused: (id: string) => boolean
   setPaused: (id: string, paused: boolean) => void
   pauseAll: (ids: string[]) => void
   resumeAll: (ids: string[]) => void
+  recordItemSpeed: (itemId: string, speedBytesPerSec: number | null) => void
   recordFileProgress: (
     itemId: string,
     filePath: string,
     bytesSent: number,
-    totalBytes: number
+    totalBytes: number,
+    reportedSpeedBytesPerSec?: number | null
   ) => void
   recordFileList: (itemId: string, files: FileProgressByPath[]) => void
   setItemLinks: (itemId: string, links: ItemDriveLinks) => void
@@ -86,8 +97,28 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
   _fileLastSampleById: {},
   _lastSampleById: {},
   _startedAtById: {},
+  _reportedSpeedById: {},
 
   isPaused: id => Boolean(get().pausedById[id]),
+
+  recordItemSpeed: (itemId, speedBytesPerSec) =>
+    set(state => {
+      if (
+        typeof speedBytesPerSec !== 'number' ||
+        !Number.isFinite(speedBytesPerSec)
+      ) {
+        return state
+      }
+      return {
+        _reportedSpeedById: {
+          ...state._reportedSpeedById,
+          [itemId]: {
+            speed: Math.max(0, Math.round(speedBytesPerSec)),
+            atMs: Date.now(),
+          },
+        },
+      }
+    }),
 
   setPaused: (id, paused) =>
     set(state => ({
@@ -114,7 +145,13 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       return { pausedById: next }
     }),
 
-  recordFileProgress: (itemId, filePath, bytesSent, totalBytes) =>
+  recordFileProgress: (
+    itemId,
+    filePath,
+    bytesSent,
+    totalBytes,
+    reportedSpeedBytesPerSec
+  ) =>
     set(state => {
       const trimmed = filePath.trim()
       if (!trimmed) return state
@@ -148,8 +185,17 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       const prevSent = prevSample?.bytesSent ?? bytesSent
       const delta = Math.max(0, bytesSent - prevSent)
       const prevSpeed = existingMetrics?.[resolvedKey]?.speedBytesPerSec ?? 0
-      const speed =
-        delta > 0 ? Math.max(0, Math.round((delta * 1000) / dtMs)) : prevSpeed
+      const complete = totalBytes > 0 && bytesSent >= totalBytes
+      // rclone's moving average is authoritative when present; the byte-delta
+      // estimate only covers older backends / the plain-text progress path.
+      const speed = complete
+        ? 0
+        : typeof reportedSpeedBytesPerSec === 'number' &&
+            Number.isFinite(reportedSpeedBytesPerSec)
+          ? Math.max(0, Math.round(reportedSpeedBytesPerSec))
+          : delta > 0
+            ? Math.max(0, Math.round((delta * 1000) / dtMs))
+            : prevSpeed
       const remaining = Math.max(
         0,
         totalBytes - Math.min(bytesSent, totalBytes)
@@ -301,6 +347,7 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       > = {}
       const nextLast: Record<string, { bytesSent: number; atMs: number }> = {}
       const nextStarted: Record<string, number> = {}
+      const nextReported: Record<string, { speed: number; atMs: number }> = {}
 
       for (const [id, v] of Object.entries(state.pausedById)) {
         if (remaining.has(id)) nextPaused[id] = v
@@ -329,6 +376,9 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       for (const [id, v] of Object.entries(state._startedAtById)) {
         if (remaining.has(id)) nextStarted[id] = v
       }
+      for (const [id, v] of Object.entries(state._reportedSpeedById)) {
+        if (remaining.has(id)) nextReported[id] = v
+      }
 
       return {
         pausedById: nextPaused,
@@ -340,6 +390,7 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
         _fileLastSampleById: nextFileSamples,
         _lastSampleById: nextLast,
         _startedAtById: nextStarted,
+        _reportedSpeedById: nextReported,
       }
     }),
 
@@ -411,20 +462,30 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
               ? (sent * 1000) / baselineDtMs
               : null
 
+        // Prefer the speed rclone itself reported (already a moving average,
+        // and consistent with the per-file rows it was summed from). The
+        // delta-based estimate below only covers stale/absent reports.
+        const reported = state._reportedSpeedById[id]
+        const reportedIsFresh =
+          reported !== undefined && now - reported.atMs <= REPORTED_SPEED_TTL_MS
+
         // rclone reports in ~1s bursts, so raw samples swing wildly. Smooth them
         // exponentially; the displayed rate settles instead of flickering.
         const speed = !isActive
           ? 0
-          : sample === null
-            ? previousSpeed
-            : Math.max(
-                0,
-                Math.round(
-                  previousSpeed > 0
-                    ? previousSpeed + SPEED_SMOOTHING * (sample - previousSpeed)
-                    : sample
+          : reportedIsFresh
+            ? reported.speed
+            : sample === null
+              ? previousSpeed
+              : Math.max(
+                  0,
+                  Math.round(
+                    previousSpeed > 0
+                      ? previousSpeed +
+                          SPEED_SMOOTHING * (sample - previousSpeed)
+                      : sample
+                  )
                 )
-              )
 
         const etaSeconds =
           isActive && total > 0 && speed > 0

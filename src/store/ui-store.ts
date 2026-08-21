@@ -8,6 +8,9 @@ interface UIState {
   logPanelVisible: boolean
   preferencesOpen: boolean
   preferencesPane: PreferencePane
+  /** The setup-check dialog. Lives here because the title bar opens it and the
+   *  transfers view renders it. */
+  preflightOpen: boolean
   updateDownloading: boolean
   updateReady: boolean
   updateVersion: string | null
@@ -23,6 +26,7 @@ interface UIState {
   setPreferencesOpen: (open: boolean) => void
   setPreferencesPane: (pane: PreferencePane) => void
   openPreferencesAt: (pane: PreferencePane) => void
+  setPreflightOpen: (open: boolean) => void
   setUpdateDownloading: (downloading: boolean, version?: string | null) => void
   setUpdateReady: (ready: boolean, version?: string | null) => void
   setUpdateProgress: (progress: number | null) => void
@@ -37,6 +41,7 @@ export const useUIStore = create<UIState>()(
       logPanelVisible: false,
       preferencesOpen: false,
       preferencesPane: 'general',
+      preflightOpen: false,
       updateDownloading: false,
       updateReady: false,
       updateVersion: null,
@@ -87,6 +92,9 @@ export const useUIStore = create<UIState>()(
           undefined,
           'openPreferencesAt'
         ),
+
+      setPreflightOpen: open =>
+        set({ preflightOpen: open }, undefined, 'setPreflightOpen'),
 
       setUpdateDownloading: (downloading, version = null) =>
         set(

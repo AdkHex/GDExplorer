@@ -62,9 +62,13 @@ import {
 import { RemoteFolderBrowser } from '@/components/upload/RemoteFolderBrowser'
 import { PreflightDialog } from '@/components/preflight/PreflightPanel'
 import { useUploadDestinationStore } from '@/store/upload-destination-store'
+import { useUIStore } from '@/store/ui-store'
+import { UploadHistoryBar } from './UploadHistoryBar'
+import type { UploadHistoryEntry } from '@/store/upload-history-store'
 import { toast } from 'sonner'
 import { logger } from '@/lib/logger'
 import {
+  BrushCleaningIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   FileIcon,
@@ -73,7 +77,6 @@ import {
   FolderPlusIcon,
   FolderSearchIcon,
   LinkIcon,
-  ShieldCheckIcon,
   Loader2Icon,
   FolderSymlinkIcon,
   MoreHorizontalIcon,
@@ -171,6 +174,7 @@ export function TransferTable({
 }) {
   const items = useLocalUploadQueue(s => s.items)
   const clear = useLocalUploadQueue(s => s.clear)
+  const addItems = useLocalUploadQueue(s => s.addItems)
   const setItemsDestination = useLocalUploadQueue(s => s.setItemsDestination)
   const { data: preferences } = usePreferences()
   const destinationPresets = useMemo(
@@ -179,7 +183,9 @@ export function TransferTable({
   )
   const [clearDialogOpen, setClearDialogOpen] = useState(false)
   const [clearPending, setClearPending] = useState(false)
-  const [preflightOpen, setPreflightOpen] = useState(false)
+  // Owned by the UI store so the title bar's setup-check button can open it.
+  const preflightOpen = useUIStore(s => s.preflightOpen)
+  const setPreflightOpen = useUIStore(s => s.setPreflightOpen)
   // Rows awaiting an arbitrary destination from the paste dialog.
   const [customDestinationTargets, setCustomDestinationTargets] = useState<
     string[] | null
@@ -552,6 +558,33 @@ export function TransferTable({
       )
     },
     [ensureLinks]
+  )
+
+  /**
+   * Re-queues a past upload. `addItems` keys on path and skips duplicates, so
+   * an item still in the list is revealed rather than added twice.
+   */
+  const handleUploadAgain = useCallback(
+    (entry: UploadHistoryEntry) => {
+      const alreadyQueued = items.some(item => item.path === entry.path)
+      if (alreadyQueued) {
+        toast.message('Already in the queue', { description: entry.name })
+        return
+      }
+
+      addItems([{ path: entry.path, kind: entry.kind }])
+      // Pin it back to the folder it originally went to; the sidebar
+      // destination may point somewhere else now.
+      if (entry.destinationFolderId) {
+        setItemsDestination(
+          [entry.path],
+          entry.destinationFolderId,
+          entry.destinationLabel
+        )
+      }
+      toast.success('Added to the queue', { description: entry.name })
+    },
+    [addItems, items, setItemsDestination]
   )
 
   // `flexRender` turns each `cell` function into a component, so React compares
@@ -956,21 +989,30 @@ export function TransferTable({
         {/* One prominent button per HIG guidance: Start carries the accent,
             everything else is secondary or tucked into the overflow menu. */}
         <div className="flex items-center gap-2">
-          {/* Checking the setup is an occasional errand, not part of the
-              upload flow, so it sits at the quiet end as an icon. */}
+          {/* Clearing finished transfers is the natural counterpart to adding
+              them, so it sits beside Add instead of only in the overflow. */}
           <Tooltip>
             <TooltipTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                onClick={() => setPreflightOpen(true)}
-                aria-label="Check setup"
-              >
-                <ShieldCheckIcon />
-              </Button>
+              <span>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  disabled={!hasCompleted}
+                  onClick={() =>
+                    onRemoveSelected(
+                      rows.filter(r => r.status === 'done').map(r => r.id)
+                    )
+                  }
+                  aria-label="Clear completed"
+                >
+                  <BrushCleaningIcon />
+                </Button>
+              </span>
             </TooltipTrigger>
-            <TooltipContent>Check setup</TooltipContent>
+            <TooltipContent>
+              {hasCompleted ? 'Clear completed' : 'No completed transfers'}
+            </TooltipContent>
           </Tooltip>
 
           <DropdownMenu>
@@ -1071,16 +1113,6 @@ export function TransferTable({
               >
                 Remove selected
               </DropdownMenuItem>
-              <DropdownMenuItem
-                disabled={!hasCompleted}
-                onSelect={() =>
-                  onRemoveSelected(
-                    rows.filter(r => r.status === 'done').map(r => r.id)
-                  )
-                }
-              >
-                Clear completed
-              </DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem
                 variant="destructive"
@@ -1145,6 +1177,8 @@ export function TransferTable({
           setCustomDestinationTargets(null)
         }}
       />
+
+      <UploadHistoryBar onUploadAgain={handleUploadAgain} />
 
       <div className="relative min-h-0 flex-1 overflow-hidden rounded-lg border bg-card">
         <div className="h-full overflow-auto">

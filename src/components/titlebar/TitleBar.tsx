@@ -21,6 +21,7 @@ import {
   PanelLeftClose,
   ScrollText,
   Settings,
+  ShieldCheck,
 } from 'lucide-react'
 import {
   Tooltip,
@@ -46,6 +47,7 @@ export function TitleBar({
     logPanelVisible,
     toggleLogPanel,
     setPreferencesOpen,
+    setPreflightOpen,
     updateReady,
     updateDownloading,
     updateVersion,
@@ -157,6 +159,23 @@ export function TitleBar({
             </TooltipContent>
           </Tooltip>
         ) : null}
+        {/* Checking the setup is app-level configuration, so it groups with
+            Settings here rather than sitting in the transfers toolbar. */}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              onClick={() => setPreflightOpen(true)}
+              variant="ghost"
+              size="icon"
+              className="size-7 text-foreground/70 hover:text-foreground"
+              aria-label="Check setup"
+            >
+              <ShieldCheck className="size-3.5" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">Check setup</TooltipContent>
+        </Tooltip>
+
         <Tooltip>
           <TooltipTrigger asChild>
             <Button

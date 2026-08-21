@@ -5,6 +5,8 @@ export interface AppPreferences {
   autoCheckUpdates: boolean
   /** Post a system notification when a batch of uploads finishes. */
   notifyOnCompletion: boolean
+  /** Play a sound with the completion notification. */
+  notificationSound: boolean
   /** Show the menu bar / tray icon with upload progress. */
   showTrayIcon: boolean
   /** Closing the window hides it instead of quitting. Needs the tray icon. */
@@ -36,6 +38,7 @@ export const defaultPreferences: AppPreferences = {
   theme: 'system',
   autoCheckUpdates: true,
   notifyOnCompletion: true,
+  notificationSound: true,
   showTrayIcon: true,
   closeToTray: false,
   serviceAccountFolderPath: null,

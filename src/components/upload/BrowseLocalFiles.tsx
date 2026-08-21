@@ -6,11 +6,13 @@ import { listen } from '@tauri-apps/api/event'
 import { useLocalUploadQueue } from '@/store/local-upload-queue-store'
 import { useUploadDestinationStore } from '@/store/upload-destination-store'
 import { useTransferUiStore } from '@/store/transfer-ui-store'
+import { useUploadHistory } from '@/store/upload-history-store'
 import { useUIStore } from '@/store/ui-store'
 import { TransferTable } from '@/components/transfers/TransferTable'
 import { toast } from 'sonner'
 import { logger } from '@/lib/logger'
-import { notifyIfUnfocused } from '@/lib/notifications'
+import { notifyIfUnfocused, playCompletionSound } from '@/lib/notifications'
+import { getPathName } from '@/lib/utils'
 import { usePreferences } from '@/services/preferences'
 
 function normalizeSelection(
@@ -48,6 +50,7 @@ export function BrowseLocalFiles() {
     remove: removeItem,
   } = useLocalUploadQueue()
   const recordFileProgress = useTransferUiStore(s => s.recordFileProgress)
+  const recordItemSpeed = useTransferUiStore(s => s.recordItemSpeed)
   const recordFileList = useTransferUiStore(s => s.recordFileList)
   const clearFileProgress = useTransferUiStore(s => s.clearFileProgress)
   const { destinationError, destinationFolderId } = useUploadDestinationStore()
@@ -56,6 +59,7 @@ export function BrowseLocalFiles() {
   // effect deps would tear down and re-register every upload listener whenever
   // a setting changes.
   const notifyOnCompletionRef = useRef(true)
+  const notificationSoundRef = useRef(true)
   const [isBrowsing, setIsBrowsing] = useState(false)
   const [isDropActive, setIsDropActive] = useState(false)
   const [isUploading, setIsUploading] = useState(false)
@@ -83,6 +87,7 @@ export function BrowseLocalFiles() {
 
   useEffect(() => {
     notifyOnCompletionRef.current = preferences?.notifyOnCompletion ?? true
+    notificationSoundRef.current = preferences?.notificationSound ?? true
   }, [preferences])
 
   useEffect(() => {
@@ -102,7 +107,28 @@ export function BrowseLocalFiles() {
         saEmail?: string | null
       }>('upload:item_status', event => {
         const { itemId, status, message, saEmail } = event.payload
+        // Read the row before the status write so a finished item still has its
+        // pre-completion fields (destination, size) to copy into history.
+        const finished = useLocalUploadQueue
+          .getState()
+          .items.find(item => item.id === itemId)
         setItemStatus(itemId, status, message ?? null, saEmail ?? null)
+
+        if (status === 'done' && finished) {
+          useUploadHistory.getState().record({
+            name: getPathName(finished.path),
+            path: finished.path,
+            kind: finished.kind,
+            totalBytes: finished.totalBytes ?? null,
+            // Where it actually went; the sidebar may point elsewhere later.
+            destinationFolderId:
+              finished.uploadedToFolderId ??
+              finished.destinationFolderId ??
+              useUploadDestinationStore.getState().destinationFolderId ??
+              null,
+            destinationLabel: finished.destinationLabel ?? null,
+          })
+        }
       })
 
       unlistenProgress = await listen<{
@@ -110,9 +136,12 @@ export function BrowseLocalFiles() {
         path: string
         bytesSent: number
         totalBytes: number
+        speedBytesPerSec?: number | null
       }>('upload:progress', event => {
-        const { itemId, bytesSent, totalBytes } = event.payload
+        const { itemId, bytesSent, totalBytes, speedBytesPerSec } =
+          event.payload
         setItemProgress(itemId, bytesSent, totalBytes)
+        recordItemSpeed(itemId, speedBytesPerSec ?? null)
       })
 
       unlistenFileProgress = await listen<{
@@ -120,9 +149,17 @@ export function BrowseLocalFiles() {
         filePath: string
         bytesSent: number
         totalBytes: number
+        speedBytesPerSec?: number | null
       }>('upload:file_progress', event => {
-        const { itemId, filePath, bytesSent, totalBytes } = event.payload
-        recordFileProgress(itemId, filePath, bytesSent, totalBytes)
+        const { itemId, filePath, bytesSent, totalBytes, speedBytesPerSec } =
+          event.payload
+        recordFileProgress(
+          itemId,
+          filePath,
+          bytesSent,
+          totalBytes,
+          speedBytesPerSec ?? null
+        )
       })
 
       unlistenFileList = await listen<{
@@ -174,8 +211,24 @@ export function BrowseLocalFiles() {
 
         // A batch can run for hours, so the result is worth a system
         // notification when the user has moved on to something else.
+        const withSound = notificationSoundRef.current
         if (notifyOnCompletionRef.current) {
-          void notifyIfUnfocused(title, description)
+          void notifyIfUnfocused(title, description, { sound: withSound })
+        }
+
+        // The notification above is suppressed while the window is focused, so
+        // play the sound here to cover that case. `notifyIfUnfocused` resolves
+        // without notifying then, hence the explicit focus check.
+        if (withSound) {
+          void (async () => {
+            try {
+              if (await getCurrentWindow().isFocused()) {
+                await playCompletionSound()
+              }
+            } catch {
+              // No Tauri window (tests, plain browser): nothing to play.
+            }
+          })()
         }
       })
     }
@@ -196,6 +249,7 @@ export function BrowseLocalFiles() {
   }, [
     recordFileList,
     recordFileProgress,
+    recordItemSpeed,
     resetStaleUploadState,
     setItemProgress,
     setItemStatus,

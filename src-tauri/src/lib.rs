@@ -699,6 +699,9 @@ pub struct AppPreferences {
     /// a long upload is something you leave running in the background.
     #[serde(default = "default_notify_on_completion")]
     pub notify_on_completion: bool,
+    /// Play a sound with the completion notification.
+    #[serde(default = "default_notification_sound")]
+    pub notification_sound: bool,
     /// Show the menu bar / tray icon with upload progress.
     #[serde(default = "default_show_tray_icon")]
     pub show_tray_icon: bool,
@@ -736,6 +739,7 @@ impl Default for AppPreferences {
             theme: "system".to_string(),
             auto_check_updates: true,
             notify_on_completion: true,
+            notification_sound: true,
             show_tray_icon: true,
             close_to_tray: false,
             service_account_folder_path: None,
@@ -771,6 +775,10 @@ fn default_auto_check_updates() -> bool {
 }
 
 fn default_notify_on_completion() -> bool {
+    true
+}
+
+fn default_notification_sound() -> bool {
     true
 }
 
@@ -882,10 +890,21 @@ async fn save_preferences(app: AppHandle, preferences: AppPreferences) -> Result
 }
 
 #[tauri::command]
+/// The platform's default alert sound. Windows parses this name into its
+/// `Sound` enum, where "Default" is the standard notification chime; macOS
+/// takes an `NSSound` name, and "Ping" is the one always present in
+/// /System/Library/Sounds.
+#[cfg(target_os = "windows")]
+const NOTIFICATION_SOUND_NAME: &str = "Default";
+#[cfg(not(target_os = "windows"))]
+const NOTIFICATION_SOUND_NAME: &str = "Ping";
+
+#[tauri::command]
 async fn send_native_notification(
     app: AppHandle,
     title: String,
     body: Option<String>,
+    sound: Option<bool>,
 ) -> Result<(), String> {
     log::info!("Sending native notification: {title}");
 
@@ -921,6 +940,12 @@ async fn send_native_notification(
             notification = notification.body(body_text);
         }
 
+        // Silent unless asked: without a sound name the platform posts the
+        // banner with no audio, which is why completions used to be quiet.
+        if sound.unwrap_or(false) {
+            notification = notification.sound(NOTIFICATION_SOUND_NAME);
+        }
+
         match notification.show() {
             Ok(_) => {
                 log::info!("Native notification sent successfully");
@@ -937,6 +962,67 @@ async fn send_native_notification(
     {
         log::warn!("Native notifications not supported on mobile");
         Err("Native notifications not supported on mobile".to_string())
+    }
+}
+
+/// Plays the OS alert sound.
+///
+/// A background completion already gets its sound from the notification itself;
+/// this covers the case where the window is focused, since the system suppresses
+/// banners (and their audio) for the frontmost app. Each platform's built-in
+/// player is used rather than bundling an audio crate and a sound file.
+#[tauri::command]
+async fn play_notification_sound() -> Result<(), String> {
+    let result = tokio::task::spawn_blocking(|| {
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            // MessageBeep plays the user's configured notification sound; the
+            // flag keeps the helper console window from flashing.
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "[System.Media.SystemSounds]::Asterisk.Play()",
+                ])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status()
+                .map(|_| ())
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            std::process::Command::new("afplay")
+                .arg("/System/Library/Sounds/Ping.aiff")
+                .status()
+                .map(|_| ())
+        }
+
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+        {
+            // canberra-gtk-play is part of libcanberra, present on most desktop
+            // Linux installs; a missing binary just means no sound.
+            std::process::Command::new("canberra-gtk-play")
+                .args(["-i", "complete"])
+                .status()
+                .map(|_| ())
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            // Not fatal - the upload still finished and the UI already said so.
+            log::warn!("Could not play the completion sound: {e}");
+            Err(format!("Could not play the completion sound: {e}"))
+        }
+        Err(e) => {
+            log::warn!("Completion sound task failed: {e}");
+            Err(format!("Completion sound task failed: {e}"))
+        }
     }
 }
 
@@ -1381,6 +1467,7 @@ pub fn run() {
             load_preferences,
             save_preferences,
             send_native_notification,
+            play_notification_sound,
             save_emergency_data,
             load_emergency_data,
             cleanup_old_recovery_files,

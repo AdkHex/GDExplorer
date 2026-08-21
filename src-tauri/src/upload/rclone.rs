@@ -324,7 +324,8 @@ async fn run_rclone_command(
     let progress_re = progress_regex();
     let mut last_bytes = 0_u64;
     let mut last_total = 0_u64;
-    let mut last_file_progress: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut last_speed: Option<u64> = None;
+    let mut last_file_progress: HashMap<String, (u64, u64, u64)> = HashMap::new();
     // Keep the most recent rclone errors so a failure can say what went wrong
     // instead of only reporting an exit code.
     let mut error_lines: Vec<String> = Vec::new();
@@ -352,26 +353,30 @@ async fn run_rclone_command(
                 recent_lines.push(line.clone());
 
                 if let Some(entries) = parse_json_file_progress(&line) {
-                    for (file_path, bytes, total) in entries {
+                    for (file_path, bytes, total, speed) in entries {
                         let should_emit = match last_file_progress.get(&file_path) {
-                            Some((last_bytes, last_total)) => {
-                                *last_bytes != bytes || *last_total != total
-                            }
+                            Some(previous) => *previous != (bytes, total, speed),
                             None => true,
                         };
                         if should_emit {
-                            last_file_progress.insert(file_path.clone(), (bytes, total));
-                            emit_file_progress(app, item, &file_path, bytes, total).await;
+                            last_file_progress.insert(file_path.clone(), (bytes, total, speed));
+                            emit_file_progress(app, item, &file_path, bytes, total, speed).await;
                         }
                     }
                 }
-                if let Some((bytes, total)) = parse_json_progress(&line, &item.path)
-                    .or_else(|| parse_progress_line(&progress_re, &line))
-                {
-                    if bytes != last_bytes || total != last_total {
+                if let Some((bytes, total, speed)) = parse_json_progress(
+                    &line,
+                    &item.path,
+                    &item.kind,
+                )
+                .or_else(|| {
+                    parse_progress_line(&progress_re, &line).map(|(b, t)| (b, t, None))
+                }) {
+                    if bytes != last_bytes || total != last_total || speed != last_speed {
                         last_bytes = bytes;
                         last_total = total;
-                        emit_progress(app, item, bytes, total).await;
+                        last_speed = speed;
+                        emit_progress(app, item, bytes, total, speed).await;
                     }
                 }
             }
@@ -522,13 +527,20 @@ fn describe_failure(
     }
 }
 
-async fn emit_progress(app: &AppHandle, item: &QueueItemInput, bytes: u64, total: u64) {
+async fn emit_progress(
+    app: &AppHandle,
+    item: &QueueItemInput,
+    bytes: u64,
+    total: u64,
+    speed: Option<u64>,
+) {
     log::debug!(
         target: "rclone",
-        "progress id={} bytes={} total={}",
+        "progress id={} bytes={} total={} speed={:?}",
         item.id,
         bytes,
-        total
+        total,
+        speed
     );
     let _ = app.emit(
         "upload:progress",
@@ -537,6 +549,7 @@ async fn emit_progress(app: &AppHandle, item: &QueueItemInput, bytes: u64, total
             path: item.path.clone(),
             bytes_sent: bytes,
             total_bytes: total,
+            speed_bytes_per_sec: speed,
         },
     );
 }
@@ -547,6 +560,7 @@ async fn emit_file_progress(
     file_path: &str,
     bytes: u64,
     total: u64,
+    speed: u64,
 ) {
     let _ = app.emit(
         "upload:file_progress",
@@ -555,6 +569,7 @@ async fn emit_file_progress(
             file_path: file_path.to_string(),
             bytes_sent: bytes,
             total_bytes: total,
+            speed_bytes_per_sec: Some(speed),
         },
     );
 }
@@ -1476,47 +1491,76 @@ fn parse_progress_line(regex: &Regex, line: &str) -> Option<(u64, u64)> {
     Some((sent, total))
 }
 
-fn parse_json_progress(line: &str, path: &str) -> Option<(u64, u64)> {
+/// Current speed rclone reports for one `transferring` entry. `speedAvg` is
+/// the exponentially weighted moving average ("current" speed); `speed` is the
+/// whole-transfer average and only used as a fallback.
+fn transfer_entry_speed(entry: &Value) -> u64 {
+    entry
+        .get("speedAvg")
+        .and_then(|v| v.as_f64())
+        .or_else(|| entry.get("speed").and_then(|v| v.as_f64()))
+        .map(|v| v.max(0.0).round() as u64)
+        .unwrap_or(0)
+}
+
+fn parse_json_progress(line: &str, path: &str, kind: &str) -> Option<(u64, u64, Option<u64>)> {
     if !line.trim_start().starts_with('{') {
         return None;
     }
     let value: Value = serde_json::from_str(line).ok()?;
     let stats = value.get("stats")?;
-    let file_name = Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(path);
 
-    if let Some(transferring) = stats.get("transferring").and_then(|v| v.as_array()) {
-        for entry in transferring {
-            let name = entry
-                .get("name")
-                .and_then(|v| v.as_str())
-                .or_else(|| entry.get("path").and_then(|v| v.as_str()))
-                .or_else(|| entry.get("object").and_then(|v| v.as_str()));
-            if let Some(name) = name {
-                if name == file_name || name.ends_with(file_name) {
-                    let bytes = entry.get("bytes").and_then(|v| v.as_u64())?;
-                    let total = entry.get("size").and_then(|v| v.as_u64())?;
-                    return Some((bytes, total));
+    // The item's current speed is the sum of the per-file moving averages on
+    // this same stats line, so the parent row always matches its children.
+    let transferring = stats.get("transferring").and_then(|v| v.as_array());
+    let speed = Some(
+        transferring
+            .map(|entries| entries.iter().map(transfer_entry_speed).sum())
+            .unwrap_or(0),
+    );
+
+    // For a single-file item the matching `transferring` entry is more precise
+    // than the aggregate (which can include retried bytes). Folders must use
+    // the aggregate: picking a lone transferring entry used to overwrite the
+    // whole folder's progress with one file's bytes whenever only one file was
+    // left mid-flight, which corrupted the parent progress bar and speed.
+    if kind == "file" {
+        let file_name = Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path);
+
+        if let Some(transferring) = transferring {
+            for entry in transferring {
+                let name = entry
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| entry.get("path").and_then(|v| v.as_str()))
+                    .or_else(|| entry.get("object").and_then(|v| v.as_str()));
+                if let Some(name) = name {
+                    if name == file_name || name.ends_with(file_name) {
+                        let bytes = entry.get("bytes").and_then(|v| v.as_u64())?;
+                        let total = entry.get("size").and_then(|v| v.as_u64())?;
+                        return Some((bytes, total, speed));
+                    }
                 }
             }
-        }
 
-        if transferring.len() == 1 {
-            let entry = &transferring[0];
-            let bytes = entry.get("bytes").and_then(|v| v.as_u64())?;
-            let total = entry.get("size").and_then(|v| v.as_u64())?;
-            return Some((bytes, total));
+            if transferring.len() == 1 {
+                let entry = &transferring[0];
+                let bytes = entry.get("bytes").and_then(|v| v.as_u64())?;
+                let total = entry.get("size").and_then(|v| v.as_u64())?;
+                return Some((bytes, total, speed));
+            }
         }
     }
 
     let bytes = stats.get("bytes").and_then(|v| v.as_u64())?;
     let total = stats.get("totalBytes").and_then(|v| v.as_u64())?;
-    Some((bytes, total))
+    Some((bytes, total, speed))
 }
 
-fn parse_json_file_progress(line: &str) -> Option<Vec<(String, u64, u64)>> {
+fn parse_json_file_progress(line: &str) -> Option<Vec<(String, u64, u64, u64)>> {
     if !line.trim_start().starts_with('{') {
         return None;
     }
@@ -1533,7 +1577,7 @@ fn parse_json_file_progress(line: &str) -> Option<Vec<(String, u64, u64)>> {
         let bytes = entry.get("bytes").and_then(|v| v.as_u64());
         let total = entry.get("size").and_then(|v| v.as_u64());
         if let (Some(name), Some(bytes), Some(total)) = (name, bytes, total) {
-            entries.push((name.to_string(), bytes, total));
+            entries.push((name.to_string(), bytes, total, transfer_entry_speed(entry)));
         }
     }
     if entries.is_empty() {
@@ -1674,5 +1718,55 @@ mod tests {
         assert_eq!(escape_drive_query_value("Bob's"), r"Bob\'s");
         assert_eq!(escape_drive_query_value(r"back\slash"), r"back\\slash");
         assert_eq!(escape_drive_query_value("plain"), "plain");
+    }
+
+    const STATS_LINE: &str = r#"{"level":"info","msg":"","stats":{"bytes":3000,"totalBytes":10000,"transferring":[{"name":"a.mkv","bytes":1000,"size":4000,"speed":50.0,"speedAvg":100.4},{"name":"b.mkv","bytes":2000,"size":6000,"speed":75.0,"speedAvg":200.0}]}}"#;
+
+    #[test]
+    fn folder_progress_uses_the_aggregate_and_sums_file_speeds() {
+        let (bytes, total, speed) =
+            parse_json_progress(STATS_LINE, "/movies/Flyboys (2006)", "folder").unwrap();
+        assert_eq!((bytes, total), (3000, 10000));
+        assert_eq!(speed, Some(300));
+    }
+
+    #[test]
+    fn folder_progress_ignores_a_lone_transferring_entry() {
+        // With one file left mid-flight the folder's progress used to be
+        // overwritten with that file's bytes, corrupting the parent row.
+        let line = r#"{"stats":{"bytes":9000,"totalBytes":10000,"transferring":[{"name":"a.mkv","bytes":1000,"size":4000,"speedAvg":100.0}]}}"#;
+        let (bytes, total, speed) =
+            parse_json_progress(line, "/movies/Flyboys (2006)", "folder").unwrap();
+        assert_eq!((bytes, total), (9000, 10000));
+        assert_eq!(speed, Some(100));
+    }
+
+    #[test]
+    fn file_progress_matches_its_transferring_entry() {
+        let (bytes, total, speed) =
+            parse_json_progress(STATS_LINE, "/movies/a.mkv", "file").unwrap();
+        assert_eq!((bytes, total), (1000, 4000));
+        assert_eq!(speed, Some(300));
+    }
+
+    #[test]
+    fn per_file_progress_includes_the_moving_average_speed() {
+        let entries = parse_json_file_progress(STATS_LINE).unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                ("a.mkv".to_string(), 1000, 4000, 100),
+                ("b.mkv".to_string(), 2000, 6000, 200),
+            ]
+        );
+    }
+
+    #[test]
+    fn progress_without_transferring_reports_zero_speed() {
+        // Finalize/checking phase: nothing is moving, so the truthful current
+        // speed is zero rather than a stale value.
+        let line = r#"{"stats":{"bytes":10000,"totalBytes":10000}}"#;
+        let (_, _, speed) = parse_json_progress(line, "/movies/x", "folder").unwrap();
+        assert_eq!(speed, Some(0));
     }
 }

@@ -94,7 +94,8 @@ export async function notify(
  */
 export async function notifyIfUnfocused(
   title: string,
-  message?: string
+  message?: string,
+  options: { sound?: boolean } = {}
 ): Promise<void> {
   try {
     if (await getCurrentWindow().isFocused()) return
@@ -105,9 +106,30 @@ export async function notifyIfUnfocused(
   }
 
   try {
-    await invoke('send_native_notification', { title, body: message })
+    await invoke('send_native_notification', {
+      title,
+      body: message,
+      sound: options.sound ?? false,
+    })
   } catch (error) {
     logger.warn('Failed to send native notification', { error: String(error) })
+  }
+}
+
+/**
+ * Plays the platform alert sound for a finished batch.
+ *
+ * Kept separate from `notifyIfUnfocused` on purpose: that call stays silent
+ * while the window is focused, but the whole point of a completion sound is to
+ * be heard whether or not the app is in front. When the window is in the
+ * background the native notification already carries the sound, so this only
+ * has to cover the focused case.
+ */
+export async function playCompletionSound(): Promise<void> {
+  try {
+    await invoke('play_notification_sound')
+  } catch (error) {
+    logger.warn('Failed to play completion sound', { error: String(error) })
   }
 }
 

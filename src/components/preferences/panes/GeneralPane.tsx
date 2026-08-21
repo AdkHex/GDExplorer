@@ -95,6 +95,7 @@ export const GeneralPane: React.FC = () => {
       rcloneExcludePatterns: preferences.rcloneExcludePatterns ?? [],
       destinationPresets: preferences.destinationPresets ?? [],
       notifyOnCompletion: preferences.notifyOnCompletion ?? true,
+      notificationSound: preferences.notificationSound ?? true,
       showTrayIcon: preferences.showTrayIcon ?? true,
       closeToTray: preferences.closeToTray ?? false,
     })
@@ -181,6 +182,9 @@ const GeneralPaneForm: React.FC<{
   const [isConfiguringRclone, setIsConfiguringRclone] = useState(false)
   const [notifyOnCompletion, setNotifyOnCompletion] = useState(
     () => preferences.notifyOnCompletion ?? true
+  )
+  const [notificationSound, setNotificationSound] = useState(
+    () => preferences.notificationSound ?? true
   )
   const [showTrayIcon, setShowTrayIcon] = useState(
     () => preferences.showTrayIcon ?? true
@@ -610,6 +614,30 @@ const GeneralPaneForm: React.FC<{
                     setNotifyOnCompletion(
                       preferences.notifyOnCompletion ?? true
                     )
+                  })
+              }}
+            />
+          </div>
+        </SettingsField>
+
+        <SettingsField
+          label="Play a sound when a batch finishes"
+          description="Plays the system alert sound with the completion notification, whether or not the window is in front."
+        >
+          <div className="flex items-center justify-between gap-4">
+            <p className="text-sm text-muted-foreground">
+              {notificationSound ? 'Sound on' : 'Sound off'}
+            </p>
+            <Switch
+              checked={notificationSound}
+              disabled={savePreferences.isPending}
+              aria-label="Play a sound when a batch finishes"
+              onCheckedChange={checked => {
+                setNotificationSound(checked)
+                savePreferences
+                  .mutateAsync({ notificationSound: checked })
+                  .catch(() => {
+                    setNotificationSound(preferences.notificationSound ?? true)
                   })
               }}
             />

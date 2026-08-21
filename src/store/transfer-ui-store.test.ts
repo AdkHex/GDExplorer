@@ -97,3 +97,75 @@ describe('transferUiStore file progress keying', () => {
     ])
   })
 })
+
+describe('transferUiStore reported speeds', () => {
+  beforeEach(() => {
+    useTransferUiStore.setState({
+      pausedById: {},
+      metricsById: {},
+      fileProgressById: {},
+      fileOrderById: {},
+      fileMetricsById: {},
+      _fileLastSampleById: {},
+      _lastSampleById: {},
+      _startedAtById: {},
+      _reportedSpeedById: {},
+    })
+  })
+
+  it('shows the rclone-reported file speed instead of a byte-delta estimate', () => {
+    seedList(['/root/a.txt'])
+
+    useTransferUiStore
+      .getState()
+      .recordFileProgress(ITEM, '/root/a.txt', 50, 100, 12345)
+
+    expect(
+      useTransferUiStore.getState().fileMetricsById[ITEM]?.['/root/a.txt']
+        ?.speedBytesPerSec
+    ).toBe(12345)
+  })
+
+  it('zeroes the file speed once the file is complete', () => {
+    seedList(['/root/a.txt'])
+
+    useTransferUiStore
+      .getState()
+      .recordFileProgress(ITEM, '/root/a.txt', 50, 100, 500)
+    useTransferUiStore
+      .getState()
+      .recordFileProgress(ITEM, '/root/a.txt', 100, 100, 500)
+
+    expect(
+      useTransferUiStore.getState().fileMetricsById[ITEM]?.['/root/a.txt']
+        ?.speedBytesPerSec
+    ).toBe(0)
+  })
+
+  it('uses a fresh reported item speed in tick', () => {
+    useTransferUiStore.getState().recordItemSpeed(ITEM, 777)
+    useTransferUiStore
+      .getState()
+      .tick([
+        { id: ITEM, status: 'uploading', bytesSent: 10, totalBytes: 1000 },
+      ])
+
+    expect(
+      useTransferUiStore.getState().metricsById[ITEM]?.speedBytesPerSec
+    ).toBe(777)
+  })
+
+  it('falls back to the delta estimate when no speed was reported', () => {
+    useTransferUiStore
+      .getState()
+      .tick([
+        { id: ITEM, status: 'uploading', bytesSent: 10, totalBytes: 1000 },
+      ])
+
+    // No reported sample: the legacy estimate (average since the transfer
+    // started, min 250ms window) still applies. 10 bytes / 250ms = 40 B/s.
+    expect(
+      useTransferUiStore.getState().metricsById[ITEM]?.speedBytesPerSec
+    ).toBe(40)
+  })
+})
