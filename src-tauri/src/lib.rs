@@ -755,23 +755,21 @@ impl Default for AppPreferences {
             close_to_tray: false,
             service_account_folder_path: None,
             max_concurrent_uploads: 3,
-            // Peak rclone memory is roughly
-            //   max_concurrent_uploads * rclone_transfers * upload_chunk_size
-            // so these three defaults are chosen together: 3 * 32 * 128 MiB is
-            // about 12 GiB, the same budget as before.
+            // These are the values the app shipped with in January, which
+            // measurably uploaded faster than every "tuned" set that followed.
             //
-            // Throughput is (files in flight) x (per-file speed). Google caps a
-            // single file at roughly 200-300 Mbps and will not parallelize one
-            // file, so the only way up is more files at once. Chunk size stops
-            // helping above ~128 MiB - past that it just buys fewer, larger
-            // requests and stalls while each one is buffered - so spending the
-            // memory budget on streams instead of chunk size doubles the
-            // parallelism for free.
+            // Raising --transfers looks like it should help, since throughput
+            // is (files in flight) x (per-file speed). It does not: Drive
+            // rate-limits per account, so past a handful of streams the extra
+            // ones compete for the same quota, trigger 403 rateLimitExceeded,
+            // and the resulting backoff loses more than the parallelism gains.
+            // Four streams per rclone process, times max_concurrent_uploads
+            // processes, is what actually saturated the link.
             upload_chunk_size_mib: 128,
             rclone_path: "rclone".to_string(),
             rclone_remote_name: "gdrive".to_string(),
-            rclone_transfers: 32,
-            rclone_checkers: 32,
+            rclone_transfers: 4,
+            rclone_checkers: 8,
             rclone_retries: default_rclone_retries(),
             rclone_bandwidth_limit: String::new(),
             rclone_exclude_patterns: Vec::new(),
@@ -813,11 +811,11 @@ fn default_rclone_remote_name() -> String {
 }
 
 fn default_rclone_transfers() -> u16 {
-    32
+    4
 }
 
 fn default_rclone_checkers() -> u16 {
-    32
+    8
 }
 
 fn get_preferences_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -872,24 +870,36 @@ async fn load_preferences(app: AppHandle) -> Result<AppPreferences, String> {
     Ok(preferences)
 }
 
-/// Moves the old 256 MiB / 16-transfer tuning onto the current defaults.
+/// Puts any of the "tuned" upload settings back onto the January values.
 ///
-/// Those values were saved to disk, so raising the defaults alone would leave
-/// every existing install on the slow settings. 256 MiB chunks buy nothing over
-/// 128 MiB and stall while each one buffers, and the memory they cost is what
-/// caps the number of parallel streams - which is the only thing that actually
-/// raises throughput, because Google will not parallelize a single file.
+/// Two rounds of tuning (256 MiB/16 transfers, then 128 MiB/32) were both
+/// slower in practice than the settings the app originally shipped with, and
+/// both were written to disk - so restoring the defaults alone would leave
+/// existing installs on the slow values.
 ///
-/// Only the exact old defaults are touched, so a deliberately customised value
-/// is left alone.
+/// Only the exact tuned combinations are recognised, so a deliberately
+/// customised setting is left alone.
 fn migrate_throughput_defaults(preferences: &mut AppPreferences) {
-    if preferences.upload_chunk_size_mib == 256 && preferences.rclone_transfers == 16 {
-        log::info!("Migrating upload tuning from 256MiB/16 transfers to 128MiB/32 transfers");
-        preferences.upload_chunk_size_mib = 128;
-        preferences.rclone_transfers = 32;
-        if preferences.rclone_checkers == 16 {
-            preferences.rclone_checkers = 32;
-        }
+    let tuned = matches!(
+        (
+            preferences.upload_chunk_size_mib,
+            preferences.rclone_transfers
+        ),
+        (256, 16) | (128, 32)
+    );
+    if !tuned {
+        return;
+    }
+
+    log::info!(
+        "Restoring January upload tuning (128MiB chunk, 4 transfers, 8 checkers) from {}MiB/{} transfers",
+        preferences.upload_chunk_size_mib,
+        preferences.rclone_transfers
+    );
+    preferences.upload_chunk_size_mib = 128;
+    preferences.rclone_transfers = 4;
+    if matches!(preferences.rclone_checkers, 16 | 32) {
+        preferences.rclone_checkers = 8;
     }
 }
 
@@ -1569,14 +1579,37 @@ mod tests {
     }
 
     #[test]
-    fn migrates_the_old_slow_upload_tuning() {
-        // The old values were written to disk, so raising the defaults alone
-        // would leave existing installs capped at 16 parallel streams.
+    fn restores_january_tuning_from_the_first_tuned_set() {
+        // 256MiB/16 was written to disk, so restoring the defaults alone would
+        // leave existing installs on the slower settings.
         let mut prefs = legacy_prefs();
         migrate_throughput_defaults(&mut prefs);
         assert_eq!(prefs.upload_chunk_size_mib, 128);
-        assert_eq!(prefs.rclone_transfers, 32);
-        assert_eq!(prefs.rclone_checkers, 32);
+        assert_eq!(prefs.rclone_transfers, 4);
+        assert_eq!(prefs.rclone_checkers, 8);
+    }
+
+    #[test]
+    fn restores_january_tuning_from_the_second_tuned_set() {
+        let mut prefs = AppPreferences {
+            upload_chunk_size_mib: 128,
+            rclone_transfers: 32,
+            rclone_checkers: 32,
+            ..AppPreferences::default()
+        };
+        migrate_throughput_defaults(&mut prefs);
+        assert_eq!(prefs.rclone_transfers, 4);
+        assert_eq!(prefs.rclone_checkers, 8);
+    }
+
+    #[test]
+    fn the_january_defaults_are_left_untouched() {
+        // Already correct: the migration must not thrash them on every launch.
+        let mut prefs = AppPreferences::default();
+        migrate_throughput_defaults(&mut prefs);
+        assert_eq!(prefs.upload_chunk_size_mib, 128);
+        assert_eq!(prefs.rclone_transfers, 4);
+        assert_eq!(prefs.rclone_checkers, 8);
     }
 
     #[test]
@@ -1598,7 +1631,7 @@ mod tests {
             ..legacy_prefs()
         };
         migrate_throughput_defaults(&mut prefs);
-        assert_eq!(prefs.rclone_transfers, 32);
+        assert_eq!(prefs.rclone_transfers, 4);
         assert_eq!(prefs.rclone_checkers, 4);
     }
 

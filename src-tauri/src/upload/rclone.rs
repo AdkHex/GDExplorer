@@ -1356,26 +1356,21 @@ fn build_rclone_args(
         ),
         "--drive-root-folder-id".to_string(),
         item.destination_folder_id.clone(),
+        // Kept deliberately close to rclone's own defaults.
+        //
+        // A previous round of "tuning" added --drive-upload-cutoff, an
+        // aggressive pacer (--drive-pacer-min-sleep 10ms / --drive-pacer-burst
+        // 200) and --fast-list on the theory that each would raise throughput.
+        // In practice the build without any of them uploaded faster, so they
+        // are gone. Drive rate-limits per account; pushing the pacer harder
+        // invites 403 rateLimitExceeded and the backoff that follows, which
+        // costs more than the extra calls gain.
         "--drive-chunk-size".to_string(),
-        format!("{}M", prefs.drive_chunk_size_mib),
-        // Without this rclone switches to the chunked path at 8 MiB, so most
-        // files paid for a resumable session they did not need. Matching the
-        // chunk size keeps single-request uploads for anything smaller.
-        "--drive-upload-cutoff".to_string(),
         format!("{}M", prefs.drive_chunk_size_mib),
         "--transfers".to_string(),
         prefs.transfers.to_string(),
         "--checkers".to_string(),
         prefs.checkers.to_string(),
-        // Drive's default pacer sleeps 100ms between API calls, which caps the
-        // job at ~10 calls/sec no matter how much bandwidth is available.
-        "--drive-pacer-min-sleep".to_string(),
-        "10ms".to_string(),
-        "--drive-pacer-burst".to_string(),
-        "200".to_string(),
-        // One recursive listing instead of one call per directory. Matters on
-        // deep folders, where the listing dominated the transfer time.
-        "--fast-list".to_string(),
         "--stats".to_string(),
         "1s".to_string(),
         "--stats-log-level".to_string(),
