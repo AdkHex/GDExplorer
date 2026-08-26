@@ -175,3 +175,46 @@ describe('transferUiStore speed is measured, not reported', () => {
     ).toBe(40)
   })
 })
+
+describe('transferUiStore settled-byte speed', () => {
+  beforeEach(() => {
+    useTransferUiStore.setState({
+      metricsById: {},
+      _lastSampleById: {},
+      _startedAtById: {},
+      _reportedSpeedById: {},
+      _settledBytesById: {},
+    })
+  })
+
+  it('measures from settled bytes, not buffered bytesSent', () => {
+    // rclone has fed 100 MB into chunks but only 1 MB belongs to completed
+    // files. The row must reflect the settled figure.
+    useTransferUiStore.getState().recordSettledBytes(ITEM, 1_000_000)
+    useTransferUiStore.getState().tick([
+      {
+        id: ITEM,
+        status: 'uploading',
+        bytesSent: 100_000_000,
+        totalBytes: 1_000_000_000,
+      },
+    ])
+
+    const speed =
+      useTransferUiStore.getState().metricsById[ITEM]?.speedBytesPerSec ?? 0
+    // 1 MB over the minimum 250ms window, not 100 MB.
+    expect(speed).toBe(4_000_000)
+  })
+
+  it('falls back to bytesSent when no settled figure is available', () => {
+    useTransferUiStore
+      .getState()
+      .tick([
+        { id: ITEM, status: 'uploading', bytesSent: 10, totalBytes: 1000 },
+      ])
+
+    expect(
+      useTransferUiStore.getState().metricsById[ITEM]?.speedBytesPerSec
+    ).toBe(40)
+  })
+})

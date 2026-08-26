@@ -325,6 +325,7 @@ async fn run_rclone_command(
     let mut last_bytes = 0_u64;
     let mut last_total = 0_u64;
     let mut last_speed: Option<u64> = None;
+    let mut last_settled: Option<u64> = None;
     let mut last_file_progress: HashMap<String, (u64, u64, u64)> = HashMap::new();
     // Keep the most recent rclone errors so a failure can say what went wrong
     // instead of only reporting an exit code.
@@ -364,19 +365,24 @@ async fn run_rclone_command(
                         }
                     }
                 }
-                if let Some((bytes, total, speed)) = parse_json_progress(
+                if let Some((bytes, total, speed, settled)) = parse_json_progress(
                     &line,
                     &item.path,
                     &item.kind,
                 )
                 .or_else(|| {
-                    parse_progress_line(&progress_re, &line).map(|(b, t)| (b, t, None))
+                    parse_progress_line(&progress_re, &line).map(|(b, t)| (b, t, None, None))
                 }) {
-                    if bytes != last_bytes || total != last_total || speed != last_speed {
+                    if bytes != last_bytes
+                        || total != last_total
+                        || speed != last_speed
+                        || settled != last_settled
+                    {
                         last_bytes = bytes;
                         last_total = total;
                         last_speed = speed;
-                        emit_progress(app, item, bytes, total, speed).await;
+                        last_settled = settled;
+                        emit_progress(app, item, bytes, total, speed, settled).await;
                     }
                 }
             }
@@ -533,14 +539,16 @@ async fn emit_progress(
     bytes: u64,
     total: u64,
     speed: Option<u64>,
+    settled: Option<u64>,
 ) {
     log::debug!(
         target: "rclone",
-        "progress id={} bytes={} total={} speed={:?}",
+        "progress id={} bytes={} total={} speed={:?} settled={:?}",
         item.id,
         bytes,
         total,
-        speed
+        speed,
+        settled
     );
     let _ = app.emit(
         "upload:progress",
@@ -550,6 +558,7 @@ async fn emit_progress(
             bytes_sent: bytes,
             total_bytes: total,
             speed_bytes_per_sec: speed,
+            settled_bytes: settled,
         },
     );
 }
@@ -1498,7 +1507,32 @@ fn transfer_entry_speed(entry: &Value) -> u64 {
         .unwrap_or(0)
 }
 
-fn parse_json_progress(line: &str, path: &str, kind: &str) -> Option<(u64, u64, Option<u64>)> {
+/// Bytes rclone has actually finished sending, i.e. `stats.bytes` minus every
+/// byte still sitting in an in-flight transfer.
+///
+/// `stats.bytes` counts data as soon as it is fed into a chunk, so it runs
+/// ahead of what Drive has accepted - with 128 MiB chunks it can lead reality
+/// by gigabytes across several parallel transfers. Subtracting the in-flight
+/// entries leaves only bytes belonging to completed files, which cannot be
+/// inflated by buffering.
+fn settled_bytes(stats: &Value) -> Option<u64> {
+    let total = stats.get("bytes").and_then(|v| v.as_u64())?;
+    let in_flight: u64 = stats
+        .get("transferring")
+        .and_then(|v| v.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.get("bytes").and_then(|v| v.as_u64()))
+                .sum()
+        })
+        .unwrap_or(0);
+    Some(total.saturating_sub(in_flight))
+}
+
+type ProgressSample = (u64, u64, Option<u64>, Option<u64>);
+
+fn parse_json_progress(line: &str, path: &str, kind: &str) -> Option<ProgressSample> {
     if !line.trim_start().starts_with('{') {
         return None;
     }
@@ -1513,6 +1547,7 @@ fn parse_json_progress(line: &str, path: &str, kind: &str) -> Option<(u64, u64, 
             .map(|entries| entries.iter().map(transfer_entry_speed).sum())
             .unwrap_or(0),
     );
+    let settled = settled_bytes(stats);
 
     // For a single-file item the matching `transferring` entry is more precise
     // than the aggregate (which can include retried bytes). Folders must use
@@ -1536,7 +1571,7 @@ fn parse_json_progress(line: &str, path: &str, kind: &str) -> Option<(u64, u64, 
                     if name == file_name || name.ends_with(file_name) {
                         let bytes = entry.get("bytes").and_then(|v| v.as_u64())?;
                         let total = entry.get("size").and_then(|v| v.as_u64())?;
-                        return Some((bytes, total, speed));
+                        return Some((bytes, total, speed, settled));
                     }
                 }
             }
@@ -1545,14 +1580,14 @@ fn parse_json_progress(line: &str, path: &str, kind: &str) -> Option<(u64, u64, 
                 let entry = &transferring[0];
                 let bytes = entry.get("bytes").and_then(|v| v.as_u64())?;
                 let total = entry.get("size").and_then(|v| v.as_u64())?;
-                return Some((bytes, total, speed));
+                return Some((bytes, total, speed, settled));
             }
         }
     }
 
     let bytes = stats.get("bytes").and_then(|v| v.as_u64())?;
     let total = stats.get("totalBytes").and_then(|v| v.as_u64())?;
-    Some((bytes, total, speed))
+    Some((bytes, total, speed, settled))
 }
 
 fn parse_json_file_progress(line: &str) -> Option<Vec<(String, u64, u64, u64)>> {
@@ -1719,7 +1754,7 @@ mod tests {
 
     #[test]
     fn folder_progress_uses_the_aggregate_and_sums_file_speeds() {
-        let (bytes, total, speed) =
+        let (bytes, total, speed, _) =
             parse_json_progress(STATS_LINE, "/movies/Flyboys (2006)", "folder").unwrap();
         assert_eq!((bytes, total), (3000, 10000));
         assert_eq!(speed, Some(300));
@@ -1730,7 +1765,7 @@ mod tests {
         // With one file left mid-flight the folder's progress used to be
         // overwritten with that file's bytes, corrupting the parent row.
         let line = r#"{"stats":{"bytes":9000,"totalBytes":10000,"transferring":[{"name":"a.mkv","bytes":1000,"size":4000,"speedAvg":100.0}]}}"#;
-        let (bytes, total, speed) =
+        let (bytes, total, speed, _) =
             parse_json_progress(line, "/movies/Flyboys (2006)", "folder").unwrap();
         assert_eq!((bytes, total), (9000, 10000));
         assert_eq!(speed, Some(100));
@@ -1738,7 +1773,7 @@ mod tests {
 
     #[test]
     fn file_progress_matches_its_transferring_entry() {
-        let (bytes, total, speed) =
+        let (bytes, total, speed, _) =
             parse_json_progress(STATS_LINE, "/movies/a.mkv", "file").unwrap();
         assert_eq!((bytes, total), (1000, 4000));
         assert_eq!(speed, Some(300));
@@ -1757,11 +1792,30 @@ mod tests {
     }
 
     #[test]
+    fn settled_bytes_exclude_data_still_in_flight() {
+        // STATS_LINE: stats.bytes = 3000, with 1000 + 2000 still in flight, so
+        // nothing has actually landed yet. This is the number the displayed
+        // speed is measured from - `bytes` alone would claim 3000.
+        let value: Value = serde_json::from_str(STATS_LINE).unwrap();
+        let stats = value.get("stats").unwrap();
+        assert_eq!(settled_bytes(stats), Some(0));
+    }
+
+    #[test]
+    fn settled_bytes_count_completed_files() {
+        // 9000 transferred, 1000 of it mid-flight -> 8000 genuinely landed.
+        let line = r#"{"stats":{"bytes":9000,"totalBytes":10000,"transferring":[{"name":"a.mkv","bytes":1000,"size":4000,"speedAvg":100.0}]}}"#;
+        let value: Value = serde_json::from_str(line).unwrap();
+        let stats = value.get("stats").unwrap();
+        assert_eq!(settled_bytes(stats), Some(8000));
+    }
+
+    #[test]
     fn progress_without_transferring_reports_zero_speed() {
         // Finalize/checking phase: nothing is moving, so the truthful current
         // speed is zero rather than a stale value.
         let line = r#"{"stats":{"bytes":10000,"totalBytes":10000}}"#;
-        let (_, _, speed) = parse_json_progress(line, "/movies/x", "folder").unwrap();
+        let (_, _, speed, _) = parse_json_progress(line, "/movies/x", "folder").unwrap();
         assert_eq!(speed, Some(0));
     }
 }
