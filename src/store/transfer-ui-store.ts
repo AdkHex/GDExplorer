@@ -59,8 +59,6 @@ interface TransferUiState {
   _startedAtById: Record<string, number>
   /** Speeds rclone itself reported, per item. Diagnostics only - see above. */
   _reportedSpeedById: Record<string, { speed: number; atMs: number }>
-  /** Latest settled-byte count per item, used to measure honest speed. */
-  _settledBytesById: Record<string, number>
 
   isPaused: (id: string) => boolean
   setPaused: (id: string, paused: boolean) => void
@@ -81,8 +79,6 @@ interface TransferUiState {
   clearFileProgress: (itemIds: string[]) => void
   clearRemoved: (remainingIds: string[]) => void
 
-  /** Records bytes rclone has fully settled (buffered data excluded). */
-  recordSettledBytes: (itemId: string, settledBytes: number | null) => void
   tick: (
     items: {
       id: string
@@ -104,23 +100,8 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
   _lastSampleById: {},
   _startedAtById: {},
   _reportedSpeedById: {},
-  _settledBytesById: {},
 
   isPaused: id => Boolean(get().pausedById[id]),
-
-  recordSettledBytes: (itemId, settledBytes) =>
-    set(state => {
-      if (typeof settledBytes !== 'number' || !Number.isFinite(settledBytes)) {
-        return state
-      }
-      if (state._settledBytesById[itemId] === settledBytes) return state
-      return {
-        _settledBytesById: {
-          ...state._settledBytesById,
-          [itemId]: Math.max(0, Math.round(settledBytes)),
-        },
-      }
-    }),
 
   recordItemSpeed: (itemId, speedBytesPerSec) =>
     set(state => {
@@ -361,7 +342,6 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       const nextLast: Record<string, { bytesSent: number; atMs: number }> = {}
       const nextStarted: Record<string, number> = {}
       const nextReported: Record<string, { speed: number; atMs: number }> = {}
-      const nextSettled: Record<string, number> = {}
 
       for (const [id, v] of Object.entries(state.pausedById)) {
         if (remaining.has(id)) nextPaused[id] = v
@@ -393,9 +373,6 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       for (const [id, v] of Object.entries(state._reportedSpeedById)) {
         if (remaining.has(id)) nextReported[id] = v
       }
-      for (const [id, v] of Object.entries(state._settledBytesById)) {
-        if (remaining.has(id)) nextSettled[id] = v
-      }
 
       return {
         pausedById: nextPaused,
@@ -408,7 +385,6 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
         _lastSampleById: nextLast,
         _startedAtById: nextStarted,
         _reportedSpeedById: nextReported,
-        _settledBytesById: nextSettled,
       }
     }),
 
@@ -450,19 +426,11 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
           startedAtById = omitKey(startedAtById, id)
         }
 
-        // Speed is measured from settled bytes (completed files) when rclone
-        // reports them. `bytesSent` includes data buffered into the current
-        // chunk, which with 128 MiB chunks across several parallel transfers
-        // runs ahead of what Drive has accepted - so differentiating it still
-        // overstates the rate even though the value itself is a byte count.
-        const settled = state._settledBytesById[id]
-        const measured = typeof settled === 'number' ? settled : sent
-
         const prev = lastSampleById[id]
         const atMs = prev?.atMs ?? now
         const dtMs = Math.max(250, now - atMs)
-        const prevSent = prev?.bytesSent ?? measured
-        const delta = Math.max(0, measured - prevSent)
+        const prevSent = prev?.bytesSent ?? sent
+        const delta = Math.max(0, sent - prevSent)
 
         // Only update the sample when bytes have actually advanced; updating the timestamp
         // every tick would make speed/ETA incorrect for large chunks.
@@ -470,7 +438,7 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
           if (lastSampleById === state._lastSampleById) {
             lastSampleById = { ...state._lastSampleById }
           }
-          lastSampleById[id] = { bytesSent: measured, atMs: now }
+          lastSampleById[id] = { bytesSent: sent, atMs: now }
         }
 
         const baselineAtMs = startedAtById[id]
@@ -484,8 +452,8 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
         const sample =
           delta > 0
             ? (delta * 1000) / dtMs
-            : measured > 0 && baselineAtMs !== undefined
-              ? (measured * 1000) / baselineDtMs
+            : sent > 0 && baselineAtMs !== undefined
+              ? (sent * 1000) / baselineDtMs
               : null
 
         // Measured from actual byte progress, NOT rclone's `speedAvg`.

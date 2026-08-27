@@ -22,10 +22,6 @@ pub struct ProgressEvent {
     /// when progress came from a source that does not report speed, in which
     /// case the frontend falls back to computing it from byte deltas.
     pub speed_bytes_per_sec: Option<u64>,
-    /// Bytes belonging to completed files only, with everything still in
-    /// flight subtracted. Displayed speed is measured from this, because
-    /// `bytes_sent` counts buffered data and so runs ahead of reality.
-    pub settled_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
