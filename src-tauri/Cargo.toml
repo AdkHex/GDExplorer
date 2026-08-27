@@ -1,6 +1,6 @@
 [package]
 name = "gdexplorer"
-version = "0.2.19"
+version = "0.2.20"
 description = "GDExplorer"
 authors = ["vo1x"]
 edition = "2021"
