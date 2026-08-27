@@ -175,3 +175,72 @@ describe('transferUiStore speed is measured, not reported', () => {
     ).toBe(40)
   })
 })
+
+describe('transferUiStore item speed reflects the current rate', () => {
+  beforeEach(() => {
+    useTransferUiStore.setState({
+      pausedById: {},
+      metricsById: {},
+      _lastSampleById: {},
+      _startedAtById: {},
+      _reportedSpeedById: {},
+    })
+  })
+
+  it('holds the last measured rate when no bytes moved', () => {
+    // Two ticks with real movement establish a rate...
+    useTransferUiStore.setState({
+      _startedAtById: { [ITEM]: Date.now() - 1000 },
+      _lastSampleById: { [ITEM]: { bytesSent: 0, atMs: Date.now() - 1000 } },
+    })
+    useTransferUiStore
+      .getState()
+      .tick([
+        { id: ITEM, status: 'uploading', bytesSent: 1000, totalBytes: 100_000 },
+      ])
+    const first =
+      useTransferUiStore.getState().metricsById[ITEM]?.speedBytesPerSec ?? 0
+    expect(first).toBeGreaterThan(0)
+
+    // ...and a tick with no new bytes must not invent a different number.
+    useTransferUiStore
+      .getState()
+      .tick([
+        { id: ITEM, status: 'uploading', bytesSent: 1000, totalBytes: 100_000 },
+      ])
+    expect(
+      useTransferUiStore.getState().metricsById[ITEM]?.speedBytesPerSec
+    ).toBe(first)
+  })
+
+  it('does not report the lifetime average as the current rate', () => {
+    // The reported bug: a folder that moved 120 GiB quickly and is now down to
+    // one slow file must not keep showing the fast historical average.
+    const startedAt = Date.now() - 600_000 // ten minutes ago
+    useTransferUiStore.setState({
+      _startedAtById: { [ITEM]: startedAt },
+      _lastSampleById: {
+        [ITEM]: { bytesSent: 120_000_000_000, atMs: Date.now() - 2000 },
+      },
+      metricsById: {
+        [ITEM]: { speedBytesPerSec: 6_000_000, etaSeconds: null },
+      },
+    })
+
+    // No new bytes this tick.
+    useTransferUiStore.getState().tick([
+      {
+        id: ITEM,
+        status: 'uploading',
+        bytesSent: 120_000_000_000,
+        totalBytes: 134_000_000_000,
+      },
+    ])
+
+    const speed =
+      useTransferUiStore.getState().metricsById[ITEM]?.speedBytesPerSec ?? 0
+    // 120 GB / 600s would be ~200 MB/s. It must hold 6 MB/s instead.
+    expect(speed).toBe(6_000_000)
+    expect(speed).toBeLessThan(50_000_000)
+  })
+})

@@ -426,7 +426,15 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
           startedAtById = omitKey(startedAtById, id)
         }
 
-        const prev = lastSampleById[id]
+        // Seed the first sample at the moment the transfer became active with
+        // zero bytes, so the very first tick still yields a real measurement
+        // instead of waiting a full cycle for a baseline.
+        const startedAt = startedAtById[id]
+        const prev =
+          lastSampleById[id] ??
+          (startedAt !== undefined
+            ? { bytesSent: 0, atMs: startedAt }
+            : undefined)
         const atMs = prev?.atMs ?? now
         const dtMs = Math.max(250, now - atMs)
         const prevSent = prev?.bytesSent ?? sent
@@ -441,20 +449,20 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
           lastSampleById[id] = { bytesSent: sent, atMs: now }
         }
 
-        const baselineAtMs = startedAtById[id]
-        const baselineDtMs =
-          baselineAtMs !== undefined ? Math.max(250, now - baselineAtMs) : dtMs
-
         const previousSpeed = state.metricsById[id]?.speedBytesPerSec ?? 0
 
         // Instantaneous rate for this tick, or the average since the transfer
         // started when no bytes have moved yet.
-        const sample =
-          delta > 0
-            ? (delta * 1000) / dtMs
-            : sent > 0 && baselineAtMs !== undefined
-              ? (sent * 1000) / baselineDtMs
-              : null
+        // Only a real byte delta produces a sample. The old fallback used
+        // `sent / elapsed-since-start`, i.e. the average over the whole
+        // transfer, which is not the current rate: once the quick files in a
+        // folder finish and one slow file is left, that average stays high for
+        // as long as the tail takes. It reported 1.2 Gbps (and a 40s ETA) on a
+        // folder whose only active file was moving at 50 Mbps.
+        //
+        // With nothing new transferred the honest answer is "no fresh sample",
+        // so the previous measured rate is held until bytes move again.
+        const sample = delta > 0 ? (delta * 1000) / dtMs : null
 
         // Measured from actual byte progress, NOT rclone's `speedAvg`.
         //
