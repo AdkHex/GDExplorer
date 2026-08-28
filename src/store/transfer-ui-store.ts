@@ -12,6 +12,15 @@ type UploadRuntimeStatus =
 const SPEED_SMOOTHING = 0.3
 
 /**
+ * How much elapsed time a speed measurement covers.
+ *
+ * rclone emits stats roughly once a second and only when bytes change, while
+ * the UI ticks twice a second, so a window shorter than this would keep
+ * measuring gaps where nothing arrived and read as 0.
+ */
+const SPEED_WINDOW_MS = 3000
+
+/**
  * rclone's reported speed is recorded for diagnostics but is deliberately NOT
  * displayed: `speedAvg` counts bytes as they enter the upload buffer, so with
  * large chunks it reports the disk read rate rather than what Drive has
@@ -175,11 +184,18 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
         : (existingOrder ?? [])
 
       const now = Date.now()
-      const prevSample = existingSamples?.[resolvedKey]
-      const atMs = prevSample?.atMs ?? now
+      // Same rolling window as `tick`: anchor on the first update for this
+      // file so a baseline always exists, then re-anchor once the window has
+      // elapsed. Without an anchor the delta stayed zero and the row read
+      // "0 bps" for the whole transfer.
+      const prevSample = existingSamples?.[resolvedKey] ?? {
+        bytesSent,
+        atMs: now,
+      }
+      const atMs = prevSample.atMs
       const dtMs = Math.max(250, now - atMs)
-      const prevSent = prevSample?.bytesSent ?? bytesSent
-      const delta = Math.max(0, bytesSent - prevSent)
+      const delta = Math.max(0, bytesSent - prevSample.bytesSent)
+      const windowElapsed = now - atMs >= SPEED_WINDOW_MS
       const prevSpeed = existingMetrics?.[resolvedKey]?.speedBytesPerSec ?? 0
       const complete = totalBytes > 0 && bytesSent >= totalBytes
       // Measured from byte progress rather than rclone's `speedAvg`, which
@@ -189,7 +205,9 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
         ? 0
         : delta > 0
           ? Math.max(0, Math.round((delta * 1000) / dtMs))
-          : prevSpeed
+          : windowElapsed
+            ? 0
+            : prevSpeed
       const remaining = Math.max(
         0,
         totalBytes - Math.min(bytesSent, totalBytes)
@@ -198,7 +216,9 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
 
       const nextSamples = {
         ...(existingSamples ?? {}),
-        [resolvedKey]: { bytesSent, atMs: delta > 0 ? now : atMs },
+        [resolvedKey]: windowElapsed
+          ? { bytesSent, atMs: now }
+          : { bytesSent: prevSample.bytesSent, atMs },
       }
 
       const nextMetrics = {
@@ -426,23 +446,39 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
           startedAtById = omitKey(startedAtById, id)
         }
 
-        // Seed the first sample at the moment the transfer became active with
-        // zero bytes, so the very first tick still yields a real measurement
-        // instead of waiting a full cycle for a baseline.
-        const startedAt = startedAtById[id]
-        const prev =
-          lastSampleById[id] ??
-          (startedAt !== undefined
-            ? { bytesSent: 0, atMs: startedAt }
-            : undefined)
-        const atMs = prev?.atMs ?? now
+        // A rolling window anchored on an earlier (bytes, time) pair.
+        //
+        // The anchor is always established on the first tick an item is
+        // active, so there is never a state where no baseline exists - that
+        // was the bug behind rows stuck at "0 bps": with no stored sample,
+        // `prevSent` defaulted to the current byte count, making the delta
+        // permanently zero, so a rate could never be established at all.
+        //
+        // The anchor is only advanced once it is older than the window, which
+        // keeps the measurement over a meaningful span instead of the gap
+        // between two ticks. rclone emits stats about once a second while the
+        // UI ticks twice a second, so most ticks legitimately see no new bytes.
+        let anchor = lastSampleById[id]
+        if (isActive && anchor === undefined) {
+          if (lastSampleById === state._lastSampleById) {
+            lastSampleById = { ...state._lastSampleById }
+          }
+          anchor = { bytesSent: sent, atMs: now }
+          lastSampleById[id] = anchor
+        }
+
+        const atMs = anchor?.atMs ?? now
         const dtMs = Math.max(250, now - atMs)
-        const prevSent = prev?.bytesSent ?? sent
+        const prevSent = anchor?.bytesSent ?? sent
         const delta = Math.max(0, sent - prevSent)
 
-        // Only update the sample when bytes have actually advanced; updating the timestamp
-        // every tick would make speed/ETA incorrect for large chunks.
-        if (isActive && delta > 0) {
+        // Re-anchor once the window has elapsed, so the next measurement
+        // covers fresh ground rather than an ever-growing average.
+        if (
+          isActive &&
+          anchor !== undefined &&
+          now - anchor.atMs >= SPEED_WINDOW_MS
+        ) {
           if (lastSampleById === state._lastSampleById) {
             lastSampleById = { ...state._lastSampleById }
           }
@@ -451,18 +487,19 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
 
         const previousSpeed = state.metricsById[id]?.speedBytesPerSec ?? 0
 
-        // Instantaneous rate for this tick, or the average since the transfer
-        // started when no bytes have moved yet.
-        // Only a real byte delta produces a sample. The old fallback used
-        // `sent / elapsed-since-start`, i.e. the average over the whole
-        // transfer, which is not the current rate: once the quick files in a
-        // folder finish and one slow file is left, that average stays high for
-        // as long as the tail takes. It reported 1.2 Gbps (and a 40s ETA) on a
-        // folder whose only active file was moving at 50 Mbps.
+        // Once the window has elapsed, report what actually moved across it -
+        // including zero, which is the truth when a transfer has stalled.
+        // Before that, hold the previous rate rather than flicker to 0 between
+        // rclone's once-a-second updates.
         //
-        // With nothing new transferred the honest answer is "no fresh sample",
-        // so the previous measured rate is held until bytes move again.
-        const sample = delta > 0 ? (delta * 1000) / dtMs : null
+        // The removed fallback used `sent / elapsed-since-start`, the average
+        // over the whole transfer. That is not the current rate: once the quick
+        // files in a folder finish and one slow file is left, the average stays
+        // high for as long as the tail takes. It reported 1.2 Gbps (and a 40s
+        // ETA) on a folder whose only active file was moving at 50 Mbps.
+        const windowElapsed = now - atMs >= SPEED_WINDOW_MS
+        const sample =
+          delta > 0 ? (delta * 1000) / dtMs : windowElapsed ? 0 : null
 
         // Measured from actual byte progress, NOT rclone's `speedAvg`.
         //

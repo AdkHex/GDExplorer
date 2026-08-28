@@ -163,16 +163,28 @@ describe('transferUiStore speed is measured, not reported', () => {
   })
 
   it('measures the item rate from byte deltas', () => {
+    // The first tick only anchors the window; a rate needs two observations.
     useTransferUiStore
       .getState()
       .tick([
         { id: ITEM, status: 'uploading', bytesSent: 10, totalBytes: 1000 },
       ])
 
-    // Average since start over the minimum 250ms window: 10 bytes -> 40 B/s.
-    expect(
-      useTransferUiStore.getState().metricsById[ITEM]?.speedBytesPerSec
-    ).toBe(40)
+    // Backdate the anchor by a second, then report 1010 more bytes.
+    useTransferUiStore.setState({
+      _lastSampleById: { [ITEM]: { bytesSent: 10, atMs: Date.now() - 1000 } },
+    })
+    useTransferUiStore
+      .getState()
+      .tick([
+        { id: ITEM, status: 'uploading', bytesSent: 1020, totalBytes: 100_000 },
+      ])
+
+    // ~1010 bytes over ~1s. Allow slack for timer jitter.
+    const speed =
+      useTransferUiStore.getState().metricsById[ITEM]?.speedBytesPerSec ?? 0
+    expect(speed).toBeGreaterThan(900)
+    expect(speed).toBeLessThan(1200)
   })
 })
 
@@ -242,5 +254,101 @@ describe('transferUiStore item speed reflects the current rate', () => {
     // 120 GB / 600s would be ~200 MB/s. It must hold 6 MB/s instead.
     expect(speed).toBe(6_000_000)
     expect(speed).toBeLessThan(50_000_000)
+  })
+})
+
+describe('transferUiStore establishes a rate from a cold start', () => {
+  beforeEach(() => {
+    useTransferUiStore.setState({
+      pausedById: {},
+      metricsById: {},
+      fileProgressById: {},
+      fileOrderById: {},
+      fileMetricsById: {},
+      _fileLastSampleById: {},
+      _lastSampleById: {},
+      _startedAtById: {},
+      _reportedSpeedById: {},
+    })
+  })
+
+  it('anchors an item that is already mid-transfer', () => {
+    // The reported bug: an upload already at 2.4% with no stored sample read
+    // "0 bps" forever, because the baseline defaulted to the current byte
+    // count and the delta could never become positive.
+    useTransferUiStore.getState().tick([
+      {
+        id: ITEM,
+        status: 'uploading',
+        bytesSent: 7_000_000_000,
+        totalBytes: 297_000_000_000,
+      },
+    ])
+
+    const anchor = useTransferUiStore.getState()._lastSampleById[ITEM]
+    expect(anchor).toBeDefined()
+    expect(anchor?.bytesSent).toBe(7_000_000_000)
+
+    // Once bytes advance past the window, a real rate appears.
+    useTransferUiStore.setState({
+      _lastSampleById: {
+        [ITEM]: { bytesSent: 7_000_000_000, atMs: Date.now() - 4000 },
+      },
+    })
+    useTransferUiStore.getState().tick([
+      {
+        id: ITEM,
+        status: 'uploading',
+        bytesSent: 7_400_000_000,
+        totalBytes: 297_000_000_000,
+      },
+    ])
+
+    expect(
+      useTransferUiStore.getState().metricsById[ITEM]?.speedBytesPerSec ?? 0
+    ).toBeGreaterThan(0)
+  })
+
+  it('anchors a file row that is already mid-transfer', () => {
+    seedList(['/root/big.mkv'])
+    useTransferUiStore
+      .getState()
+      .recordFileProgress(ITEM, '/root/big.mkv', 500_000_000, 14_000_000_000)
+
+    // Backdate past the window, then report more bytes.
+    const samples = useTransferUiStore.getState()._fileLastSampleById[ITEM]
+    useTransferUiStore.setState({
+      _fileLastSampleById: {
+        [ITEM]: {
+          ...samples,
+          '/root/big.mkv': { bytesSent: 500_000_000, atMs: Date.now() - 4000 },
+        },
+      },
+    })
+    useTransferUiStore
+      .getState()
+      .recordFileProgress(ITEM, '/root/big.mkv', 600_000_000, 14_000_000_000)
+
+    expect(
+      useTransferUiStore.getState().fileMetricsById[ITEM]?.['/root/big.mkv']
+        ?.speedBytesPerSec ?? 0
+    ).toBeGreaterThan(0)
+  })
+
+  it('reports zero once a stalled window elapses', () => {
+    useTransferUiStore.setState({
+      _lastSampleById: { [ITEM]: { bytesSent: 1000, atMs: Date.now() - 5000 } },
+      metricsById: { [ITEM]: { speedBytesPerSec: 500_000, etaSeconds: 10 } },
+    })
+    useTransferUiStore
+      .getState()
+      .tick([
+        { id: ITEM, status: 'uploading', bytesSent: 1000, totalBytes: 100_000 },
+      ])
+
+    // Nothing moved for 5s: the honest rate is 0, not the stale 500 kB/s.
+    expect(
+      useTransferUiStore.getState().metricsById[ITEM]?.speedBytesPerSec
+    ).toBeLessThan(500_000)
   })
 })
