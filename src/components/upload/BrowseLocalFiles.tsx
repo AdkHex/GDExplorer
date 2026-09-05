@@ -50,7 +50,6 @@ export function BrowseLocalFiles() {
     remove: removeItem,
   } = useLocalUploadQueue()
   const recordFileProgress = useTransferUiStore(s => s.recordFileProgress)
-  const recordItemSpeed = useTransferUiStore(s => s.recordItemSpeed)
   const recordFileList = useTransferUiStore(s => s.recordFileList)
   const clearFileProgress = useTransferUiStore(s => s.clearFileProgress)
   const { destinationError, destinationFolderId } = useUploadDestinationStore()
@@ -138,10 +137,8 @@ export function BrowseLocalFiles() {
         totalBytes: number
         speedBytesPerSec?: number | null
       }>('upload:progress', event => {
-        const { itemId, bytesSent, totalBytes, speedBytesPerSec } =
-          event.payload
+        const { itemId, bytesSent, totalBytes } = event.payload
         setItemProgress(itemId, bytesSent, totalBytes)
-        recordItemSpeed(itemId, speedBytesPerSec ?? null)
       })
 
       unlistenFileProgress = await listen<{
@@ -151,15 +148,8 @@ export function BrowseLocalFiles() {
         totalBytes: number
         speedBytesPerSec?: number | null
       }>('upload:file_progress', event => {
-        const { itemId, filePath, bytesSent, totalBytes, speedBytesPerSec } =
-          event.payload
-        recordFileProgress(
-          itemId,
-          filePath,
-          bytesSent,
-          totalBytes,
-          speedBytesPerSec ?? null
-        )
+        const { itemId, filePath, bytesSent, totalBytes } = event.payload
+        recordFileProgress(itemId, filePath, bytesSent, totalBytes)
       })
 
       unlistenFileList = await listen<{
@@ -249,7 +239,6 @@ export function BrowseLocalFiles() {
   }, [
     recordFileList,
     recordFileProgress,
-    recordItemSpeed,
     resetStaleUploadState,
     setItemProgress,
     setItemStatus,

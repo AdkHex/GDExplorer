@@ -8,24 +8,112 @@ type UploadRuntimeStatus =
   | 'done'
   | 'failed'
 
-/** Weight given to the newest speed sample when smoothing (0-1). */
-const SPEED_SMOOTHING = 0.3
+/**
+ * How far back a rate is measured. Long enough to span several of rclone's
+ * counter updates, so a genuine change in speed shows up within a few seconds
+ * without every individual update swinging the number.
+ */
+const SPEED_WINDOW_MS = 15_000
+
+/** Below this much observed history there is nothing honest to report. */
+const MIN_SPEED_SPAN_MS = 1000
 
 /**
- * How much elapsed time a speed measurement covers.
+ * One observation of a byte counter. Only recorded when the counter actually
+ * moved, which is what makes the rate below exact - see `measureRate`.
+ */
+interface Sample {
+  atMs: number
+  bytes: number
+}
+
+/**
+ * Records a counter reading, keeping only the last `SPEED_WINDOW_MS` of them.
  *
- * rclone emits stats roughly once a second and only when bytes change, while
- * the UI ticks twice a second, so a window shorter than this would keep
- * measuring gaps where nothing arrived and read as 0.
+ * Readings where nothing moved are deliberately dropped rather than stored.
+ * rclone advances its byte counters in bursts (one acknowledged chunk at a
+ * time, and only when it emits a stats line), so the timestamps that matter
+ * are the ones where bytes arrived. Keeping only those means the first and
+ * last sample are both arrival instants, and the division in `measureRate`
+ * covers a whole number of arrivals instead of a window that happens to cut
+ * one in half.
  */
-const SPEED_WINDOW_MS = 3000
+function pushSample(
+  history: Sample[] | undefined,
+  bytes: number,
+  now: number
+): Sample[] {
+  const previous = history ?? []
+  const last = previous[previous.length - 1]
+  if (last) {
+    // The counter went backwards, so rclone restarted for this item (a Windows
+    // pause, or a retry) and now counts only the work that is left. Start over
+    // rather than waiting for it to climb back past the old peak, which would
+    // strand the row at "0 B/s" for the rest of the transfer.
+    if (bytes < last.bytes) return [{ atMs: now, bytes }]
+    if (bytes === last.bytes) return previous
+  }
+
+  const kept = previous.filter(sample => sample.atMs >= now - SPEED_WINDOW_MS)
+  // Always keep one older reading when the window has emptied, so a link slow
+  // enough that its updates are further apart than the window still has two
+  // points to measure between.
+  return [
+    ...(kept.length > 0 ? kept : previous.slice(-1)),
+    { atMs: now, bytes },
+  ]
+}
 
 /**
- * rclone's reported speed is recorded for diagnostics but is deliberately NOT
- * displayed: `speedAvg` counts bytes as they enter the upload buffer, so with
- * large chunks it reports the disk read rate rather than what Drive has
- * actually accepted. Displayed rates are measured from byte progress instead.
+ * Bytes per second over the recorded window, as measured rather than smoothed.
+ *
+ * The numerator spans arrival to arrival, so it is an exact average over a
+ * whole number of counter updates. The denominator additionally charges any
+ * idle time beyond one typical gap between updates, which is what makes a
+ * transfer that has gone quiet decay instead of freezing at its last rate.
+ *
+ * Both halves of that are one-directional: this can read low while a chunk is
+ * still in flight, and can never read higher than the bytes that arrived.
  */
+function measureRate(samples: Sample[] | undefined, now: number): number {
+  if (!samples || samples.length < 2) return 0
+
+  // Age readings out against `now`, not only when a new one arrives: a stalled
+  // transfer stops producing samples altogether.
+  const recent = samples.filter(sample => sample.atMs >= now - SPEED_WINDOW_MS)
+  const window = recent.length >= 2 ? recent : samples.slice(-2)
+
+  const first = window[0]
+  const last = window[window.length - 1]
+  if (!first || !last) return 0
+
+  const span = last.atMs - first.atMs
+  const moved = last.bytes - first.bytes
+  if (span <= 0 || moved <= 0) return 0
+
+  const typicalGap = span / (window.length - 1)
+  // Nothing has arrived for far longer than this transfer's own cadence, so
+  // it is stalled rather than part-way through an update. The honest rate is 0.
+  if (now - last.atMs >= Math.max(SPEED_WINDOW_MS, typicalGap * 4)) return 0
+
+  const idle = Math.max(0, now - last.atMs - typicalGap)
+  const elapsed = span + idle
+  if (elapsed < MIN_SPEED_SPAN_MS) return 0
+
+  return Math.max(0, Math.round((moved * 1000) / elapsed))
+}
+
+/** Seconds left at the current rate, or null when there is no rate to go on. */
+function etaFrom(
+  bytesSent: number,
+  totalBytes: number,
+  speedBytesPerSec: number
+): number | null {
+  if (speedBytesPerSec <= 0 || totalBytes <= 0) return null
+  const remaining = totalBytes - Math.min(bytesSent, totalBytes)
+  if (remaining <= 0) return 0
+  return Math.round(remaining / speedBytesPerSec)
+}
 
 export interface TransferMetrics {
   speedBytesPerSec: number
@@ -60,28 +148,18 @@ interface TransferUiState {
   fileProgressById: Record<string, Record<string, FileProgress>>
   fileOrderById: Record<string, string[]>
   fileMetricsById: Record<string, Record<string, FileMetrics>>
-  _fileLastSampleById: Record<
-    string,
-    Record<string, { bytesSent: number; atMs: number }>
-  >
-  _lastSampleById: Record<string, { bytesSent: number; atMs: number }>
-  _startedAtById: Record<string, number>
-  /** Speeds rclone itself reported, per item. Diagnostics only - see above. */
-  _reportedSpeedById: Record<string, { speed: number; atMs: number }>
+  _fileSamplesById: Record<string, Record<string, Sample[]>>
+  _samplesById: Record<string, Sample[]>
 
   isPaused: (id: string) => boolean
   setPaused: (id: string, paused: boolean) => void
   pauseAll: (ids: string[]) => void
   resumeAll: (ids: string[]) => void
-  /** Records rclone's self-reported rate. Kept for diagnostics only. */
-  recordItemSpeed: (itemId: string, speedBytesPerSec: number | null) => void
   recordFileProgress: (
     itemId: string,
     filePath: string,
     bytesSent: number,
-    totalBytes: number,
-    /** rclone's self-reported rate; recorded but not displayed. */
-    reportedSpeedBytesPerSec?: number | null
+    totalBytes: number
   ) => void
   recordFileList: (itemId: string, files: FileProgressByPath[]) => void
   setItemLinks: (itemId: string, links: ItemDriveLinks) => void
@@ -105,31 +183,10 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
   fileProgressById: {},
   fileOrderById: {},
   fileMetricsById: {},
-  _fileLastSampleById: {},
-  _lastSampleById: {},
-  _startedAtById: {},
-  _reportedSpeedById: {},
+  _fileSamplesById: {},
+  _samplesById: {},
 
   isPaused: id => Boolean(get().pausedById[id]),
-
-  recordItemSpeed: (itemId, speedBytesPerSec) =>
-    set(state => {
-      if (
-        typeof speedBytesPerSec !== 'number' ||
-        !Number.isFinite(speedBytesPerSec)
-      ) {
-        return state
-      }
-      return {
-        _reportedSpeedById: {
-          ...state._reportedSpeedById,
-          [itemId]: {
-            speed: Math.max(0, Math.round(speedBytesPerSec)),
-            atMs: Date.now(),
-          },
-        },
-      }
-    }),
 
   setPaused: (id, paused) =>
     set(state => ({
@@ -164,7 +221,7 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       const existingByItem = state.fileProgressById[itemId]
       const existingOrder = state.fileOrderById[itemId]
       const existingMetrics = state.fileMetricsById[itemId]
-      const existingSamples = state._fileLastSampleById[itemId]
+      const existingSamples = state._fileSamplesById[itemId]
       const resolvedKey =
         existingOrder && existingByItem
           ? resolveFileKey(existingOrder, trimmed)
@@ -184,41 +241,18 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
         : (existingOrder ?? [])
 
       const now = Date.now()
-      // Same rolling window as `tick`: anchor on the first update for this
-      // file so a baseline always exists, then re-anchor once the window has
-      // elapsed. Without an anchor the delta stayed zero and the row read
-      // "0 bps" for the whole transfer.
-      const prevSample = existingSamples?.[resolvedKey] ?? {
-        bytesSent,
-        atMs: now,
-      }
-      const atMs = prevSample.atMs
-      const dtMs = Math.max(250, now - atMs)
-      const delta = Math.max(0, bytesSent - prevSample.bytesSent)
-      const windowElapsed = now - atMs >= SPEED_WINDOW_MS
-      const prevSpeed = existingMetrics?.[resolvedKey]?.speedBytesPerSec ?? 0
+      // Measured from the file's own byte progress, never from rclone's
+      // `speedAvg`: that counts bytes as they enter the upload buffer, so with
+      // large chunks it reports the disk read rate rather than what Drive has
+      // accepted. See `measureRate` for how the rate is derived.
+      const samples = pushSample(existingSamples?.[resolvedKey], bytesSent, now)
       const complete = totalBytes > 0 && bytesSent >= totalBytes
-      // Measured from byte progress rather than rclone's `speedAvg`, which
-      // counts buffered-but-not-yet-uploaded bytes and so reads high. See the
-      // longer note in `tick`.
-      const speed = complete
-        ? 0
-        : delta > 0
-          ? Math.max(0, Math.round((delta * 1000) / dtMs))
-          : windowElapsed
-            ? 0
-            : prevSpeed
-      const remaining = Math.max(
-        0,
-        totalBytes - Math.min(bytesSent, totalBytes)
-      )
-      const etaSeconds = speed > 0 ? Math.round(remaining / speed) : null
+      const speed = complete ? 0 : measureRate(samples, now)
+      const etaSeconds = complete ? 0 : etaFrom(bytesSent, totalBytes, speed)
 
       const nextSamples = {
         ...(existingSamples ?? {}),
-        [resolvedKey]: windowElapsed
-          ? { bytesSent, atMs: now }
-          : { bytesSent: prevSample.bytesSent, atMs },
+        [resolvedKey]: samples,
       }
 
       const nextMetrics = {
@@ -239,8 +273,8 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
           ...state.fileMetricsById,
           [itemId]: nextMetrics,
         },
-        _fileLastSampleById: {
-          ...state._fileLastSampleById,
+        _fileSamplesById: {
+          ...state._fileSamplesById,
           [itemId]: nextSamples,
         },
       }
@@ -278,13 +312,14 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
 
       if (nextOrder.length === 0) return state
 
+      // Metrics start empty and stay that way until the file actually moves.
+      // Samples are deliberately NOT pre-seeded here: a zero recorded when the
+      // listing arrived would put the window's left edge minutes before the
+      // file's first byte, and the rate would read near zero for its whole
+      // transfer.
       const nextMetrics: Record<string, FileMetrics> = {}
-      const nextSamples: Record<string, { bytesSent: number; atMs: number }> =
-        {}
-      const now = Date.now()
       for (const filePath of nextOrder) {
         nextMetrics[filePath] = { speedBytesPerSec: 0, etaSeconds: null }
-        nextSamples[filePath] = { bytesSent: 0, atMs: now }
       }
 
       return {
@@ -303,13 +338,6 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
             ...nextMetrics,
           },
         },
-        _fileLastSampleById: {
-          ...state._fileLastSampleById,
-          [itemId]: {
-            ...(state._fileLastSampleById[itemId] ?? {}),
-            ...nextSamples,
-          },
-        },
       }
     }),
 
@@ -320,10 +348,7 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       const nextById: Record<string, Record<string, FileProgress>> = {}
       const nextOrderById: Record<string, string[]> = {}
       const nextMetricsById: Record<string, Record<string, FileMetrics>> = {}
-      const nextSamplesById: Record<
-        string,
-        Record<string, { bytesSent: number; atMs: number }>
-      > = {}
+      const nextSamplesById: Record<string, Record<string, Sample[]>> = {}
 
       for (const [id, value] of Object.entries(state.fileProgressById)) {
         if (!ids.has(id)) nextById[id] = value
@@ -334,7 +359,7 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       for (const [id, value] of Object.entries(state.fileMetricsById)) {
         if (!ids.has(id)) nextMetricsById[id] = value
       }
-      for (const [id, value] of Object.entries(state._fileLastSampleById)) {
+      for (const [id, value] of Object.entries(state._fileSamplesById)) {
         if (!ids.has(id)) nextSamplesById[id] = value
       }
 
@@ -342,7 +367,7 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
         fileProgressById: nextById,
         fileOrderById: nextOrderById,
         fileMetricsById: nextMetricsById,
-        _fileLastSampleById: nextSamplesById,
+        _fileSamplesById: nextSamplesById,
       }
     }),
 
@@ -355,13 +380,8 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       const nextFileProgress: Record<string, Record<string, FileProgress>> = {}
       const nextFileOrder: Record<string, string[]> = {}
       const nextFileMetrics: Record<string, Record<string, FileMetrics>> = {}
-      const nextFileSamples: Record<
-        string,
-        Record<string, { bytesSent: number; atMs: number }>
-      > = {}
-      const nextLast: Record<string, { bytesSent: number; atMs: number }> = {}
-      const nextStarted: Record<string, number> = {}
-      const nextReported: Record<string, { speed: number; atMs: number }> = {}
+      const nextFileSamples: Record<string, Record<string, Sample[]>> = {}
+      const nextSamples: Record<string, Sample[]> = {}
 
       for (const [id, v] of Object.entries(state.pausedById)) {
         if (remaining.has(id)) nextPaused[id] = v
@@ -381,17 +401,11 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       for (const [id, v] of Object.entries(state.fileMetricsById)) {
         if (remaining.has(id)) nextFileMetrics[id] = v
       }
-      for (const [id, v] of Object.entries(state._fileLastSampleById)) {
+      for (const [id, v] of Object.entries(state._fileSamplesById)) {
         if (remaining.has(id)) nextFileSamples[id] = v
       }
-      for (const [id, v] of Object.entries(state._lastSampleById)) {
-        if (remaining.has(id)) nextLast[id] = v
-      }
-      for (const [id, v] of Object.entries(state._startedAtById)) {
-        if (remaining.has(id)) nextStarted[id] = v
-      }
-      for (const [id, v] of Object.entries(state._reportedSpeedById)) {
-        if (remaining.has(id)) nextReported[id] = v
+      for (const [id, v] of Object.entries(state._samplesById)) {
+        if (remaining.has(id)) nextSamples[id] = v
       }
 
       return {
@@ -401,10 +415,8 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
         fileProgressById: nextFileProgress,
         fileOrderById: nextFileOrder,
         fileMetricsById: nextFileMetrics,
-        _fileLastSampleById: nextFileSamples,
-        _lastSampleById: nextLast,
-        _startedAtById: nextStarted,
-        _reportedSpeedById: nextReported,
+        _fileSamplesById: nextFileSamples,
+        _samplesById: nextSamples,
       }
     }),
 
@@ -412,8 +424,7 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
     set(state => {
       const now = Date.now()
       let metricsById = state.metricsById
-      let lastSampleById = state._lastSampleById
-      let startedAtById = state._startedAtById
+      let samplesById = state._samplesById
 
       for (const item of items) {
         const id = item.id
@@ -431,108 +442,31 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
               status !== 'done' &&
               status !== 'failed'))
 
-        // Establish a stable "started at" time so speed/ETA can be computed even if the first
-        // progress event arrives with bytesSent > 0 (common with larger chunks / slower UIs).
-        if (isActive && startedAtById[id] === undefined) {
-          if (startedAtById === state._startedAtById) {
-            startedAtById = { ...state._startedAtById }
+        // The rate is measured, not smoothed: `pushSample` keeps the instants
+        // the byte counter actually moved and `measureRate` divides across a
+        // whole number of them. Deriving it from rclone's own `speedAvg` is
+        // wrong for a different reason - that counts bytes as they enter the
+        // upload buffer, so with large chunks it reports the disk read rate
+        // rather than what Drive has accepted.
+        let speed = 0
+        if (isActive) {
+          const previous = samplesById[id]
+          const samples = pushSample(previous, sent, now)
+          if (samples !== previous) {
+            if (samplesById === state._samplesById) {
+              samplesById = { ...state._samplesById }
+            }
+            samplesById[id] = samples
           }
-          startedAtById[id] = now
-        } else if (!isActive && startedAtById[id] !== undefined) {
-          // Reset once inactive to avoid stale baselines.
-          if (startedAtById === state._startedAtById) {
-            startedAtById = { ...state._startedAtById }
-          }
-          startedAtById = omitKey(startedAtById, id)
+          speed = measureRate(samples, now)
+        } else {
+          // Drop the history when an item stops, so a resumed transfer
+          // measures its own rate instead of averaging across the pause.
+          samplesById = omitKey(samplesById, id)
         }
-
-        // A rolling window anchored on an earlier (bytes, time) pair.
-        //
-        // The anchor is always established on the first tick an item is
-        // active, so there is never a state where no baseline exists - that
-        // was the bug behind rows stuck at "0 bps": with no stored sample,
-        // `prevSent` defaulted to the current byte count, making the delta
-        // permanently zero, so a rate could never be established at all.
-        //
-        // The anchor is only advanced once it is older than the window, which
-        // keeps the measurement over a meaningful span instead of the gap
-        // between two ticks. rclone emits stats about once a second while the
-        // UI ticks twice a second, so most ticks legitimately see no new bytes.
-        let anchor = lastSampleById[id]
-        if (isActive && anchor === undefined) {
-          if (lastSampleById === state._lastSampleById) {
-            lastSampleById = { ...state._lastSampleById }
-          }
-          anchor = { bytesSent: sent, atMs: now }
-          lastSampleById[id] = anchor
-        }
-
-        const atMs = anchor?.atMs ?? now
-        const dtMs = Math.max(250, now - atMs)
-        const prevSent = anchor?.bytesSent ?? sent
-        const delta = Math.max(0, sent - prevSent)
-
-        // Re-anchor once the window has elapsed, so the next measurement
-        // covers fresh ground rather than an ever-growing average.
-        if (
-          isActive &&
-          anchor !== undefined &&
-          now - anchor.atMs >= SPEED_WINDOW_MS
-        ) {
-          if (lastSampleById === state._lastSampleById) {
-            lastSampleById = { ...state._lastSampleById }
-          }
-          lastSampleById[id] = { bytesSent: sent, atMs: now }
-        }
-
-        const previousSpeed = state.metricsById[id]?.speedBytesPerSec ?? 0
-
-        // Once the window has elapsed, report what actually moved across it -
-        // including zero, which is the truth when a transfer has stalled.
-        // Before that, hold the previous rate rather than flicker to 0 between
-        // rclone's once-a-second updates.
-        //
-        // The removed fallback used `sent / elapsed-since-start`, the average
-        // over the whole transfer. That is not the current rate: once the quick
-        // files in a folder finish and one slow file is left, the average stays
-        // high for as long as the tail takes. It reported 1.2 Gbps (and a 40s
-        // ETA) on a folder whose only active file was moving at 50 Mbps.
-        const windowElapsed = now - atMs >= SPEED_WINDOW_MS
-        const sample =
-          delta > 0 ? (delta * 1000) / dtMs : windowElapsed ? 0 : null
-
-        // Measured from actual byte progress, NOT rclone's `speedAvg`.
-        //
-        // `speedAvg` counts bytes as they enter the upload buffer, so with
-        // large chunks it reports the disk read rate while the chunk is still
-        // being sent to Drive. That reads high and steady while the transfer
-        // is really slower - the same reason rclone can sit at "100%, ETA 0s"
-        // for minutes. Byte deltas over a rolling window cannot outrun what
-        // has genuinely been transferred.
-        //
-        // rclone reports in ~1s bursts, so raw samples swing wildly. Smooth
-        // them exponentially; the displayed rate settles instead of flickering.
-        const speed = !isActive
-          ? 0
-          : sample === null
-            ? previousSpeed
-            : Math.max(
-                0,
-                Math.round(
-                  previousSpeed > 0
-                    ? previousSpeed + SPEED_SMOOTHING * (sample - previousSpeed)
-                    : sample
-                )
-              )
 
         const etaSeconds =
-          isActive && total > 0 && speed > 0
-            ? Math.max(0, Math.round((total - Math.min(sent, total)) / speed))
-            : status === 'done'
-              ? 0
-              : paused
-                ? null
-                : null
+          status === 'done' ? 0 : isActive ? etaFrom(sent, total, speed) : null
 
         const prevMetrics = state.metricsById[id]
         const nextMetrics: TransferMetrics = {
@@ -550,11 +484,7 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
         }
       }
 
-      return {
-        metricsById,
-        _lastSampleById: lastSampleById,
-        _startedAtById: startedAtById,
-      }
+      return { metricsById, _samplesById: samplesById }
     }),
 }))
 
