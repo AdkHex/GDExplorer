@@ -46,11 +46,14 @@ export const defaultPreferences: AppPreferences = {
   closeToTray: false,
   serviceAccountFolderPath: null,
   maxConcurrentUploads: 3,
-  uploadChunkSizeMib: 256,
+  // Must match `AppPreferences::default()` in src-tauri/src/lib.rs. They had
+  // drifted to 256/16/16 here, so a failed preferences load seeded the cache
+  // with values the backend's `migrate_throughput_defaults` immediately undoes.
+  uploadChunkSizeMib: 128,
   rclonePath: 'rclone',
   rcloneRemoteName: 'gdrive',
-  rcloneTransfers: 16,
-  rcloneCheckers: 16,
+  rcloneTransfers: 4,
+  rcloneCheckers: 8,
   rcloneRetries: 3,
   rcloneBandwidthLimit: '',
   rcloneExcludePatterns: [],
