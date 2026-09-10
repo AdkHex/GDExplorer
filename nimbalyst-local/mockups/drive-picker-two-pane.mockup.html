@@ -1,0 +1,603 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Drive destination picker — two pane</title>
+    <style>
+      /* Tokens copied from src/App.css (.dark) so this matches the real app. */
+      :root {
+        --radius: 0.625rem;
+        --background: oklch(0.145 0 0);
+        --foreground: oklch(0.985 0 0);
+        --card: oklch(0.205 0 0);
+        --muted: oklch(0.269 0 0);
+        --muted-foreground: oklch(0.708 0 0);
+        --accent: oklch(0.269 0 0);
+        --border: oklch(1 0 0 / 10%);
+        --input: oklch(1 0 0 / 15%);
+        --primary: oklch(0.922 0 0);
+        --primary-foreground: oklch(0.205 0 0);
+        --secondary: oklch(0.269 0 0);
+        --status-info: #5cb8ff;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 28px;
+        background: #0a0a0a;
+        font-family:
+          -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+        color: var(--foreground);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 26px;
+      }
+
+      .caption {
+        width: 1000px;
+        font-size: 12px;
+        color: var(--muted-foreground);
+      }
+      .caption b {
+        color: var(--foreground);
+        font-weight: 600;
+      }
+
+      /* ---- dialog shell ------------------------------------------------ */
+      .dialog {
+        width: 1000px;
+        height: 640px;
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        box-shadow: 0 24px 60px rgb(0 0 0 / 55%);
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+
+      .head {
+        padding: 20px 22px 14px;
+        position: relative;
+      }
+      .head h2 {
+        margin: 0 0 4px;
+        font-size: 17px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+      .head p {
+        margin: 0;
+        font-size: 13px;
+        line-height: 1.45;
+        color: var(--muted-foreground);
+      }
+      .close {
+        position: absolute;
+        top: 16px;
+        right: 16px;
+        width: 26px;
+        height: 26px;
+        border-radius: 6px;
+        border: 0;
+        background: transparent;
+        color: var(--muted-foreground);
+        font-size: 15px;
+        cursor: pointer;
+        display: grid;
+        place-items: center;
+      }
+
+      /* ---- toolbar: breadcrumb + search -------------------------------- */
+      .toolbar {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 0 22px 12px;
+      }
+      .crumbs {
+        flex: 1;
+        min-width: 0;
+        height: 34px;
+        display: flex;
+        align-items: center;
+        gap: 2px;
+        padding: 0 10px;
+        border: 1px solid var(--input);
+        border-radius: 8px;
+        background: rgb(255 255 255 / 4%);
+        font-size: 13px;
+        overflow: hidden;
+        white-space: nowrap;
+      }
+      .crumbs .seg {
+        padding: 3px 6px;
+        border-radius: 5px;
+        color: var(--muted-foreground);
+        cursor: pointer;
+      }
+      .crumbs .seg:hover {
+        background: var(--accent);
+        color: var(--foreground);
+      }
+      .crumbs .seg.here {
+        color: var(--foreground);
+        font-weight: 500;
+      }
+      .crumbs .sep {
+        color: var(--muted-foreground);
+        opacity: 0.5;
+        font-size: 11px;
+      }
+
+      .search {
+        position: relative;
+        width: 260px;
+        flex: none;
+      }
+      .search input {
+        width: 100%;
+        height: 34px;
+        padding: 0 30px 0 32px;
+        border-radius: 8px;
+        border: 1px solid var(--input);
+        background: rgb(255 255 255 / 4%);
+        color: var(--foreground);
+        font-size: 13px;
+        font-family: inherit;
+        outline: none;
+      }
+      .search input::placeholder {
+        color: var(--muted-foreground);
+      }
+      .search .mag,
+      .search .clr {
+        position: absolute;
+        top: 50%;
+        transform: translateY(-50%);
+        color: var(--muted-foreground);
+        font-size: 13px;
+      }
+      .search .mag {
+        left: 11px;
+      }
+      .search .clr {
+        right: 10px;
+        cursor: pointer;
+      }
+
+      .icon-btn {
+        width: 34px;
+        height: 34px;
+        flex: none;
+        border-radius: 8px;
+        border: 1px solid var(--input);
+        background: rgb(255 255 255 / 4%);
+        color: var(--muted-foreground);
+        display: grid;
+        place-items: center;
+        cursor: pointer;
+      }
+
+      /* ---- two panes ---------------------------------------------------- */
+      .panes {
+        flex: 1;
+        min-height: 0;
+        margin: 0 22px;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: rgb(0 0 0 / 22%);
+        display: grid;
+        grid-template-columns: 300px 1fr;
+        overflow: hidden;
+      }
+
+      .tree {
+        border-right: 1px solid var(--border);
+        overflow: auto;
+        padding: 6px 0;
+      }
+      .list {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+      }
+
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        height: 30px;
+        padding: 0 10px;
+        font-size: 13px;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      .row:hover {
+        background: rgb(255 255 255 / 5%);
+      }
+      .row.sel {
+        background: color-mix(in oklab, var(--status-info) 16%, transparent);
+      }
+      .row .tw {
+        width: 14px;
+        color: var(--muted-foreground);
+        font-size: 9px;
+        flex: none;
+        text-align: center;
+      }
+      .row .ico {
+        width: 15px;
+        flex: none;
+        opacity: 0.85;
+      }
+      .row .nm {
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .d1 {
+        padding-left: 24px;
+      }
+      .d2 {
+        padding-left: 42px;
+      }
+
+      /* list pane header + rows */
+      .lhead,
+      .lrow {
+        display: grid;
+        grid-template-columns: 1fr 96px 132px;
+        align-items: center;
+        gap: 12px;
+        padding: 0 14px;
+      }
+      .lhead {
+        height: 30px;
+        border-bottom: 1px solid var(--border);
+        font-size: 11px;
+        font-weight: 500;
+        color: var(--muted-foreground);
+        background: rgb(255 255 255 / 3%);
+        position: sticky;
+        top: 0;
+      }
+      .lbody {
+        overflow: auto;
+        flex: 1;
+      }
+      .lrow {
+        height: 34px;
+        font-size: 13px;
+        border-bottom: 1px solid rgb(255 255 255 / 4%);
+        cursor: pointer;
+      }
+      .lrow:hover {
+        background: rgb(255 255 255 / 5%);
+      }
+      .lrow.sel {
+        background: color-mix(in oklab, var(--status-info) 16%, transparent);
+      }
+      .lrow .nm {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+      }
+      .lrow .nm span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .lrow .meta {
+        font-size: 12px;
+        color: var(--muted-foreground);
+        font-variant-numeric: tabular-nums;
+      }
+      /* files are shown for context only - not selectable as a destination */
+      .lrow.file,
+      .lrow.file .meta {
+        color: color-mix(in oklab, var(--muted-foreground) 65%, transparent);
+        cursor: default;
+      }
+      .lrow.file:hover {
+        background: transparent;
+      }
+
+      /* ---- footer ------------------------------------------------------- */
+      .foot {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 14px 22px 18px;
+      }
+      .picked {
+        flex: 1;
+        min-width: 0;
+        font-size: 12px;
+        color: var(--muted-foreground);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .picked b {
+        color: var(--foreground);
+        font-weight: 500;
+      }
+      .btn {
+        height: 36px;
+        padding: 0 16px;
+        border-radius: 8px;
+        font-size: 13px;
+        font-weight: 500;
+        font-family: inherit;
+        cursor: pointer;
+        border: 1px solid transparent;
+      }
+      .btn.ghost {
+        background: var(--secondary);
+        color: var(--foreground);
+      }
+      .btn.primary {
+        background: var(--primary);
+        color: var(--primary-foreground);
+      }
+
+      svg {
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="caption">
+      <b>A — browsing.</b> Tree of drives on the left, contents of the selected
+      folder on the right. Files are listed but dimmed: they tell you you are in
+      the right place, and cannot be chosen as a destination.
+    </div>
+
+    <div class="dialog">
+      <div class="head">
+        <h2>Choose a destination folder</h2>
+        <p>
+          Shared drives your service accounts can reach. Pick a folder on either
+          side, or search every drive by name.
+        </p>
+        <button class="close">✕</button>
+      </div>
+
+      <div class="toolbar">
+        <div class="crumbs">
+          <span class="seg">Ionicboy TD</span>
+          <span class="sep">›</span>
+          <span class="seg">Ionic Mux</span>
+          <span class="sep">›</span>
+          <span class="seg here">2026</span>
+        </div>
+        <div class="search">
+          <span class="mag">⌕</span>
+          <input placeholder="Search folders in all drives…" />
+        </div>
+        <button class="icon-btn" title="Reload">⟳</button>
+      </div>
+
+      <div class="panes">
+        <div class="tree">
+          <div class="row">
+            <span class="tw">▸</span>
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="10" rx="2"/><path d="M6 12h.01M10 12h.01"/></svg>
+            <span class="nm">4kHdHub [volx]</span>
+          </div>
+
+          <div class="row">
+            <span class="tw">▾</span>
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="10" rx="2"/><path d="M6 12h.01M10 12h.01"/></svg>
+            <span class="nm">Ionicboy TD</span>
+          </div>
+          <div class="row d1">
+            <span class="tw">▸</span>
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            <span class="nm">Atomic</span>
+          </div>
+          <div class="row d1">
+            <span class="tw">▸</span>
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            <span class="nm">Clone</span>
+          </div>
+          <div class="row d1">
+            <span class="tw">▾</span>
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            <span class="nm">Ionic Mux</span>
+          </div>
+          <div class="row d2 sel">
+            <span class="tw">▸</span>
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            <span class="nm">2026</span>
+          </div>
+          <div class="row d2">
+            <span class="tw">▸</span>
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            <span class="nm">Archive</span>
+          </div>
+          <div class="row d1">
+            <span class="tw">▸</span>
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            <span class="nm">Try</span>
+          </div>
+          <div class="row d1">
+            <span class="tw">▸</span>
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            <span class="nm">Vod's and Others</span>
+          </div>
+          <div class="row d1">
+            <span class="tw">▸</span>
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            <span class="nm">Watch</span>
+          </div>
+        </div>
+
+        <div class="list">
+          <div class="lhead">
+            <div>Name</div>
+            <div>Size</div>
+            <div>Modified</div>
+          </div>
+          <div class="lbody">
+            <div class="lrow">
+              <div class="nm">
+                <svg class="ico" width="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+                <span>Season 01</span>
+              </div>
+              <div class="meta">—</div>
+              <div class="meta">12 Aug 2026</div>
+            </div>
+            <div class="lrow sel">
+              <div class="nm">
+                <svg class="ico" width="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+                <span>Season 02</span>
+              </div>
+              <div class="meta">—</div>
+              <div class="meta">18 Aug 2026</div>
+            </div>
+            <div class="lrow">
+              <div class="nm">
+                <svg class="ico" width="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+                <span>Extras</span>
+              </div>
+              <div class="meta">—</div>
+              <div class="meta">02 Jul 2026</div>
+            </div>
+            <div class="lrow file">
+              <div class="nm">
+                <svg class="ico" width="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>
+                <span>S02E01.1080p.WEB-DL.mkv</span>
+              </div>
+              <div class="meta">2.4 GiB</div>
+              <div class="meta">18 Aug 2026</div>
+            </div>
+            <div class="lrow file">
+              <div class="nm">
+                <svg class="ico" width="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>
+                <span>S02E02.1080p.WEB-DL.mkv</span>
+              </div>
+              <div class="meta">2.6 GiB</div>
+              <div class="meta">18 Aug 2026</div>
+            </div>
+            <div class="lrow file">
+              <div class="nm">
+                <svg class="ico" width="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>
+                <span>poster.jpg</span>
+              </div>
+              <div class="meta">412 KiB</div>
+              <div class="meta">11 Aug 2026</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="foot">
+        <div class="picked">
+          Selected <b>Ionicboy TD / Ionic Mux / 2026 / Season 02</b>
+        </div>
+        <button class="btn ghost">Cancel</button>
+        <button class="btn primary">Use folder</button>
+      </div>
+    </div>
+
+    <div class="caption">
+      <b>B — searching.</b> Typing replaces the right pane with matches from
+      every drive; the tree stays put so you keep your bearings. Each hit shows
+      the drive it came from, and clicking one selects it.
+    </div>
+
+    <div class="dialog" style="height: 520px">
+      <div class="head">
+        <h2>Choose a destination folder</h2>
+        <p>
+          Shared drives your service accounts can reach. Pick a folder on either
+          side, or search every drive by name.
+        </p>
+        <button class="close">✕</button>
+      </div>
+
+      <div class="toolbar">
+        <div class="crumbs">
+          <span class="seg">Ionicboy TD</span>
+          <span class="sep">›</span>
+          <span class="seg here">Ionic Mux</span>
+        </div>
+        <div class="search">
+          <span class="mag">⌕</span>
+          <input value="mux" />
+          <span class="clr">✕</span>
+        </div>
+        <button class="icon-btn" title="Reload">⟳</button>
+      </div>
+
+      <div class="panes">
+        <div class="tree">
+          <div class="row">
+            <span class="tw">▸</span>
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="10" rx="2"/><path d="M6 12h.01M10 12h.01"/></svg>
+            <span class="nm">4kHdHub [volx]</span>
+          </div>
+          <div class="row">
+            <span class="tw">▾</span>
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="10" rx="2"/><path d="M6 12h.01M10 12h.01"/></svg>
+            <span class="nm">Ionicboy TD</span>
+          </div>
+          <div class="row d1 sel">
+            <span class="tw">▸</span>
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            <span class="nm">Ionic Mux</span>
+          </div>
+        </div>
+
+        <div class="list">
+          <div class="lhead" style="grid-template-columns: 1fr 220px">
+            <div>4 matches for “mux”</div>
+            <div>In drive</div>
+          </div>
+          <div class="lbody">
+            <div class="lrow" style="grid-template-columns: 1fr 220px">
+              <div class="nm">
+                <svg class="ico" width="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+                <span>Mux</span>
+              </div>
+              <div class="meta">4kHdHub [volx]</div>
+            </div>
+            <div class="lrow" style="grid-template-columns: 1fr 220px">
+              <div class="nm">
+                <svg class="ico" width="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+                <span>Muxes</span>
+              </div>
+              <div class="meta">4kHdHub [volx]</div>
+            </div>
+            <div class="lrow sel" style="grid-template-columns: 1fr 220px">
+              <div class="nm">
+                <svg class="ico" width="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+                <span>Ionic Mux</span>
+              </div>
+              <div class="meta">Ionicboy TD</div>
+            </div>
+            <div class="lrow" style="grid-template-columns: 1fr 220px">
+              <div class="nm">
+                <svg class="ico" width="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+                <span>Super Mario Galazy Movie (2026) Muxed</span>
+              </div>
+              <div class="meta">Ionicboy TD</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="foot">
+        <div class="picked">Selected <b>Ionic Mux</b> — Ionicboy TD</div>
+        <button class="btn ghost">Cancel</button>
+        <button class="btn primary">Use folder</button>
+      </div>
+    </div>
+  </body>
+</html>

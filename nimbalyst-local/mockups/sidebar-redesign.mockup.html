@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Sidebar redesign — matched to the two-pane picker</title>
+    <style>
+      /* Same tokens and idioms as drive-picker-two-pane.mockup.html */
+      :root {
+        --radius: 0.625rem;
+        --background: oklch(0.145 0 0);
+        --foreground: oklch(0.985 0 0);
+        --card: oklch(0.205 0 0);
+        --muted: oklch(0.269 0 0);
+        --muted-foreground: oklch(0.708 0 0);
+        --accent: oklch(0.269 0 0);
+        --border: oklch(1 0 0 / 10%);
+        --input: oklch(1 0 0 / 15%);
+        --primary: oklch(0.922 0 0);
+        --primary-foreground: oklch(0.205 0 0);
+        --secondary: oklch(0.269 0 0);
+        --status-info: #5cb8ff;
+        --status-success: #4ad968;
+        --status-danger: #ff6165;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 28px;
+        background: #0a0a0a;
+        font-family:
+          -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+        color: var(--foreground);
+        display: flex;
+        align-items: flex-start;
+        gap: 26px;
+      }
+      svg {
+        display: block;
+      }
+      .col {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .caption {
+        font-size: 12px;
+        color: var(--muted-foreground);
+        max-width: 260px;
+        line-height: 1.5;
+      }
+      .caption b {
+        color: var(--foreground);
+        font-weight: 600;
+      }
+      .tag {
+        display: inline-block;
+        font-size: 10px;
+        padding: 2px 6px;
+        border-radius: 999px;
+        margin-left: 6px;
+      }
+      .tag.rec {
+        background: color-mix(in oklab, var(--status-info) 18%, transparent);
+        color: var(--status-info);
+      }
+      .tag.old {
+        background: color-mix(in oklab, var(--status-danger) 16%, transparent);
+        color: var(--status-danger);
+      }
+
+      /* ---- sidebar shell, same surface as the app ---------------------- */
+      .sidebar {
+        width: 240px;
+        height: 500px;
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 18px;
+        overflow: hidden;
+      }
+      .block {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      /* the picker's 11px muted column-header voice */
+      .lbl {
+        font-size: 11px;
+        font-weight: 500;
+        color: var(--muted-foreground);
+      }
+      .rowbetween {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      .sep {
+        height: 1px;
+        background: var(--border);
+      }
+      .trunc {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .grow {
+        flex: 1;
+        min-width: 0;
+      }
+      .num {
+        font-variant-numeric: tabular-nums;
+      }
+
+      /* ---- destination card: the picker's breadcrumb, stacked ---------- */
+      .dest {
+        border: 1px solid var(--input);
+        border-radius: 8px;
+        background: rgb(255 255 255 / 4%);
+        padding: 7px 9px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        cursor: pointer;
+      }
+      .dest:hover {
+        background: rgb(255 255 255 / 6%);
+      }
+      .dest .crumb {
+        font-size: 11px;
+        color: var(--muted-foreground);
+        display: flex;
+        align-items: center;
+        gap: 3px;
+      }
+      .dest .crumb .sep {
+        opacity: 0.5;
+        height: auto;
+        background: none;
+      }
+      .dest .name {
+        font-size: 13px;
+        font-weight: 500;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .dest.empty {
+        border-style: dashed;
+      }
+      .dest.bad {
+        border-color: var(--status-danger);
+      }
+      .chev {
+        color: var(--muted-foreground);
+        flex: none;
+      }
+
+      /* ---- progress, same slim bar as the app -------------------------- */
+      .track {
+        height: 6px;
+        border-radius: 999px;
+        background: color-mix(in oklab, var(--status-info) 15%, transparent);
+        overflow: hidden;
+      }
+      .fill {
+        height: 100%;
+        border-radius: 999px;
+        background: var(--status-info);
+      }
+      .prow {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .pct {
+        font-size: 11px;
+        color: var(--muted-foreground);
+        width: 32px;
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+      }
+      .stat {
+        font-size: 12px;
+        font-variant-numeric: tabular-nums;
+      }
+      .stat.dim {
+        color: var(--muted-foreground);
+      }
+
+      /* ---- menu, styled like the picker's list rows -------------------- */
+      .menu {
+        width: 240px;
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 4px;
+        box-shadow: 0 18px 40px rgb(0 0 0 / 50%);
+      }
+      .mrow {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        height: 30px;
+        padding: 0 8px;
+        border-radius: 5px;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      .mrow:hover {
+        background: rgb(255 255 255 / 5%);
+      }
+      .mrow.sel {
+        background: color-mix(in oklab, var(--status-info) 16%, transparent);
+      }
+      .mrow .ico {
+        width: 15px;
+        flex: none;
+        opacity: 0.85;
+        color: var(--muted-foreground);
+      }
+      .msep {
+        height: 1px;
+        background: var(--border);
+        margin: 4px 0;
+      }
+
+      .note {
+        font-size: 11px;
+        padding-left: 2px;
+      }
+      .note.bad {
+        color: var(--status-danger);
+      }
+      .note.good {
+        color: var(--status-success);
+      }
+      .stack {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- ================= BEFORE ================= -->
+    <div class="col">
+      <div class="caption"><b>Before</b><span class="tag old">current</span></div>
+      <div class="sidebar">
+        <div class="block">
+          <div style="display: flex; align-items: center; gap: 8px">
+            <svg width="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--muted-foreground)"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            <div style="font-size: 14px; font-weight: 600">Destination</div>
+          </div>
+          <div style="height: 32px; border: 1px solid var(--input); border-radius: 8px; background: rgb(255 255 255 / 4%); display: flex; align-items: center; padding: 0 10px; gap: 8px; font-size: 13px">
+            <span class="grow">Custom…</span>
+            <svg class="chev" width="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+          </div>
+          <div style="height: 32px; border: 1px solid var(--status-success); border-radius: 8px; background: rgb(255 255 255 / 4%); display: flex; align-items: center; padding: 0 10px; gap: 8px; font-size: 13px">
+            <span class="grow trunc">https://drive.google.com/…</span>
+            <svg width="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--muted-foreground)"><path d="M18 6L6 18M6 6l12 12"/></svg>
+          </div>
+          <div style="height: 32px; border: 1px solid var(--input); border-radius: 8px; background: rgb(255 255 255 / 4%); display: flex; align-items: center; justify-content: center; gap: 6px; font-size: 13px; font-weight: 500">
+            <svg width="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            Browse Drive…
+          </div>
+          <div style="display: flex; align-items: center; gap: 6px">
+            <svg width="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--status-success)"><circle cx="12" cy="12" r="10"/><path d="M9 12l2 2 4-4"/></svg>
+            <span class="grow trunc" style="font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: var(--muted-foreground)">1NGv8RZ5pA94A8lses0JEuWy…</span>
+            <svg width="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--muted-foreground)"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6M15 3h6v6M10 14L21 3"/></svg>
+          </div>
+        </div>
+        <div class="sep"></div>
+        <div class="block">
+          <div class="rowbetween">
+            <div style="font-size: 14px; font-weight: 600">Queue</div>
+            <div class="stat dim">1 item</div>
+          </div>
+          <div class="prow">
+            <div class="track grow"><div class="fill" style="width: 45%"></div></div>
+            <div class="pct">45%</div>
+          </div>
+          <div class="stat dim" style="line-height: 1.45">
+            28 GiB of 62 GiB · 227 MiB/s · 2m 33s<br />left
+          </div>
+        </div>
+      </div>
+      <div class="note bad">4 boxes · raw ID · “left” wraps alone</div>
+    </div>
+
+    <!-- ================= AFTER ================= -->
+    <div class="col">
+      <div class="caption">
+        <b>After</b><span class="tag rec">matches the picker</span>
+      </div>
+      <div class="sidebar">
+        <div class="block">
+          <div class="lbl">Destination</div>
+          <!-- the picker's breadcrumb, stacked to fit 240px -->
+          <div class="dest">
+            <div class="grow">
+              <div class="crumb trunc">
+                <span>Ionicboy TD</span><span class="sep">›</span><span>Ionic Mux</span>
+              </div>
+              <div class="name trunc">
+                <svg width="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--status-success); flex: none"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+                <span class="trunc">2026</span>
+              </div>
+            </div>
+            <svg class="chev" width="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+          </div>
+        </div>
+
+        <div class="sep"></div>
+
+        <div class="block">
+          <div class="rowbetween">
+            <div class="lbl">Queue</div>
+            <div class="stat dim num">1 item</div>
+          </div>
+          <div class="prow">
+            <div class="track grow"><div class="fill" style="width: 45%"></div></div>
+            <div class="pct">45%</div>
+          </div>
+          <div class="stat">28 GiB / 62 GiB</div>
+          <div class="stat dim">227 MiB/s · 2m 33s left</div>
+        </div>
+      </div>
+      <div class="note good">1 box · drive › folder path · never wraps</div>
+    </div>
+
+    <!-- ================= MENU + STATES ================= -->
+    <div class="col">
+      <div class="caption"><b>What the card opens</b></div>
+      <div class="menu">
+        <div class="mrow sel">
+          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+          <span class="grow trunc">2026</span>
+          <svg width="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg>
+        </div>
+        <div class="mrow">
+          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+          <span class="grow trunc">Muxes</span>
+        </div>
+        <div class="mrow">
+          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+          <span class="grow trunc">VOD</span>
+        </div>
+        <div class="msep"></div>
+        <div class="mrow">
+          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="10" rx="2"/><path d="M6 12h.01M10 12h.01"/></svg>
+          <span class="grow">Browse Drive…</span>
+        </div>
+        <div class="mrow">
+          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 007.5.5l3-3a5 5 0 00-7-7l-1.5 1.5"/><path d="M14 11a5 5 0 00-7.5-.5l-3 3a5 5 0 007 7L12 19"/></svg>
+          <span class="grow">Paste link…</span>
+        </div>
+        <div class="msep"></div>
+        <div class="mrow">
+          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6M15 3h6v6M10 14L21 3"/></svg>
+          <span class="grow">Open in Drive</span>
+        </div>
+      </div>
+
+      <div class="caption" style="margin-top: 8px"><b>Other states</b></div>
+      <div class="stack" style="width: 240px">
+        <div>
+          <div class="lbl" style="margin-bottom: 6px">Nothing chosen</div>
+          <div class="dest empty">
+            <div class="grow">
+              <div class="name" style="color: var(--muted-foreground)">
+                <svg width="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex: none"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+                <span>Choose a folder</span>
+              </div>
+            </div>
+            <svg class="chev" width="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+          </div>
+        </div>
+
+        <div>
+          <div class="lbl" style="margin-bottom: 6px">Bad link pasted</div>
+          <div class="dest bad">
+            <div class="grow">
+              <div class="crumb" style="color: var(--status-danger)">Not a Drive folder</div>
+              <div class="name trunc" style="color: var(--muted-foreground)">
+                <span class="trunc">Pick or paste again</span>
+              </div>
+            </div>
+            <svg class="chev" width="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+          </div>
+        </div>
+
+        <div>
+          <div class="lbl" style="margin-bottom: 6px">Pasted link, path unknown</div>
+          <div class="dest">
+            <div class="grow">
+              <div class="crumb trunc">Pasted link</div>
+              <div class="name trunc">
+                <svg width="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--status-success); flex: none"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+                <span class="trunc" style="font-family: ui-monospace, Menlo, monospace; font-size: 11px">1NGv8RZ5pA94A8…</span>
+              </div>
+            </div>
+            <svg class="chev" width="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+          </div>
+        </div>
+
+        <div>
+          <div class="lbl" style="margin-bottom: 6px">Queue idle</div>
+          <div class="stat dim">Nothing queued</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ================= CONTINUITY ================= -->
+    <div class="col">
+      <div class="caption">
+        <b>Why it matches.</b> The card is the picker's breadcrumb and footer,
+        folded into 240px. Same 8px radii, same
+        <span style="font-family: ui-monospace, Menlo, monospace">rgb(255 255 255 / 4%)</span>
+        surface, same 11px muted labels, same
+        <span style="color: var(--status-info)">status-info</span> selection tint.
+      </div>
+      <div
+        style="
+          width: 380px;
+          background: var(--card);
+          border: 1px solid var(--border);
+          border-radius: 10px;
+          overflow: hidden;
+        "
+      >
+        <div style="padding: 12px 14px 10px">
+          <div style="font-size: 13px; font-weight: 600; margin-bottom: 8px">
+            The picker it opens (existing)
+          </div>
+          <div
+            style="
+              height: 34px;
+              display: flex;
+              align-items: center;
+              gap: 2px;
+              padding: 0 10px;
+              border: 1px solid var(--input);
+              border-radius: 8px;
+              background: rgb(255 255 255 / 4%);
+              font-size: 13px;
+            "
+          >
+            <span style="padding: 3px 6px; color: var(--muted-foreground)">Ionicboy TD</span>
+            <span style="color: var(--muted-foreground); opacity: 0.5; font-size: 11px">›</span>
+            <span style="padding: 3px 6px; color: var(--muted-foreground)">Ionic Mux</span>
+            <span style="color: var(--muted-foreground); opacity: 0.5; font-size: 11px">›</span>
+            <span style="padding: 3px 6px; font-weight: 500">2026</span>
+          </div>
+        </div>
+        <div
+          style="
+            margin: 0 14px 12px;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            background: rgb(0 0 0 / 22%);
+            overflow: hidden;
+          "
+        >
+          <div
+            style="
+              height: 30px;
+              display: flex;
+              align-items: center;
+              padding: 0 14px;
+              font-size: 11px;
+              font-weight: 500;
+              color: var(--muted-foreground);
+              background: rgb(255 255 255 / 3%);
+              border-bottom: 1px solid var(--border);
+            "
+          >
+            Name
+          </div>
+          <div class="mrow" style="height: 34px; border-radius: 0; margin: 0">
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            <span>Season 01</span>
+          </div>
+          <div class="mrow sel" style="height: 34px; border-radius: 0; margin: 0">
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            <span>Season 02</span>
+          </div>
+        </div>
+        <div style="display: flex; gap: 10px; padding: 0 14px 14px; align-items: center">
+          <div style="flex: 1; min-width: 0; font-size: 12px; color: var(--muted-foreground)" class="trunc">
+            Selected <b style="color: var(--foreground); font-weight: 500">Ionicboy TD / Ionic Mux / 2026</b>
+          </div>
+          <div style="height: 32px; padding: 0 14px; border-radius: 8px; background: var(--primary); color: var(--primary-foreground); font-size: 13px; font-weight: 500; display: grid; place-items: center">
+            Use folder
+          </div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
