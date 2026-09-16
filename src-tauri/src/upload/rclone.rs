@@ -101,6 +101,7 @@ pub async fn run_rclone_job(
         let sa_pool = sa_pool.clone();
         let sa_tick = sa_tick.clone();
         let tallies = tallies.clone();
+        let fanout = concurrency;
 
         worker_handles.push(tokio::spawn(async move {
             loop {
@@ -113,8 +114,10 @@ pub async fn run_rclone_job(
                 };
                 let Some(item) = item else { break };
 
-                let result =
-                    run_rclone_for_item(&app, &control, &prefs, &sa_pool, &sa_tick, &item).await;
+                let result = run_rclone_for_item(
+                    &app, &control, &prefs, &sa_pool, &sa_tick, &item, fanout,
+                )
+                .await;
 
                 match result {
                     Ok(()) => {
@@ -194,15 +197,34 @@ async fn run_rclone_for_item(
     sa_pool: &Arc<Mutex<Vec<ServiceAccountFile>>>,
     sa_tick: &Arc<AtomicU64>,
     item: &QueueItemInput,
+    max_fanout: usize,
 ) -> Result<(), String> {
-    if let Some(file_list) = collect_file_list(item) {
+    let files = collect_file_list(item);
+    if let Some(file_list) = &files {
         let _ = app.emit(
             "upload:file_list",
             FileListEvent {
                 item_id: item.id.clone(),
-                files: file_list,
+                files: file_list.clone(),
             },
         );
+    }
+
+    // A folder with several files fans its files out across service accounts,
+    // so a single folder is no longer capped at one account's throughput. A
+    // file item (or an empty folder) keeps the single-process path.
+    if item.kind == "folder" && files.as_ref().is_some_and(|list| list.len() > 1) {
+        return run_folder_fanout(
+            app,
+            control,
+            prefs,
+            sa_pool,
+            sa_tick,
+            item,
+            files.as_ref().expect("folder files were just collected"),
+            max_fanout,
+        )
+        .await;
     }
 
     // On Windows a pause stops the child process, so the item has to be run
@@ -237,7 +259,303 @@ async fn run_rclone_for_item(
 
         let (sa_path, sa_email) = select_service_account(sa_pool, sa_tick).await?;
 
-        match run_rclone_command(app, control, prefs, &sa_path, sa_email, item).await {
+        match run_rclone_command(
+            app,
+            control,
+            prefs,
+            &sa_path,
+            sa_email,
+            item,
+            &ItemProgress::Direct,
+            None,
+        )
+        .await
+        {
+            Err(err) if err == PAUSE_RESTART => continue,
+            other => return other,
+        }
+    }
+}
+
+/// How one rclone process reports the item-level progress it produces.
+enum ItemProgress {
+    /// This process owns the item and emits its status and progress directly.
+    Direct,
+    /// Part of a folder fan-out: forward progress to the aggregator so the
+    /// folder's total is the sum of every group, and let the coordinator emit
+    /// status and completion.
+    Fanout {
+        aggregator: Arc<FolderAggregator>,
+        part: usize,
+    },
+}
+
+impl ItemProgress {
+    async fn report(
+        &self,
+        app: &AppHandle,
+        item: &QueueItemInput,
+        bytes: u64,
+        total: u64,
+        speed: Option<u64>,
+    ) {
+        match self {
+            ItemProgress::Direct => emit_progress(app, item, bytes, total, speed).await,
+            ItemProgress::Fanout { aggregator, part } => {
+                aggregator.update(*part, bytes, total, speed).await;
+            }
+        }
+    }
+}
+
+/// One group's last reported progress: (bytes sent, total bytes, speed).
+type PartProgress = (u64, u64, Option<u64>);
+
+/// Sums the progress of a folder's fan-out groups into one item-level reading.
+struct FolderAggregator {
+    app: AppHandle,
+    item: QueueItemInput,
+    /// group index -> latest progress for that group.
+    parts: Mutex<HashMap<usize, PartProgress>>,
+}
+
+impl FolderAggregator {
+    fn new(app: AppHandle, item: QueueItemInput) -> Self {
+        Self {
+            app,
+            item,
+            parts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn update(&self, part: usize, bytes: u64, total: u64, speed: Option<u64>) {
+        let (bytes, total, speed) = {
+            let mut parts = self.parts.lock().await;
+            parts.insert(part, (bytes, total, speed));
+            parts
+                .values()
+                .fold((0_u64, 0_u64, 0_u64), |(b, t, s), (pb, pt, ps)| {
+                    (b + pb, t + pt, s + ps.unwrap_or(0))
+                })
+        };
+        emit_progress(&self.app, &self.item, bytes, total, Some(speed)).await;
+    }
+}
+
+struct GroupedFile {
+    relative: String,
+    size: u64,
+}
+
+/// Splits a folder's files into up to `max_groups` balanced groups, each a list
+/// of paths relative to the folder root for rclone's `--files-from-raw`.
+///
+/// Sizes are balanced by sorting largest-first and dealing round-robin, so one
+/// big file cannot leave a group idle while another still has work.
+fn partition_files(
+    root: &Path,
+    files: &[FileListEntry],
+    max_groups: usize,
+) -> Result<Vec<Vec<String>>, String> {
+    let mut entries: Vec<GroupedFile> = files
+        .iter()
+        .map(|file| {
+            let relative = Path::new(&file.file_path).strip_prefix(root).map_err(|_| {
+                format!(
+                    "File {} is not inside the folder {}",
+                    file.file_path,
+                    root.display()
+                )
+            })?;
+            Ok(GroupedFile {
+                relative: relative.to_string_lossy().replace('\\', "/"),
+                size: file.total_bytes,
+            })
+        })
+        .collect::<Result<_, String>>()?;
+
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.size));
+
+    let group_count = max_groups.min(entries.len()).max(1);
+    let mut groups: Vec<Vec<String>> = (0..group_count).map(|_| Vec::new()).collect();
+    for (index, entry) in entries.into_iter().enumerate() {
+        groups[index % group_count].push(entry.relative);
+    }
+    groups.retain(|group| !group.is_empty());
+    Ok(groups)
+}
+
+/// Writes a NUL-separated file list for rclone's `--files-from-raw`, which
+/// reads paths verbatim so names with leading/trailing spaces or a leading `#`
+/// survive. Returns the temp file's path for the caller to clean up.
+fn write_files_from(paths: &[String]) -> Result<PathBuf, String> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let path = std::env::temp_dir().join(format!(
+        "gdexplorer-files-from-{}-{}.txt",
+        std::process::id(),
+        stamp
+    ));
+    let mut contents = Vec::new();
+    for entry in paths {
+        contents.extend_from_slice(entry.as_bytes());
+        contents.push(0);
+    }
+    std::fs::write(&path, contents)
+        .map_err(|e| format!("Failed to write rclone file list: {e}"))?;
+    Ok(path)
+}
+
+/// Runs a folder item's files across several service accounts at once.
+///
+/// Each group is its own rclone process with its own service account, so the
+/// folder is no longer limited to a single account's throughput. Progress is
+/// summed across groups and reported once; the item is marked done only after
+/// every group finishes.
+#[allow(clippy::too_many_arguments)]
+async fn run_folder_fanout(
+    app: &AppHandle,
+    control: &UploadControlHandle,
+    prefs: &RclonePreferences,
+    sa_pool: &Arc<Mutex<Vec<ServiceAccountFile>>>,
+    sa_tick: &Arc<AtomicU64>,
+    item: &QueueItemInput,
+    files: &[FileListEntry],
+    max_fanout: usize,
+) -> Result<(), String> {
+    let groups = partition_files(Path::new(&item.path), files, max_fanout)?;
+    let group_count = groups.len();
+
+    let should_pause =
+        *control.pause_rx.borrow() || control.paused_items_rx.borrow().contains(&item.id);
+    let _ = app.emit(
+        "upload:item_status",
+        ItemStatusEvent {
+            item_id: item.id.clone(),
+            path: item.path.clone(),
+            kind: item.kind.clone(),
+            status: if should_pause {
+                "paused".to_string()
+            } else {
+                "uploading".to_string()
+            },
+            message: None,
+            sa_email: None,
+        },
+    );
+
+    let aggregator = Arc::new(FolderAggregator::new(app.clone(), item.clone()));
+
+    let mut tasks = Vec::with_capacity(group_count);
+    for (part, group) in groups.into_iter().enumerate() {
+        let files_from = write_files_from(&group)?;
+        let app = app.clone();
+        let control = control.clone();
+        let prefs = prefs.clone();
+        let sa_pool = sa_pool.clone();
+        let sa_tick = sa_tick.clone();
+        let item = item.clone();
+        let aggregator = aggregator.clone();
+
+        tasks.push(tokio::spawn(async move {
+            let result = run_rclone_group(
+                &app,
+                &control,
+                &prefs,
+                &sa_pool,
+                &sa_tick,
+                &item,
+                part,
+                &files_from,
+                &aggregator,
+            )
+            .await;
+            let _ = std::fs::remove_file(&files_from);
+            result
+        }));
+    }
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut canceled = false;
+    for task in tasks {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                if err == CANCELED || control.is_canceled() {
+                    canceled = true;
+                } else if !failures.contains(&err) {
+                    failures.push(err);
+                }
+            }
+            Err(join) => failures.push(format!("folder worker stopped: {join}")),
+        }
+    }
+
+    if canceled || control.is_canceled() {
+        return Err(CANCELED.to_string());
+    }
+    if !failures.is_empty() {
+        let mut detail = failures.join("; ");
+        if detail.chars().count() > MAX_ERROR_DETAIL {
+            detail = detail.chars().take(MAX_ERROR_DETAIL).collect::<String>() + "…";
+        }
+        return Err(detail);
+    }
+
+    log::info!(
+        target: "rclone",
+        "upload.done id={} status=ok groups={group_count}",
+        item.id
+    );
+    let _ = app.emit(
+        "upload:item_status",
+        ItemStatusEvent {
+            item_id: item.id.clone(),
+            path: item.path.clone(),
+            kind: item.kind.clone(),
+            status: "done".to_string(),
+            message: None,
+            sa_email: None,
+        },
+    );
+    Ok(())
+}
+
+/// Runs one fan-out group to completion, retrying after a Windows pause the
+/// same way the single-process path does.
+#[allow(clippy::too_many_arguments)]
+async fn run_rclone_group(
+    app: &AppHandle,
+    control: &UploadControlHandle,
+    prefs: &RclonePreferences,
+    sa_pool: &Arc<Mutex<Vec<ServiceAccountFile>>>,
+    sa_tick: &Arc<AtomicU64>,
+    item: &QueueItemInput,
+    part: usize,
+    files_from: &Path,
+    aggregator: &Arc<FolderAggregator>,
+) -> Result<(), String> {
+    loop {
+        wait_if_paused(control, &item.id).await?;
+        let (sa_path, sa_email) = select_service_account(sa_pool, sa_tick).await?;
+        let progress = ItemProgress::Fanout {
+            aggregator: aggregator.clone(),
+            part,
+        };
+        match run_rclone_command(
+            app,
+            control,
+            prefs,
+            &sa_path,
+            sa_email,
+            item,
+            &progress,
+            Some(files_from),
+        )
+        .await
+        {
             Err(err) if err == PAUSE_RESTART => continue,
             other => return other,
         }
@@ -252,6 +570,8 @@ async fn run_rclone_command(
     sa_path: &Path,
     sa_email: Option<String>,
     item: &QueueItemInput,
+    progress: &ItemProgress,
+    files_from: Option<&Path>,
 ) -> Result<(), String> {
     if control.is_canceled() {
         return Err(CANCELED.to_string());
@@ -263,19 +583,25 @@ async fn run_rclone_command(
         item.id,
         sa_path.to_string_lossy()
     );
-    let _ = app.emit(
-        "upload:item_status",
-        ItemStatusEvent {
-            item_id: item.id.clone(),
-            path: item.path.clone(),
-            kind: item.kind.clone(),
-            status: "uploading".to_string(),
-            message: None,
-            sa_email: sa_email.clone(),
-        },
-    );
+    if let ItemProgress::Direct = progress {
+        let _ = app.emit(
+            "upload:item_status",
+            ItemStatusEvent {
+                item_id: item.id.clone(),
+                path: item.path.clone(),
+                kind: item.kind.clone(),
+                status: "uploading".to_string(),
+                message: None,
+                sa_email: sa_email.clone(),
+            },
+        );
+    }
 
-    let args = build_rclone_args(prefs, item, sa_path);
+    let mut args = build_rclone_args(prefs, item, sa_path);
+    if let Some(files_from) = files_from {
+        args.push("--files-from-raw".to_string());
+        args.push(files_from.to_string_lossy().to_string());
+    }
 
     let mut command = build_rclone_command(&prefs.rclone_path, &args);
 
@@ -376,7 +702,7 @@ async fn run_rclone_command(
                         last_bytes = bytes;
                         last_total = total;
                         last_speed = speed;
-                        emit_progress(app, item, bytes, total, speed).await;
+                        progress.report(app, item, bytes, total, speed).await;
                     }
                 }
             }
@@ -443,17 +769,19 @@ async fn run_rclone_command(
             "upload.done id={} status=ok",
             item.id
         );
-        let _ = app.emit(
-            "upload:item_status",
-            ItemStatusEvent {
-                item_id: item.id.clone(),
-                path: item.path.clone(),
-                kind: item.kind.clone(),
-                status: "done".to_string(),
-                message: None,
-                sa_email,
-            },
-        );
+        if let ItemProgress::Direct = progress {
+            let _ = app.emit(
+                "upload:item_status",
+                ItemStatusEvent {
+                    item_id: item.id.clone(),
+                    path: item.path.clone(),
+                    kind: item.kind.clone(),
+                    status: "done".to_string(),
+                    message: None,
+                    sa_email,
+                },
+            );
+        }
         return Ok(());
     }
 
@@ -1763,5 +2091,64 @@ mod tests {
         let line = r#"{"stats":{"bytes":10000,"totalBytes":10000}}"#;
         let (_, _, speed) = parse_json_progress(line, "/movies/x", "folder").unwrap();
         assert_eq!(speed, Some(0));
+    }
+
+    #[test]
+    fn partition_files_splits_into_relative_forward_slash_paths() {
+        let files = vec![
+            FileListEntry {
+                file_path: "/root/a.mkv".to_string(),
+                total_bytes: 100,
+            },
+            FileListEntry {
+                file_path: "/root/b.mkv".to_string(),
+                total_bytes: 200,
+            },
+            FileListEntry {
+                file_path: "/root/sub/c.mkv".to_string(),
+                total_bytes: 300,
+            },
+        ];
+        // Sorted largest-first (c=300, b=200, a=100) then dealt round-robin.
+        let groups = partition_files(Path::new("/root"), &files, 2).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[0],
+            vec!["sub/c.mkv".to_string(), "a.mkv".to_string()]
+        );
+        assert_eq!(groups[1], vec!["b.mkv".to_string()]);
+    }
+
+    #[test]
+    fn partition_files_caps_the_number_of_groups() {
+        let files = vec![
+            FileListEntry {
+                file_path: "/root/a.mkv".to_string(),
+                total_bytes: 1,
+            },
+            FileListEntry {
+                file_path: "/root/b.mkv".to_string(),
+                total_bytes: 1,
+            },
+        ];
+        let groups = partition_files(Path::new("/root"), &files, 10).unwrap();
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn partition_files_rejects_a_file_outside_the_root() {
+        let files = vec![FileListEntry {
+            file_path: "/elsewhere/a.mkv".to_string(),
+            total_bytes: 1,
+        }];
+        assert!(partition_files(Path::new("/root"), &files, 2).is_err());
+    }
+
+    #[test]
+    fn files_from_writes_nul_separated_paths() {
+        let path = write_files_from(&["a.mkv".to_string(), "b.mkv".to_string()]).unwrap();
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(contents, b"a.mkv\0b.mkv\0");
+        std::fs::remove_file(&path).unwrap();
     }
 }
