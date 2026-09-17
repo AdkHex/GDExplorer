@@ -8,7 +8,7 @@ use crate::upload::scheduler::{
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -212,19 +212,12 @@ async fn run_rclone_for_item(
 
     // A folder with several files fans its files out across service accounts,
     // so a single folder is no longer capped at one account's throughput. A
-    // file item (or an empty folder) keeps the single-process path.
-    if item.kind == "folder" && files.as_ref().is_some_and(|list| list.len() > 1) {
-        return run_folder_fanout(
-            app,
-            control,
-            prefs,
-            sa_pool,
-            sa_tick,
-            item,
-            files.as_ref().expect("folder files were just collected"),
-            max_fanout,
-        )
-        .await;
+    // file item, an empty folder, or a folder the fan-out cannot express (see
+    // `plan_folder_fanout`) keeps the single-process path.
+    if item.kind == "folder" {
+        if let Some(groups) = plan_folder_fanout(prefs, item, files.as_deref(), max_fanout).await {
+            return run_folder_fanout(app, control, prefs, sa_pool, sa_tick, item, groups).await;
+        }
     }
 
     // On Windows a pause stops the child process, so the item has to be run
@@ -347,6 +340,29 @@ struct GroupedFile {
     size: u64,
 }
 
+/// A file's path relative to the folder root, in the forward-slash form rclone
+/// uses on every platform.
+///
+/// `--files-from-raw` is one path per line, so a name with a line break in it
+/// would be read as two paths that match nothing; such a folder is refused
+/// here and goes through a single process instead.
+fn relative_path(root: &Path, file_path: &str) -> Result<String, String> {
+    let relative = Path::new(file_path)
+        .strip_prefix(root)
+        .map_err(|_| {
+            format!(
+                "File {file_path} is not inside the folder {}",
+                root.display()
+            )
+        })?
+        .to_string_lossy()
+        .replace('\\', "/");
+    if relative.contains(['\n', '\r']) {
+        return Err(format!("File {file_path} has a line break in its name"));
+    }
+    Ok(relative)
+}
+
 /// Splits a folder's files into up to `max_groups` balanced groups, each a list
 /// of paths relative to the folder root for rclone's `--files-from-raw`.
 ///
@@ -360,15 +376,8 @@ fn partition_files(
     let mut entries: Vec<GroupedFile> = files
         .iter()
         .map(|file| {
-            let relative = Path::new(&file.file_path).strip_prefix(root).map_err(|_| {
-                format!(
-                    "File {} is not inside the folder {}",
-                    file.file_path,
-                    root.display()
-                )
-            })?;
             Ok(GroupedFile {
-                relative: relative.to_string_lossy().replace('\\', "/"),
+                relative: relative_path(root, &file.file_path)?,
                 size: file.total_bytes,
             })
         })
@@ -385,9 +394,16 @@ fn partition_files(
     Ok(groups)
 }
 
-/// Writes a NUL-separated file list for rclone's `--files-from-raw`, which
-/// reads paths verbatim so names with leading/trailing spaces or a leading `#`
-/// survive. Returns the temp file's path for the caller to clean up.
+/// Writes a file list for rclone's `--files-from-raw`, one path per line. The
+/// raw variant reads each line verbatim, so names with leading/trailing spaces
+/// or a leading `#` survive. Returns the temp file's path for the caller to
+/// clean up.
+///
+/// The separator has to be a newline. rclone splits this file with a line
+/// scanner, so a NUL-separated list is read as a single path that matches
+/// nothing - and a `--files-from` entry that does not exist is skipped without
+/// an error, so rclone then reports a successful copy of no files at all.
+/// (`--files-from0` takes NUL, but only in releases from mid-2026 on.)
 fn write_files_from(paths: &[String]) -> Result<PathBuf, String> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -398,14 +414,109 @@ fn write_files_from(paths: &[String]) -> Result<PathBuf, String> {
         std::process::id(),
         stamp
     ));
-    let mut contents = Vec::new();
+    let mut contents = String::new();
     for entry in paths {
-        contents.extend_from_slice(entry.as_bytes());
-        contents.push(0);
+        contents.push_str(entry);
+        contents.push('\n');
     }
     std::fs::write(&path, contents)
         .map_err(|e| format!("Failed to write rclone file list: {e}"))?;
     Ok(path)
+}
+
+/// Asks rclone which of a folder's files survive the exclude patterns.
+///
+/// rclone refuses `--exclude` next to `--files-from-raw` ("overrides all other
+/// filters"), so a fanned-out folder cannot hand the patterns to `copy`.
+/// Listing the local folder through rclone with the same patterns applies them
+/// with rclone's own matcher, so the fan-out skips exactly what one process
+/// would. Paths come back relative to the folder with forward slashes, the
+/// same form `relative_path` produces.
+async fn files_surviving_excludes(
+    prefs: &RclonePreferences,
+    root: &Path,
+) -> Result<HashSet<String>, String> {
+    let mut args = vec![
+        "lsjson".to_string(),
+        root.to_string_lossy().to_string(),
+        "-R".to_string(),
+        "--files-only".to_string(),
+    ];
+    args.extend(exclude_args(prefs));
+
+    let output = run_rclone_to_completion(prefs, &args, Duration::from_secs(30 * 60)).await?;
+    if !output.status.success() {
+        let detail = describe_command_failure(&output);
+        return Err(if detail.is_empty() {
+            "Could not list the folder with the exclude patterns.".to_string()
+        } else {
+            format!("Could not list the folder with the exclude patterns: {detail}")
+        });
+    }
+
+    let entries: Vec<LsJsonEntry> = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("Could not read the folder listing: {e}"))?;
+    Ok(entries
+        .into_iter()
+        .filter(|entry| !entry.is_dir)
+        .map(|entry| entry.path)
+        .collect())
+}
+
+/// Decides how a folder is split across rclone processes, or returns None when
+/// it should go through a single process instead.
+///
+/// Single-process is the fallback for anything the fan-out cannot express:
+/// fewer than two files once the exclude patterns are applied, a name
+/// `--files-from-raw` cannot carry, or a listing that failed. Falling back
+/// costs throughput, never correctness.
+async fn plan_folder_fanout(
+    prefs: &RclonePreferences,
+    item: &QueueItemInput,
+    files: Option<&[FileListEntry]>,
+    max_fanout: usize,
+) -> Option<Vec<Vec<String>>> {
+    let files = files?;
+    if files.len() < 2 || max_fanout < 2 {
+        return None;
+    }
+    let root = Path::new(&item.path);
+
+    let kept: Vec<FileListEntry> = if exclude_args(prefs).is_empty() {
+        files.to_vec()
+    } else {
+        match files_surviving_excludes(prefs, root).await {
+            Ok(surviving) => files
+                .iter()
+                .filter(|file| {
+                    relative_path(root, &file.file_path)
+                        .is_ok_and(|relative| surviving.contains(&relative))
+                })
+                .cloned()
+                .collect(),
+            Err(err) => {
+                log::warn!(
+                    target: "rclone",
+                    "upload.fanout_skipped id={} reason={err}",
+                    item.id
+                );
+                return None;
+            }
+        }
+    };
+
+    match partition_files(root, &kept, max_fanout) {
+        Ok(groups) if groups.len() > 1 => Some(groups),
+        Ok(_) => None,
+        Err(err) => {
+            log::warn!(
+                target: "rclone",
+                "upload.fanout_skipped id={} reason={err}",
+                item.id
+            );
+            None
+        }
+    }
 }
 
 /// Runs a folder item's files across several service accounts at once.
@@ -414,7 +525,6 @@ fn write_files_from(paths: &[String]) -> Result<PathBuf, String> {
 /// folder is no longer limited to a single account's throughput. Progress is
 /// summed across groups and reported once; the item is marked done only after
 /// every group finishes.
-#[allow(clippy::too_many_arguments)]
 async fn run_folder_fanout(
     app: &AppHandle,
     control: &UploadControlHandle,
@@ -422,10 +532,8 @@ async fn run_folder_fanout(
     sa_pool: &Arc<Mutex<Vec<ServiceAccountFile>>>,
     sa_tick: &Arc<AtomicU64>,
     item: &QueueItemInput,
-    files: &[FileListEntry],
-    max_fanout: usize,
+    groups: Vec<Vec<String>>,
 ) -> Result<(), String> {
-    let groups = partition_files(Path::new(&item.path), files, max_fanout)?;
     let group_count = groups.len();
 
     let should_pause =
@@ -597,11 +705,7 @@ async fn run_rclone_command(
         );
     }
 
-    let mut args = build_rclone_args(prefs, item, sa_path);
-    if let Some(files_from) = files_from {
-        args.push("--files-from-raw".to_string());
-        args.push(files_from.to_string_lossy().to_string());
-    }
+    let args = build_rclone_args(prefs, item, sa_path, files_from);
 
     let mut command = build_rclone_command(&prefs.rclone_path, &args);
 
@@ -1661,10 +1765,22 @@ pub async fn search_remote_folders(
     Ok(folders)
 }
 
+/// The `--exclude` flags for the configured patterns.
+fn exclude_args(prefs: &RclonePreferences) -> Vec<String> {
+    prefs
+        .exclude_patterns
+        .iter()
+        .map(|pattern| pattern.trim())
+        .filter(|pattern| !pattern.is_empty())
+        .flat_map(|pattern| ["--exclude".to_string(), pattern.to_string()])
+        .collect()
+}
+
 fn build_rclone_args(
     prefs: &RclonePreferences,
     item: &QueueItemInput,
     sa_path: &Path,
+    files_from: Option<&Path>,
 ) -> Vec<String> {
     let mut args = vec![
         "copy".to_string(),
@@ -1718,13 +1834,15 @@ fn build_rclone_args(
         args.push(bandwidth_limit.to_string());
     }
 
-    for pattern in &prefs.exclude_patterns {
-        let pattern = pattern.trim();
-        if pattern.is_empty() {
-            continue;
+    // rclone rejects `--exclude` next to `--files-from-raw`, so a fan-out
+    // group's list arrives with the patterns already applied (see
+    // `files_surviving_excludes`) and only a single process passes them.
+    match files_from {
+        Some(files_from) => {
+            args.push("--files-from-raw".to_string());
+            args.push(files_from.to_string_lossy().to_string());
         }
-        args.push("--exclude".to_string());
-        args.push(pattern.to_string());
+        None => args.extend(exclude_args(prefs)),
     }
 
     args
@@ -2145,10 +2263,87 @@ mod tests {
     }
 
     #[test]
-    fn files_from_writes_nul_separated_paths() {
-        let path = write_files_from(&["a.mkv".to_string(), "b.mkv".to_string()]).unwrap();
+    fn partition_files_refuses_a_name_with_a_line_break() {
+        // One path per line: a break inside a name would become two paths that
+        // match nothing, so the folder has to go through a single process.
+        let files = vec![
+            FileListEntry {
+                file_path: "/root/a.mkv".to_string(),
+                total_bytes: 1,
+            },
+            FileListEntry {
+                file_path: "/root/odd\nname.mkv".to_string(),
+                total_bytes: 1,
+            },
+        ];
+        assert!(partition_files(Path::new("/root"), &files, 2).is_err());
+    }
+
+    #[test]
+    fn files_from_writes_one_path_per_line() {
+        // rclone splits `--files-from-raw` on newlines. A NUL-separated list
+        // used to be read as one path that matched nothing, and rclone then
+        // reported a successful copy of zero files.
+        let path = write_files_from(&["a.mkv".to_string(), "sub/b.mkv".to_string()]).unwrap();
         let contents = std::fs::read(&path).unwrap();
-        assert_eq!(contents, b"a.mkv\0b.mkv\0");
+        assert_eq!(contents, b"a.mkv\nsub/b.mkv\n");
         std::fs::remove_file(&path).unwrap();
+    }
+
+    fn test_prefs(exclude_patterns: &[&str]) -> RclonePreferences {
+        RclonePreferences {
+            rclone_path: "rclone".to_string(),
+            remote_name: "gdrive".to_string(),
+            drive_chunk_size_mib: 128,
+            transfers: 4,
+            checkers: 8,
+            retries: 3,
+            bandwidth_limit: String::new(),
+            exclude_patterns: exclude_patterns.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    fn test_item() -> QueueItemInput {
+        QueueItemInput {
+            id: "item".to_string(),
+            path: "/movies/Flyboys (2006)".to_string(),
+            kind: "folder".to_string(),
+            destination_folder_id: "FOLDER".to_string(),
+        }
+    }
+
+    #[test]
+    fn single_process_args_carry_the_exclude_patterns() {
+        let args = build_rclone_args(
+            &test_prefs(&[".DS_Store", " ", "**/node_modules/**"]),
+            &test_item(),
+            Path::new("/sa/one.json"),
+            None,
+        );
+        let excludes: Vec<&str> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--exclude")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(excludes, vec![".DS_Store", "**/node_modules/**"]);
+        assert!(!args.iter().any(|arg| arg == "--files-from-raw"));
+    }
+
+    #[test]
+    fn fanout_args_carry_the_file_list_and_no_excludes() {
+        // rclone refuses the two together, so a fan-out group's list is
+        // pre-filtered and the patterns must not be passed again.
+        let args = build_rclone_args(
+            &test_prefs(&[".DS_Store"]),
+            &test_item(),
+            Path::new("/sa/one.json"),
+            Some(Path::new("/tmp/list.txt")),
+        );
+        let position = args
+            .iter()
+            .position(|arg| arg == "--files-from-raw")
+            .expect("file list flag present");
+        assert_eq!(args[position + 1], "/tmp/list.txt");
+        assert!(!args.iter().any(|arg| arg == "--exclude"));
     }
 }

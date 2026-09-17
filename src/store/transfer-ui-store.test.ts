@@ -20,6 +20,7 @@ describe('transferUiStore file progress keying', () => {
       fileMetricsById: {},
       _fileSamplesById: {},
       _samplesById: {},
+      _reportedSpeedById: {},
     })
   })
 
@@ -143,6 +144,7 @@ describe('transferUiStore measures the real rate', () => {
       fileMetricsById: {},
       _fileSamplesById: {},
       _samplesById: {},
+      _reportedSpeedById: {},
     })
   })
   afterEach(() => vi.useRealTimers())
@@ -231,6 +233,23 @@ describe('transferUiStore measures the real rate', () => {
     // The history is dropped, so a resume measures its own rate.
     expect(useTransferUiStore.getState()._samplesById[ITEM]).toBeUndefined()
   })
+
+  it('shows rclone reported speed until bytes have settled', () => {
+    // Before the first chunk lands there is only one reading, so there is no
+    // measured rate yet. The row shows rclone's own current speed instead of 0.
+    useTransferUiStore.getState().recordItemSpeed(ITEM, 3_000_000)
+
+    vi.setSystemTime(0)
+    useTransferUiStore
+      .getState()
+      .tick([
+        { id: ITEM, status: 'uploading', bytesSent: 0, totalBytes: 100 * MIB },
+      ])
+
+    const m = useTransferUiStore.getState().metricsById[ITEM]
+    expect(m?.speedBytesPerSec).toBe(3_000_000)
+    expect(m?.etaSeconds).toBeGreaterThan(0)
+  })
 })
 
 describe('transferUiStore measures per-file rates the same way', () => {
@@ -245,6 +264,7 @@ describe('transferUiStore measures per-file rates the same way', () => {
       fileMetricsById: {},
       _fileSamplesById: {},
       _samplesById: {},
+      _reportedSpeedById: {},
     })
   })
   afterEach(() => vi.useRealTimers())
@@ -312,5 +332,17 @@ describe('transferUiStore measures per-file rates the same way', () => {
       useTransferUiStore.getState().fileMetricsById[ITEM]?.['/root/a.txt']
     expect(m?.speedBytesPerSec).toBe(0)
     expect(m?.etaSeconds).toBe(0)
+  })
+
+  it('falls back to rclone reported speed before the first chunk', () => {
+    vi.setSystemTime(0)
+    useTransferUiStore
+      .getState()
+      .recordFileProgress(ITEM, '/root/big.mkv', 0, 100 * MIB, 2_500_000)
+
+    const m =
+      useTransferUiStore.getState().fileMetricsById[ITEM]?.['/root/big.mkv']
+    expect(m?.speedBytesPerSec).toBe(2_500_000)
+    expect(m?.etaSeconds).toBeGreaterThan(0)
   })
 })

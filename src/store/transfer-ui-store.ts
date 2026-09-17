@@ -150,16 +150,23 @@ interface TransferUiState {
   fileMetricsById: Record<string, Record<string, FileMetrics>>
   _fileSamplesById: Record<string, Record<string, Sample[]>>
   _samplesById: Record<string, Sample[]>
+  /**
+   * rclone's own current-speed reading per item, used only until enough bytes
+   * have settled to measure a rate from the counter. See `measureRate`.
+   */
+  _reportedSpeedById: Record<string, number>
 
   isPaused: (id: string) => boolean
   setPaused: (id: string, paused: boolean) => void
   pauseAll: (ids: string[]) => void
   resumeAll: (ids: string[]) => void
+  recordItemSpeed: (itemId: string, speedBytesPerSec?: number | null) => void
   recordFileProgress: (
     itemId: string,
     filePath: string,
     bytesSent: number,
-    totalBytes: number
+    totalBytes: number,
+    speedBytesPerSec?: number | null
   ) => void
   recordFileList: (itemId: string, files: FileProgressByPath[]) => void
   setItemLinks: (itemId: string, links: ItemDriveLinks) => void
@@ -185,6 +192,7 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
   fileMetricsById: {},
   _fileSamplesById: {},
   _samplesById: {},
+  _reportedSpeedById: {},
 
   isPaused: id => Boolean(get().pausedById[id]),
 
@@ -213,7 +221,25 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       return { pausedById: next }
     }),
 
-  recordFileProgress: (itemId, filePath, bytesSent, totalBytes) =>
+  recordItemSpeed: (itemId, speedBytesPerSec) =>
+    set(state => {
+      const speed =
+        typeof speedBytesPerSec === 'number' && speedBytesPerSec > 0
+          ? speedBytesPerSec
+          : 0
+      if ((state._reportedSpeedById[itemId] ?? 0) === speed) return state
+      return {
+        _reportedSpeedById: { ...state._reportedSpeedById, [itemId]: speed },
+      }
+    }),
+
+  recordFileProgress: (
+    itemId,
+    filePath,
+    bytesSent,
+    totalBytes,
+    speedBytesPerSec
+  ) =>
     set(state => {
       const trimmed = filePath.trim()
       if (!trimmed) return state
@@ -247,7 +273,22 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       // accepted. See `measureRate` for how the rate is derived.
       const samples = pushSample(existingSamples?.[resolvedKey], bytesSent, now)
       const complete = totalBytes > 0 && bytesSent >= totalBytes
-      const speed = complete ? 0 : measureRate(samples, now)
+      const measured = measureRate(samples, now)
+      // Until two byte-counter readings have settled there is nothing to
+      // measure, so fall back to rclone's own current-speed reading instead of
+      // showing 0 B/s for the whole first chunk. Once bytes settle the measured
+      // rate wins, because it counts what Drive actually accepted.
+      const reported =
+        typeof speedBytesPerSec === 'number' && speedBytesPerSec > 0
+          ? speedBytesPerSec
+          : 0
+      const speed = complete
+        ? 0
+        : measured > 0
+          ? measured
+          : samples.length < 2
+            ? reported
+            : 0
       const etaSeconds = complete ? 0 : etaFrom(bytesSent, totalBytes, speed)
 
       const nextSamples = {
@@ -382,6 +423,7 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       const nextFileMetrics: Record<string, Record<string, FileMetrics>> = {}
       const nextFileSamples: Record<string, Record<string, Sample[]>> = {}
       const nextSamples: Record<string, Sample[]> = {}
+      const nextReported: Record<string, number> = {}
 
       for (const [id, v] of Object.entries(state.pausedById)) {
         if (remaining.has(id)) nextPaused[id] = v
@@ -407,6 +449,9 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       for (const [id, v] of Object.entries(state._samplesById)) {
         if (remaining.has(id)) nextSamples[id] = v
       }
+      for (const [id, v] of Object.entries(state._reportedSpeedById)) {
+        if (remaining.has(id)) nextReported[id] = v
+      }
 
       return {
         pausedById: nextPaused,
@@ -417,6 +462,7 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
         fileMetricsById: nextFileMetrics,
         _fileSamplesById: nextFileSamples,
         _samplesById: nextSamples,
+        _reportedSpeedById: nextReported,
       }
     }),
 
@@ -425,6 +471,7 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       const now = Date.now()
       let metricsById = state.metricsById
       let samplesById = state._samplesById
+      let reportedById = state._reportedSpeedById
 
       for (const item of items) {
         const id = item.id
@@ -444,10 +491,10 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
 
         // The rate is measured, not smoothed: `pushSample` keeps the instants
         // the byte counter actually moved and `measureRate` divides across a
-        // whole number of them. Deriving it from rclone's own `speedAvg` is
-        // wrong for a different reason - that counts bytes as they enter the
-        // upload buffer, so with large chunks it reports the disk read rate
-        // rather than what Drive has accepted.
+        // whole number of them. Until two readings have settled there is
+        // nothing to measure, so fall back to rclone's own current-speed
+        // reading; once bytes settle the measured rate wins because it counts
+        // what Drive actually accepted.
         let speed = 0
         if (isActive) {
           const previous = samplesById[id]
@@ -458,11 +505,18 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
             }
             samplesById[id] = samples
           }
-          speed = measureRate(samples, now)
+          const measured = measureRate(samples, now)
+          speed =
+            measured > 0
+              ? measured
+              : samples.length < 2
+                ? (reportedById[id] ?? 0)
+                : 0
         } else {
           // Drop the history when an item stops, so a resumed transfer
           // measures its own rate instead of averaging across the pause.
           samplesById = omitKey(samplesById, id)
+          reportedById = omitKey(reportedById, id)
         }
 
         const etaSeconds =
@@ -484,7 +538,11 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
         }
       }
 
-      return { metricsById, _samplesById: samplesById }
+      return {
+        metricsById,
+        _samplesById: samplesById,
+        _reportedSpeedById: reportedById,
+      }
     }),
 }))
 
