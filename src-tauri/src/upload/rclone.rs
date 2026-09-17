@@ -5,15 +5,16 @@ use crate::upload::events::{
 use crate::upload::scheduler::{
     wait_if_paused, JobTallies, QueueItemInput, UploadControlHandle, CANCELED,
 };
+use crate::upload::speed_watch::{SpeedWatch, Transfer, MAX_ACCOUNT_SWITCHES};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -39,6 +40,27 @@ struct ServiceAccountFile {
     path: PathBuf,
     email: Option<String>,
     last_used: u64,
+    /// Times a process on this account was switched away for crawling. Such an
+    /// account is picked only once every account with fewer marks has been.
+    slow_marks: u32,
+}
+
+/// What every rclone process of a job shares.
+struct Job {
+    app: AppHandle,
+    control: UploadControlHandle,
+    prefs: RclonePreferences,
+    sa_pool: Arc<Mutex<Vec<ServiceAccountFile>>>,
+    sa_tick: Arc<AtomicU64>,
+    /// Spots a process crawling on a throttled account, see `speed_watch`.
+    watch: Arc<SpeedWatch>,
+}
+
+impl Job {
+    /// Switching accounts is pointless with nothing to switch to.
+    async fn has_alternative_account(&self) -> bool {
+        self.sa_pool.lock().await.len() >= 2
+    }
 }
 
 /// Why the rclone child process is being stopped early.
@@ -49,11 +71,18 @@ enum StopReason {
     /// Windows only: pause is implemented by stopping rclone and re-running it
     /// on resume, because there is no portable SIGSTOP equivalent.
     PauseRestart,
+    /// The process was crawling on a throttled account and is to be run again
+    /// on another one. See `speed_watch`.
+    SwitchAccount,
 }
 
 /// Internal sentinel error meaning "this item was paused, run it again once it
 /// is resumed". Never surfaced to the UI.
 const PAUSE_RESTART: &str = "__gdexplorer_pause_restart__";
+
+/// Internal sentinel error meaning "this process crawled, run it again on
+/// another service account". Never surfaced to the UI.
+const ACCOUNT_SWITCH: &str = "__gdexplorer_account_switch__";
 
 /// Keep the failure message useful without letting a pathological log line blow
 /// up the UI tooltip.
@@ -88,8 +117,14 @@ pub async fn run_rclone_job(
         "queue.worker_pool_started concurrency={concurrency}"
     );
 
-    let sa_pool = Arc::new(Mutex::new(sa_files));
-    let sa_tick = Arc::new(AtomicU64::new(0));
+    let job = Arc::new(Job {
+        app: app.clone(),
+        control: control.clone(),
+        prefs,
+        sa_pool: Arc::new(Mutex::new(sa_files)),
+        sa_tick: Arc::new(AtomicU64::new(0)),
+        watch: Arc::new(SpeedWatch::new()),
+    });
     let rx = Arc::new(Mutex::new(queue_rx));
 
     let mut worker_handles = Vec::with_capacity(concurrency);
@@ -97,9 +132,7 @@ pub async fn run_rclone_job(
         let app = app.clone();
         let control = control.clone();
         let rx = rx.clone();
-        let prefs = prefs.clone();
-        let sa_pool = sa_pool.clone();
-        let sa_tick = sa_tick.clone();
+        let job = job.clone();
         let tallies = tallies.clone();
         let fanout = concurrency;
 
@@ -114,10 +147,7 @@ pub async fn run_rclone_job(
                 };
                 let Some(item) = item else { break };
 
-                let result = run_rclone_for_item(
-                    &app, &control, &prefs, &sa_pool, &sa_tick, &item, fanout,
-                )
-                .await;
+                let result = run_rclone_for_item(&job, &item, fanout).await;
 
                 match result {
                     Ok(()) => {
@@ -189,16 +219,12 @@ pub async fn run_rclone_job(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_rclone_for_item(
-    app: &AppHandle,
-    control: &UploadControlHandle,
-    prefs: &RclonePreferences,
-    sa_pool: &Arc<Mutex<Vec<ServiceAccountFile>>>,
-    sa_tick: &Arc<AtomicU64>,
+    job: &Arc<Job>,
     item: &QueueItemInput,
     max_fanout: usize,
 ) -> Result<(), String> {
+    let (app, control, prefs) = (&job.app, &job.control, &job.prefs);
     let files = collect_file_list(item);
     if let Some(file_list) = &files {
         let _ = app.emit(
@@ -216,14 +242,15 @@ async fn run_rclone_for_item(
     // `plan_folder_fanout`) keeps the single-process path.
     if item.kind == "folder" {
         if let Some(groups) = plan_folder_fanout(prefs, item, files.as_deref(), max_fanout).await {
-            return run_folder_fanout(app, control, prefs, sa_pool, sa_tick, item, groups).await;
+            return run_folder_fanout(job, item, groups).await;
         }
     }
 
     // On Windows a pause stops the child process, so the item has to be run
     // again when it resumes. rclone skips whatever already reached Drive, so
-    // re-running is safe. On Unix the process is suspended in place and this
-    // loop runs exactly once.
+    // re-running is safe. The same goes for a process switched off a crawling
+    // account. On Unix without a switch the loop runs exactly once.
+    let mut switches = 0;
     loop {
         let should_pause =
             *control.pause_rx.borrow() || control.paused_items_rx.borrow().contains(&item.id);
@@ -250,21 +277,26 @@ async fn run_rclone_for_item(
 
         wait_if_paused(control, &item.id).await?;
 
-        let (sa_path, sa_email) = select_service_account(sa_pool, sa_tick).await?;
+        let (sa_path, sa_email) = select_service_account(&job.sa_pool, &job.sa_tick).await?;
+        let may_switch = switches < MAX_ACCOUNT_SWITCHES && job.has_alternative_account().await;
 
         match run_rclone_command(
-            app,
-            control,
-            prefs,
+            job,
             &sa_path,
             sa_email,
             item,
             &ItemProgress::Direct,
             None,
+            may_switch,
         )
         .await
         {
             Err(err) if err == PAUSE_RESTART => continue,
+            Err(err) if err == ACCOUNT_SWITCH => {
+                switches += 1;
+                mark_slow(&job.sa_pool, &sa_path).await;
+                continue;
+            }
             other => return other,
         }
     }
@@ -304,12 +336,20 @@ impl ItemProgress {
 /// One group's last reported progress: (bytes sent, total bytes, speed).
 type PartProgress = (u64, u64, Option<u64>);
 
+#[derive(Default)]
+struct PartState {
+    latest: PartProgress,
+    /// The total the group reported before its process was restarted, so its
+    /// readings can be mapped back onto it. See `carried_reading`.
+    carried_total: Option<u64>,
+}
+
 /// Sums the progress of a folder's fan-out groups into one item-level reading.
 struct FolderAggregator {
     app: AppHandle,
     item: QueueItemInput,
-    /// group index -> latest progress for that group.
-    parts: Mutex<HashMap<usize, PartProgress>>,
+    /// group index -> that group's progress.
+    parts: Mutex<HashMap<usize, PartState>>,
 }
 
 impl FolderAggregator {
@@ -321,13 +361,28 @@ impl FolderAggregator {
         }
     }
 
+    /// Called before a group's process is run again on another account.
+    async fn restarting(&self, part: usize) {
+        let mut parts = self.parts.lock().await;
+        let state = parts.entry(part).or_default();
+        if state.carried_total.is_none() && state.latest.1 > 0 {
+            state.carried_total = Some(state.latest.1);
+        }
+    }
+
     async fn update(&self, part: usize, bytes: u64, total: u64, speed: Option<u64>) {
         let (bytes, total, speed) = {
             let mut parts = self.parts.lock().await;
-            parts.insert(part, (bytes, total, speed));
+            let state = parts.entry(part).or_default();
+            let (bytes, total) = match state.carried_total {
+                Some(carried) => carried_reading(carried, state.latest, bytes, total),
+                None => (bytes, total),
+            };
+            state.latest = (bytes, total, speed);
             parts
                 .values()
-                .fold((0_u64, 0_u64, 0_u64), |(b, t, s), (pb, pt, ps)| {
+                .fold((0_u64, 0_u64, 0_u64), |(b, t, s), state| {
+                    let (pb, pt, ps) = state.latest;
                     (b + pb, t + pt, s + ps.unwrap_or(0))
                 })
         };
@@ -335,9 +390,22 @@ impl FolderAggregator {
     }
 }
 
-struct GroupedFile {
-    relative: String,
-    size: u64,
+/// Maps a restarted group's reading back onto the total it had before.
+///
+/// A fresh rclone process counts only the files still to send, so its total
+/// shrinks by whatever already reached Drive - which is exactly what counts as
+/// sent. Until it has listed those files its total is still climbing, and a
+/// complete total always covers at least what the group had left before the
+/// restart; below that the last reading is repeated rather than overstated.
+fn carried_reading(carried_total: u64, frozen: PartProgress, bytes: u64, total: u64) -> (u64, u64) {
+    if total > carried_total {
+        // More to send than the original list had: rclone knows better.
+        return (bytes, total);
+    }
+    if total < carried_total.saturating_sub(frozen.0) {
+        return (frozen.0, frozen.1);
+    }
+    ((carried_total - total) + bytes, carried_total)
 }
 
 /// A file's path relative to the folder root, in the forward-slash form rclone
@@ -366,32 +434,44 @@ fn relative_path(root: &Path, file_path: &str) -> Result<String, String> {
 /// Splits a folder's files into up to `max_groups` balanced groups, each a list
 /// of paths relative to the folder root for rclone's `--files-from-raw`.
 ///
-/// Sizes are balanced by sorting largest-first and dealing round-robin, so one
-/// big file cannot leave a group idle while another still has work.
+/// A top-level subfolder always goes to one group whole. Drive allows two
+/// folders of the same name side by side, and rclone creates any folder it
+/// cannot list, so two processes writing into the same new subfolder at the
+/// same moment each created their own. The units - top-level files and
+/// subfolders - are handed out largest-first to the group with the least work,
+/// so one big unit cannot leave a group idle while another still has work.
 fn partition_files(
     root: &Path,
     files: &[FileListEntry],
     max_groups: usize,
 ) -> Result<Vec<Vec<String>>, String> {
-    let mut entries: Vec<GroupedFile> = files
-        .iter()
-        .map(|file| {
-            Ok(GroupedFile {
-                relative: relative_path(root, &file.file_path)?,
-                size: file.total_bytes,
-            })
-        })
-        .collect::<Result<_, String>>()?;
-
-    entries.sort_by_key(|entry| std::cmp::Reverse(entry.size));
-
-    let group_count = max_groups.min(entries.len()).max(1);
-    let mut groups: Vec<Vec<String>> = (0..group_count).map(|_| Vec::new()).collect();
-    for (index, entry) in entries.into_iter().enumerate() {
-        groups[index % group_count].push(entry.relative);
+    // top-level entry -> (bytes under it, its files)
+    let mut units: BTreeMap<String, (u64, Vec<String>)> = BTreeMap::new();
+    for file in files {
+        let relative = relative_path(root, &file.file_path)?;
+        let unit = relative.split('/').next().unwrap_or(&relative).to_string();
+        let entry = units.entry(unit).or_default();
+        entry.0 += file.total_bytes;
+        entry.1.push(relative);
     }
-    groups.retain(|group| !group.is_empty());
-    Ok(groups)
+    let mut units: Vec<(u64, Vec<String>)> = units.into_values().collect();
+    units.sort_by_key(|(size, _)| std::cmp::Reverse(*size));
+
+    let group_count = max_groups.min(units.len()).max(1);
+    let mut groups: Vec<(u64, Vec<String>)> = vec![(0, Vec::new()); group_count];
+    for (size, paths) in units {
+        let lightest = groups
+            .iter_mut()
+            .min_by_key(|(load, _)| *load)
+            .expect("at least one group");
+        lightest.0 += size;
+        lightest.1.extend(paths);
+    }
+    Ok(groups
+        .into_iter()
+        .map(|(_, paths)| paths)
+        .filter(|paths| !paths.is_empty())
+        .collect())
 }
 
 /// Writes a file list for rclone's `--files-from-raw`, one path per line. The
@@ -519,6 +599,38 @@ async fn plan_folder_fanout(
     }
 }
 
+/// Creates the item's folder in Drive before any fan-out group starts.
+///
+/// Drive allows two folders of the same name side by side, and rclone creates
+/// a folder it cannot list. Groups starting at the same instant each listed,
+/// saw nothing and created their own - which is where the duplicate folders
+/// came from. Created once up front, every group finds it.
+async fn create_remote_folder(
+    job: &Job,
+    item: &QueueItemInput,
+    sa_path: &Path,
+) -> Result<(), String> {
+    let args = vec![
+        "mkdir".to_string(),
+        remote_target(&job.prefs, item),
+        "--drive-root-folder-id".to_string(),
+        item.destination_folder_id.clone(),
+        "--drive-service-account-file".to_string(),
+        sa_path.to_string_lossy().to_string(),
+        "--use-json-log".to_string(),
+    ];
+    let output = run_rclone_to_completion(&job.prefs, &args, Duration::from_secs(60)).await?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = describe_command_failure(&output);
+    Err(if detail.is_empty() {
+        "Could not create the folder in Drive.".to_string()
+    } else {
+        format!("Could not create the folder in Drive: {detail}")
+    })
+}
+
 /// Runs a folder item's files across several service accounts at once.
 ///
 /// Each group is its own rclone process with its own service account, so the
@@ -526,14 +638,11 @@ async fn plan_folder_fanout(
 /// summed across groups and reported once; the item is marked done only after
 /// every group finishes.
 async fn run_folder_fanout(
-    app: &AppHandle,
-    control: &UploadControlHandle,
-    prefs: &RclonePreferences,
-    sa_pool: &Arc<Mutex<Vec<ServiceAccountFile>>>,
-    sa_tick: &Arc<AtomicU64>,
+    job: &Arc<Job>,
     item: &QueueItemInput,
     groups: Vec<Vec<String>>,
 ) -> Result<(), String> {
+    let (app, control) = (&job.app, &job.control);
     let group_count = groups.len();
 
     let should_pause =
@@ -554,32 +663,21 @@ async fn run_folder_fanout(
         },
     );
 
+    wait_if_paused(control, &item.id).await?;
+    let (sa_path, _) = select_service_account(&job.sa_pool, &job.sa_tick).await?;
+    create_remote_folder(job, item, &sa_path).await?;
+
     let aggregator = Arc::new(FolderAggregator::new(app.clone(), item.clone()));
 
     let mut tasks = Vec::with_capacity(group_count);
     for (part, group) in groups.into_iter().enumerate() {
         let files_from = write_files_from(&group)?;
-        let app = app.clone();
-        let control = control.clone();
-        let prefs = prefs.clone();
-        let sa_pool = sa_pool.clone();
-        let sa_tick = sa_tick.clone();
+        let job = job.clone();
         let item = item.clone();
         let aggregator = aggregator.clone();
 
         tasks.push(tokio::spawn(async move {
-            let result = run_rclone_group(
-                &app,
-                &control,
-                &prefs,
-                &sa_pool,
-                &sa_tick,
-                &item,
-                part,
-                &files_from,
-                &aggregator,
-            )
-            .await;
+            let result = run_rclone_group(&job, &item, part, &files_from, &aggregator).await;
             let _ = std::fs::remove_file(&files_from);
             result
         }));
@@ -631,56 +729,63 @@ async fn run_folder_fanout(
     Ok(())
 }
 
-/// Runs one fan-out group to completion, retrying after a Windows pause the
-/// same way the single-process path does.
-#[allow(clippy::too_many_arguments)]
+/// Runs one fan-out group to completion, running it again after a Windows
+/// pause or an account switch the same way the single-process path does.
 async fn run_rclone_group(
-    app: &AppHandle,
-    control: &UploadControlHandle,
-    prefs: &RclonePreferences,
-    sa_pool: &Arc<Mutex<Vec<ServiceAccountFile>>>,
-    sa_tick: &Arc<AtomicU64>,
+    job: &Job,
     item: &QueueItemInput,
     part: usize,
     files_from: &Path,
     aggregator: &Arc<FolderAggregator>,
 ) -> Result<(), String> {
+    let mut switches = 0;
     loop {
-        wait_if_paused(control, &item.id).await?;
-        let (sa_path, sa_email) = select_service_account(sa_pool, sa_tick).await?;
+        wait_if_paused(&job.control, &item.id).await?;
+        let (sa_path, sa_email) = select_service_account(&job.sa_pool, &job.sa_tick).await?;
         let progress = ItemProgress::Fanout {
             aggregator: aggregator.clone(),
             part,
         };
+        let may_switch = switches < MAX_ACCOUNT_SWITCHES && job.has_alternative_account().await;
         match run_rclone_command(
-            app,
-            control,
-            prefs,
+            job,
             &sa_path,
             sa_email,
             item,
             &progress,
             Some(files_from),
+            may_switch,
         )
         .await
         {
             Err(err) if err == PAUSE_RESTART => continue,
+            Err(err) if err == ACCOUNT_SWITCH => {
+                switches += 1;
+                mark_slow(&job.sa_pool, &sa_path).await;
+                aggregator.restarting(part).await;
+                continue;
+            }
             other => return other,
         }
     }
 }
 
+/// Runs one rclone process for an item or fan-out group.
+///
+/// With `may_switch`, a process whose transfers crawl next to what the job has
+/// shown it can do (see `speed_watch`) is stopped and `ACCOUNT_SWITCH` is
+/// returned, so the caller runs it again on another service account.
 #[allow(clippy::too_many_arguments)]
 async fn run_rclone_command(
-    app: &AppHandle,
-    control: &UploadControlHandle,
-    prefs: &RclonePreferences,
+    job: &Job,
     sa_path: &Path,
     sa_email: Option<String>,
     item: &QueueItemInput,
     progress: &ItemProgress,
     files_from: Option<&Path>,
+    may_switch: bool,
 ) -> Result<(), String> {
+    let (app, control, prefs) = (&job.app, &job.control, &job.prefs);
     if control.is_canceled() {
         return Err(CANCELED.to_string());
     }
@@ -751,6 +856,7 @@ async fn run_rclone_command(
     let stderr_task = tokio::spawn(read_rclone_stream(stderr, line_tx.clone()));
     drop(line_tx);
 
+    let stream = job.watch.open_stream();
     let progress_re = progress_regex();
     let mut last_bytes = 0_u64;
     let mut last_total = 0_u64;
@@ -783,15 +889,42 @@ async fn run_rclone_command(
                 recent_lines.push(line.clone());
 
                 if let Some(entries) = parse_json_file_progress(&line) {
-                    for (file_path, bytes, total, speed) in entries {
-                        let should_emit = match last_file_progress.get(&file_path) {
-                            Some(previous) => *previous != (bytes, total, speed),
+                    for (file_path, bytes, total, speed) in &entries {
+                        let should_emit = match last_file_progress.get(file_path) {
+                            Some(previous) => *previous != (*bytes, *total, *speed),
                             None => true,
                         };
                         if should_emit {
-                            last_file_progress.insert(file_path.clone(), (bytes, total, speed));
-                            emit_file_progress(app, item, &file_path, bytes, total, speed).await;
+                            last_file_progress.insert(file_path.clone(), (*bytes, *total, *speed));
+                            emit_file_progress(app, item, file_path, *bytes, *total, *speed).await;
                         }
+                    }
+
+                    // Judged on every stats line, not only when a counter
+                    // moved: a process that has stopped moving is the one to
+                    // catch.
+                    let transfers: Vec<Transfer<'_>> = entries
+                        .iter()
+                        .map(|(name, bytes, size, _)| Transfer {
+                            name,
+                            bytes: *bytes,
+                            size: *size,
+                        })
+                        .collect();
+                    if may_switch
+                        && stop_reason == StopReason::None
+                        && job.watch.observe(stream, &transfers, Instant::now())
+                    {
+                        log::info!(
+                            target: "rclone",
+                            "upload.account_switch id={} pid={} sa={}",
+                            item.id,
+                            pid,
+                            sa_path.to_string_lossy()
+                        );
+                        stop_reason = StopReason::SwitchAccount;
+                        stopped = true;
+                        stop_child(&mut child, pid, item, stop_reason).await;
                     }
                 }
                 if let Some((bytes, total, speed)) = parse_json_progress(
@@ -822,32 +955,12 @@ async fn run_rclone_command(
                 }
                 stop_reason = reason;
                 stopped = true;
-                // A suspended process cannot act on a terminate request, so
-                // always resume before killing - this is what used to wedge the
-                // app when cancelling a paused item.
-                #[cfg(unix)]
-                {
-                    let _ = resume_process(pid);
-                }
-                match child.kill().await {
-                    Ok(()) => log::info!(
-                        target: "rclone",
-                        "upload.killed id={} pid={} reason={:?}",
-                        item.id,
-                        pid,
-                        stop_reason
-                    ),
-                    Err(e) => log::warn!(
-                        target: "rclone",
-                        "upload.kill_failed id={} pid={} err={e}",
-                        item.id,
-                        pid
-                    ),
-                }
+                stop_child(&mut child, pid, item, stop_reason).await;
             }
         }
     }
 
+    job.watch.close_stream(stream);
     let _ = stdout_task.await;
     let _ = stderr_task.await;
 
@@ -865,6 +978,9 @@ async fn run_rclone_command(
 
     if stop_reason == StopReason::PauseRestart {
         return Err(PAUSE_RESTART.to_string());
+    }
+    if stop_reason == StopReason::SwitchAccount {
+        return Err(ACCOUNT_SWITCH.to_string());
     }
 
     if status.success() {
@@ -899,6 +1015,36 @@ async fn run_rclone_command(
     );
 
     Err(failure)
+}
+
+/// Stops the child process. A suspended process cannot act on a terminate
+/// request, so it is always resumed first - this is what used to wedge the app
+/// when cancelling a paused item.
+async fn stop_child(
+    child: &mut tokio::process::Child,
+    pid: u32,
+    item: &QueueItemInput,
+    reason: StopReason,
+) {
+    #[cfg(unix)]
+    {
+        let _ = resume_process(pid);
+    }
+    match child.kill().await {
+        Ok(()) => log::info!(
+            target: "rclone",
+            "upload.killed id={} pid={} reason={:?}",
+            item.id,
+            pid,
+            reason
+        ),
+        Err(e) => log::warn!(
+            target: "rclone",
+            "upload.kill_failed id={} pid={} err={e}",
+            item.id,
+            pid
+        ),
+    }
 }
 
 /// Pull the human-readable message out of an rclone JSON log line, but only for
@@ -1776,6 +1922,20 @@ fn exclude_args(prefs: &RclonePreferences) -> Vec<String> {
         .collect()
 }
 
+/// Where an item lands: a folder under its own name inside the destination, a
+/// file directly in it.
+fn remote_target(prefs: &RclonePreferences, item: &QueueItemInput) -> String {
+    let folder = if item.kind == "folder" {
+        Path::new(&item.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("folder")
+    } else {
+        ""
+    };
+    format!("{}:{}", prefs.remote_name, folder)
+}
+
 fn build_rclone_args(
     prefs: &RclonePreferences,
     item: &QueueItemInput,
@@ -1785,19 +1945,7 @@ fn build_rclone_args(
     let mut args = vec![
         "copy".to_string(),
         item.path.clone(),
-        format!(
-            "{}:{}",
-            prefs.remote_name,
-            if item.kind == "folder" {
-                Path::new(&item.path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("folder")
-                    .to_string()
-            } else {
-                "".to_string()
-            }
-        ),
+        remote_target(prefs, item),
         "--drive-root-folder-id".to_string(),
         item.destination_folder_id.clone(),
         // Kept deliberately close to rclone's own defaults.
@@ -1876,6 +2024,7 @@ fn load_service_account_files(folder: &str) -> Result<Vec<ServiceAccountFile>, S
             path,
             email,
             last_used: 0,
+            slow_marks: 0,
         });
     }
 
@@ -1905,20 +2054,36 @@ async fn select_service_account(
         return Err("No service account JSON files available.".to_string());
     }
 
-    let mut best_idx = 0;
-    let mut best_used = guard[0].last_used;
-    for (idx, entry) in guard.iter().enumerate().skip(1) {
-        if entry.last_used < best_used {
-            best_idx = idx;
-            best_used = entry.last_used;
-        }
-    }
+    // Least recently used, except that an account which has crawled comes
+    // after every account that has not. See `mark_slow`.
+    let best_idx = guard
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, entry)| (entry.slow_marks, entry.last_used))
+        .map(|(idx, _)| idx)
+        .expect("pool is not empty");
 
     let next = tick.fetch_add(1, Ordering::Relaxed) + 1;
     guard[best_idx].last_used = next;
 
     let entry = &guard[best_idx];
     Ok((entry.path.clone(), entry.email.clone()))
+}
+
+/// Notes that a process on this account was switched away for crawling, so
+/// `select_service_account` reaches for it only once every account with fewer
+/// such marks has been tried.
+async fn mark_slow(pool: &Arc<Mutex<Vec<ServiceAccountFile>>>, sa_path: &Path) {
+    let mut guard = pool.lock().await;
+    if let Some(entry) = guard.iter_mut().find(|entry| entry.path == sa_path) {
+        entry.slow_marks += 1;
+        log::info!(
+            target: "rclone",
+            "sa.marked_slow sa={} marks={}",
+            entry.path.to_string_lossy(),
+            entry.slow_marks
+        );
+    }
 }
 
 fn progress_regex() -> Regex {
@@ -2001,14 +2166,19 @@ fn parse_json_progress(line: &str, path: &str, kind: &str) -> Option<(u64, u64, 
     Some((bytes, total, speed))
 }
 
+/// The `transferring` entries of a stats line as (name, bytes, size, speed).
+/// Some and empty for a stats line with nothing in flight, None for any other
+/// line, so a caller can tell "nothing moving" from "not a stats line".
 fn parse_json_file_progress(line: &str) -> Option<Vec<(String, u64, u64, u64)>> {
     if !line.trim_start().starts_with('{') {
         return None;
     }
     let value: Value = serde_json::from_str(line).ok()?;
     let stats = value.get("stats")?;
-    let transferring = stats.get("transferring")?.as_array()?;
     let mut entries = Vec::new();
+    let Some(transferring) = stats.get("transferring").and_then(|v| v.as_array()) else {
+        return Some(entries);
+    };
     for entry in transferring {
         let name = entry
             .get("name")
@@ -2021,11 +2191,7 @@ fn parse_json_file_progress(line: &str) -> Option<Vec<(String, u64, u64, u64)>> 
             entries.push((name.to_string(), bytes, total, transfer_entry_speed(entry)));
         }
     }
-    if entries.is_empty() {
-        None
-    } else {
-        Some(entries)
-    }
+    Some(entries)
 }
 
 fn collect_file_list(item: &QueueItemInput) -> Option<Vec<FileListEntry>> {
@@ -2227,14 +2393,77 @@ mod tests {
                 total_bytes: 300,
             },
         ];
-        // Sorted largest-first (c=300, b=200, a=100) then dealt round-robin.
+        // Units largest-first (sub=300, b=200, a=100), each to the group with
+        // the least work so far.
         let groups = partition_files(Path::new("/root"), &files, 2).unwrap();
         assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0], vec!["sub/c.mkv".to_string()]);
+        assert_eq!(groups[1], vec!["b.mkv".to_string(), "a.mkv".to_string()]);
+    }
+
+    #[test]
+    fn partition_files_never_splits_a_subfolder() {
+        // Two processes creating the same new subfolder at once each create
+        // their own in Drive, so a subfolder is one unit however big it is.
+        let files = vec![
+            FileListEntry {
+                file_path: "/root/Subs/a.srt".to_string(),
+                total_bytes: 400,
+            },
+            FileListEntry {
+                file_path: "/root/Subs/deep/b.srt".to_string(),
+                total_bytes: 400,
+            },
+            FileListEntry {
+                file_path: "/root/c.mkv".to_string(),
+                total_bytes: 300,
+            },
+            FileListEntry {
+                file_path: "/root/d.mkv".to_string(),
+                total_bytes: 100,
+            },
+        ];
+        let groups = partition_files(Path::new("/root"), &files, 3).unwrap();
         assert_eq!(
-            groups[0],
-            vec!["sub/c.mkv".to_string(), "a.mkv".to_string()]
+            groups,
+            vec![
+                vec!["Subs/a.srt".to_string(), "Subs/deep/b.srt".to_string()],
+                vec!["c.mkv".to_string()],
+                vec!["d.mkv".to_string()],
+            ]
         );
-        assert_eq!(groups[1], vec!["b.mkv".to_string()]);
+
+        // Everything inside one subfolder is one unit, so there is nothing to
+        // fan out: one group, which the planner turns into a single process.
+        let nested: Vec<FileListEntry> = files[..2].to_vec();
+        let groups = partition_files(Path::new("/root"), &nested, 3).unwrap();
+        assert_eq!(groups.len(), 1);
+    }
+
+    #[test]
+    fn a_restarted_group_keeps_its_original_total() {
+        // Before the restart: 800 of 1000 sent, of which one 300-byte file
+        // was complete and a 700-byte file was 500 in. The new process counts
+        // only the 700-byte file, from zero.
+        let frozen = (800, 1000, None);
+        // First stats line: nothing listed yet. Repeat the last reading rather
+        // than claim the whole difference as sent.
+        assert_eq!(carried_reading(1000, frozen, 0, 0), (800, 1000));
+        // Listed: the 300 already at Drive count as sent, the rest from zero.
+        assert_eq!(carried_reading(1000, frozen, 0, 700), (300, 1000));
+        assert_eq!(carried_reading(1000, frozen, 650, 700), (950, 1000));
+        // rclone found more than the original list: trust it.
+        assert_eq!(carried_reading(1000, frozen, 10, 1200), (10, 1200));
+    }
+
+    #[test]
+    fn a_stats_line_with_nothing_in_flight_is_still_a_stats_line() {
+        let line = r#"{"stats":{"bytes":10000,"totalBytes":10000}}"#;
+        assert_eq!(parse_json_file_progress(line), Some(Vec::new()));
+        assert_eq!(
+            parse_json_file_progress(r#"{"level":"info","msg":"x"}"#),
+            None
+        );
     }
 
     #[test]
