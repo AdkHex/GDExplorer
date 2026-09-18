@@ -10,6 +10,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 mod logbuf;
 mod preflight;
 mod rclone_tools;
+mod send_buffer;
 mod tray;
 mod upload;
 
@@ -325,6 +326,18 @@ async fn run_preflight(
         args.destination_folder_id,
     )
     .await)
+}
+
+/// Raises Windows' default socket send buffer behind an elevation prompt and
+/// returns the refreshed preflight check. See `send_buffer` for why this is
+/// what stands between one file and the full link.
+#[tauri::command]
+async fn raise_send_buffer() -> Result<preflight::PreflightCheck, String> {
+    // The elevation prompt blocks until the user answers it.
+    let state = tokio::task::spawn_blocking(send_buffer::raise)
+        .await
+        .map_err(|e| format!("Could not apply the change: {e}"))?;
+    Ok(preflight::send_buffer_check(state))
 }
 
 /// Shared drives the configured service accounts can see. The root of the
@@ -1539,6 +1552,7 @@ pub fn run() {
             resolve_folder_name,
             search_remote_folders,
             run_preflight,
+            raise_send_buffer,
             pause_upload,
             pause_items,
             resolve_item_links,

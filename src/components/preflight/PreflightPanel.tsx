@@ -30,6 +30,8 @@ interface PreflightCheck {
   label: string
   status: CheckStatus
   detail: string
+  /** An action the app can take for this check; see `runFix`. */
+  fix?: 'raise-send-buffer'
 }
 
 const STATUS_STYLE: Record<
@@ -118,6 +120,29 @@ function PreflightBody({
     runChecks(destinationFolderId).then(applyResult).catch(applyError)
   }, [destinationFolderId, applyResult, applyError])
 
+  const [fixing, setFixing] = useState<string | null>(null)
+  const [fixError, setFixError] = useState<string | null>(null)
+
+  // Applies a check's own fix and swaps in the refreshed check, so the panel
+  // shows the new state without re-running the Drive checks.
+  const runFix = useCallback((check: PreflightCheck) => {
+    if (check.fix !== 'raise-send-buffer') return
+    setFixing(check.id)
+    setFixError(null)
+    invoke<PreflightCheck>('raise_send_buffer')
+      .then(next => {
+        setChecks(
+          current => current?.map(c => (c.id === next.id ? next : c)) ?? null
+        )
+      })
+      .catch(cause => {
+        const message = cause instanceof Error ? cause.message : String(cause)
+        logger.warn('Preflight fix failed', { check: check.id, error: message })
+        setFixError(message)
+      })
+      .finally(() => setFixing(null))
+  }, [])
+
   const failures = checks?.filter(check => check.status === 'fail') ?? []
   const warnings = checks?.filter(check => check.status === 'warn') ?? []
 
@@ -162,6 +187,27 @@ function PreflightBody({
                   <p className="text-xs break-words text-muted-foreground">
                     {check.detail}
                   </p>
+                  {check.fix ? (
+                    <div className="mt-1.5 flex items-center gap-2">
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="secondary"
+                        onClick={() => runFix(check)}
+                        disabled={fixing !== null || isRunning}
+                      >
+                        {fixing === check.id ? (
+                          <Loader2Icon className="animate-spin" />
+                        ) : null}
+                        {fixing === check.id ? 'Applying…' : 'Fix'}
+                      </Button>
+                      {fixError && fixing === null ? (
+                        <span className="text-xs text-status-danger">
+                          {fixError}
+                        </span>
+                      ) : null}
+                    </div>
+                  ) : null}
                 </div>
               </div>
             )

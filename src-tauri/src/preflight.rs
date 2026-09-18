@@ -5,6 +5,7 @@
 //! the accounts can read but not write to - each surfacing as a failed row
 //! part-way through a transfer.
 
+use crate::send_buffer;
 use crate::upload::rclone::{self, RclonePreferences, WriteCheck};
 use serde::Serialize;
 use std::time::Duration;
@@ -27,6 +28,10 @@ pub struct PreflightCheck {
     pub label: String,
     pub status: CheckStatus,
     pub detail: String,
+    /// An action the panel can offer for this check, when the app can put
+    /// the problem right itself. Currently only `raise-send-buffer`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix: Option<String>,
 }
 
 impl PreflightCheck {
@@ -36,6 +41,7 @@ impl PreflightCheck {
             label: label.to_string(),
             status,
             detail: detail.into(),
+            fix: None,
         }
     }
 }
@@ -61,6 +67,12 @@ pub async fn run(
             false
         }
     };
+
+    // Windows caps every rclone connection at its default send buffer, which
+    // is what makes one file crawl while many fly. Other systems grow the
+    // buffer on their own, so the check only exists there.
+    #[cfg(windows)]
+    checks.push(check_send_buffer());
 
     checks.push(if rclone_ok {
         check_remote(prefs).await
@@ -130,6 +142,71 @@ pub async fn run(
     }
 
     checks
+}
+
+/// Mbps one connection can reach with `bytes` in flight on a 20 ms path,
+/// which is a typical round trip to Google's edge.
+fn mbps_at_20ms(bytes: u32) -> u32 {
+    (u64::from(bytes) * 8 / 20 / 1000) as u32
+}
+
+/// The check for the state `send_buffer` reports, shared by the preflight
+/// pass and the fix action so both describe it the same way.
+pub fn send_buffer_check(state: Result<send_buffer::SendBufferState, String>) -> PreflightCheck {
+    let id = "send-buffer";
+    let label = "Windows send buffer";
+    let state = match state {
+        Ok(state) => state,
+        Err(error) => {
+            return PreflightCheck::new(
+                id,
+                label,
+                CheckStatus::Warn,
+                format!("Could not read it: {error}"),
+            )
+        }
+    };
+    let live = send_buffer::describe_bytes(state.live_bytes);
+    if state.live_is_adequate() {
+        return PreflightCheck::new(
+            id,
+            label,
+            CheckStatus::Ok,
+            format!("{live} per connection, so a single file can fill the link."),
+        );
+    }
+    let cap = mbps_at_20ms(state.live_bytes);
+    if state.restart_pending() {
+        let registry = send_buffer::describe_bytes(state.registry_bytes.unwrap_or_default());
+        return PreflightCheck::new(
+            id,
+            label,
+            CheckStatus::Warn,
+            format!(
+                "Set to {registry} in the registry - restart Windows to apply it. Until then every \
+                 rclone connection is capped at {live} in flight, about {cap} Mbps on a 20 ms path."
+            ),
+        );
+    }
+    let mut check = PreflightCheck::new(
+        id,
+        label,
+        CheckStatus::Warn,
+        format!(
+            "{live} per connection, Windows' default. rclone never raises it, so each connection \
+             is capped at {live} in flight per round trip - about {cap} Mbps on a 20 ms path - \
+             which is why one file crawls while many fly. Fix sets {} (administrator prompt, \
+             then a restart).",
+            send_buffer::describe_bytes(send_buffer::RECOMMENDED_BYTES)
+        ),
+    );
+    check.fix = Some("raise-send-buffer".to_string());
+    check
+}
+
+#[cfg(windows)]
+fn check_send_buffer() -> PreflightCheck {
+    send_buffer_check(send_buffer::inspect())
 }
 
 async fn check_rclone(prefs: &RclonePreferences) -> Result<PreflightCheck, PreflightCheck> {
