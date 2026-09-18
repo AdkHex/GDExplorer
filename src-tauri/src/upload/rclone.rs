@@ -5,7 +5,7 @@ use crate::upload::events::{
 use crate::upload::scheduler::{
     wait_if_paused, JobTallies, QueueItemInput, UploadControlHandle, CANCELED,
 };
-use crate::upload::speed_watch::{SpeedWatch, Transfer, MAX_ACCOUNT_SWITCHES};
+use crate::upload::speed_watch::{SpeedWatch, Transfer, FUTILE_RUN, MAX_RESTART_STREAK};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
@@ -40,7 +40,7 @@ struct ServiceAccountFile {
     path: PathBuf,
     email: Option<String>,
     last_used: u64,
-    /// Times a process on this account was switched away for crawling. Such an
+    /// Times a process on this account was restarted for crawling. Such an
     /// account is picked only once every account with fewer marks has been.
     slow_marks: u32,
 }
@@ -52,14 +52,42 @@ struct Job {
     prefs: RclonePreferences,
     sa_pool: Arc<Mutex<Vec<ServiceAccountFile>>>,
     sa_tick: Arc<AtomicU64>,
-    /// Spots a process crawling on a throttled account, see `speed_watch`.
+    /// Spots a process crawling on a bad flow or account, see `speed_watch`.
     watch: Arc<SpeedWatch>,
 }
 
-impl Job {
-    /// Switching accounts is pointless with nothing to switch to.
-    async fn has_alternative_account(&self) -> bool {
-        self.sa_pool.lock().await.len() >= 2
+/// Rations an item's or group's restarts for crawling, so a link that is
+/// simply slow does not thrash: restarts count as a streak while each run
+/// crawled within `FUTILE_RUN` of starting, and the streak ends at
+/// `MAX_RESTART_STREAK`. A run that went well for longer starts a new streak.
+struct RestartBudget {
+    streak: u32,
+    run_started: Instant,
+}
+
+impl RestartBudget {
+    fn new() -> Self {
+        Self {
+            streak: 0,
+            run_started: Instant::now(),
+        }
+    }
+
+    /// Marks the start of a run. Whether it may be restarted for crawling.
+    fn starting(&mut self) -> bool {
+        self.run_started = Instant::now();
+        self.streak < MAX_RESTART_STREAK
+    }
+
+    /// The run was stopped for crawling. A rerun that crawled again straight
+    /// away tells the watch that the link itself has slowed.
+    fn restarted(&mut self, watch: &SpeedWatch) {
+        let quick = self.run_started.elapsed() < FUTILE_RUN;
+        let was_rerun = self.streak > 0;
+        self.streak = if quick { self.streak + 1 } else { 1 };
+        if quick && was_rerun {
+            watch.restart_was_futile(Instant::now());
+        }
     }
 }
 
@@ -71,18 +99,18 @@ enum StopReason {
     /// Windows only: pause is implemented by stopping rclone and re-running it
     /// on resume, because there is no portable SIGSTOP equivalent.
     PauseRestart,
-    /// The process was crawling on a throttled account and is to be run again
-    /// on another one. See `speed_watch`.
-    SwitchAccount,
+    /// The process was crawling and is to be run again on a fresh flow, on
+    /// another service account when there is one. See `speed_watch`.
+    Restart,
 }
 
 /// Internal sentinel error meaning "this item was paused, run it again once it
 /// is resumed". Never surfaced to the UI.
 const PAUSE_RESTART: &str = "__gdexplorer_pause_restart__";
 
-/// Internal sentinel error meaning "this process crawled, run it again on
-/// another service account". Never surfaced to the UI.
-const ACCOUNT_SWITCH: &str = "__gdexplorer_account_switch__";
+/// Internal sentinel error meaning "this process crawled, run it again". Never
+/// surfaced to the UI.
+const RESTART: &str = "__gdexplorer_restart__";
 
 /// Keep the failure message useful without letting a pathological log line blow
 /// up the UI tooltip.
@@ -248,9 +276,9 @@ async fn run_rclone_for_item(
 
     // On Windows a pause stops the child process, so the item has to be run
     // again when it resumes. rclone skips whatever already reached Drive, so
-    // re-running is safe. The same goes for a process switched off a crawling
-    // account. On Unix without a switch the loop runs exactly once.
-    let mut switches = 0;
+    // re-running is safe. The same goes for a process restarted for crawling.
+    // On Unix without a restart the loop runs exactly once.
+    let mut budget = RestartBudget::new();
     loop {
         let should_pause =
             *control.pause_rx.borrow() || control.paused_items_rx.borrow().contains(&item.id);
@@ -278,7 +306,7 @@ async fn run_rclone_for_item(
         wait_if_paused(control, &item.id).await?;
 
         let (sa_path, sa_email) = select_service_account(&job.sa_pool, &job.sa_tick).await?;
-        let may_switch = switches < MAX_ACCOUNT_SWITCHES && job.has_alternative_account().await;
+        let may_restart = budget.starting();
 
         match run_rclone_command(
             job,
@@ -287,13 +315,13 @@ async fn run_rclone_for_item(
             item,
             &ItemProgress::Direct,
             None,
-            may_switch,
+            may_restart,
         )
         .await
         {
             Err(err) if err == PAUSE_RESTART => continue,
-            Err(err) if err == ACCOUNT_SWITCH => {
-                switches += 1;
+            Err(err) if err == RESTART => {
+                budget.restarted(&job.watch);
                 mark_slow(&job.sa_pool, &sa_path).await;
                 continue;
             }
@@ -730,7 +758,7 @@ async fn run_folder_fanout(
 }
 
 /// Runs one fan-out group to completion, running it again after a Windows
-/// pause or an account switch the same way the single-process path does.
+/// pause or a restart for crawling the same way the single-process path does.
 async fn run_rclone_group(
     job: &Job,
     item: &QueueItemInput,
@@ -738,7 +766,7 @@ async fn run_rclone_group(
     files_from: &Path,
     aggregator: &Arc<FolderAggregator>,
 ) -> Result<(), String> {
-    let mut switches = 0;
+    let mut budget = RestartBudget::new();
     loop {
         wait_if_paused(&job.control, &item.id).await?;
         let (sa_path, sa_email) = select_service_account(&job.sa_pool, &job.sa_tick).await?;
@@ -746,7 +774,7 @@ async fn run_rclone_group(
             aggregator: aggregator.clone(),
             part,
         };
-        let may_switch = switches < MAX_ACCOUNT_SWITCHES && job.has_alternative_account().await;
+        let may_restart = budget.starting();
         match run_rclone_command(
             job,
             &sa_path,
@@ -754,13 +782,13 @@ async fn run_rclone_group(
             item,
             &progress,
             Some(files_from),
-            may_switch,
+            may_restart,
         )
         .await
         {
             Err(err) if err == PAUSE_RESTART => continue,
-            Err(err) if err == ACCOUNT_SWITCH => {
-                switches += 1;
+            Err(err) if err == RESTART => {
+                budget.restarted(&job.watch);
                 mark_slow(&job.sa_pool, &sa_path).await;
                 aggregator.restarting(part).await;
                 continue;
@@ -772,9 +800,9 @@ async fn run_rclone_group(
 
 /// Runs one rclone process for an item or fan-out group.
 ///
-/// With `may_switch`, a process whose transfers crawl next to what the job has
-/// shown it can do (see `speed_watch`) is stopped and `ACCOUNT_SWITCH` is
-/// returned, so the caller runs it again on another service account.
+/// With `may_restart`, a process whose transfers crawl next to what the job has
+/// shown it can do (see `speed_watch`) is stopped and `RESTART` is returned,
+/// so the caller runs it again on a fresh flow.
 #[allow(clippy::too_many_arguments)]
 async fn run_rclone_command(
     job: &Job,
@@ -783,7 +811,7 @@ async fn run_rclone_command(
     item: &QueueItemInput,
     progress: &ItemProgress,
     files_from: Option<&Path>,
-    may_switch: bool,
+    may_restart: bool,
 ) -> Result<(), String> {
     let (app, control, prefs) = (&job.app, &job.control, &job.prefs);
     if control.is_canceled() {
@@ -911,18 +939,18 @@ async fn run_rclone_command(
                             size: *size,
                         })
                         .collect();
-                    if may_switch
+                    if may_restart
                         && stop_reason == StopReason::None
                         && job.watch.observe(stream, &transfers, Instant::now())
                     {
                         log::info!(
                             target: "rclone",
-                            "upload.account_switch id={} pid={} sa={}",
+                            "upload.restart_for_crawling id={} pid={} sa={}",
                             item.id,
                             pid,
                             sa_path.to_string_lossy()
                         );
-                        stop_reason = StopReason::SwitchAccount;
+                        stop_reason = StopReason::Restart;
                         stopped = true;
                         stop_child(&mut child, pid, item, stop_reason).await;
                     }
@@ -979,8 +1007,8 @@ async fn run_rclone_command(
     if stop_reason == StopReason::PauseRestart {
         return Err(PAUSE_RESTART.to_string());
     }
-    if stop_reason == StopReason::SwitchAccount {
-        return Err(ACCOUNT_SWITCH.to_string());
+    if stop_reason == StopReason::Restart {
+        return Err(RESTART.to_string());
     }
 
     if status.success() {
@@ -2070,7 +2098,7 @@ async fn select_service_account(
     Ok((entry.path.clone(), entry.email.clone()))
 }
 
-/// Notes that a process on this account was switched away for crawling, so
+/// Notes that a process on this account was restarted for crawling, so
 /// `select_service_account` reaches for it only once every account with fewer
 /// such marks has been tried.
 async fn mark_slow(pool: &Arc<Mutex<Vec<ServiceAccountFile>>>, sa_path: &Path) {
@@ -2454,6 +2482,39 @@ mod tests {
         assert_eq!(carried_reading(1000, frozen, 650, 700), (950, 1000));
         // rclone found more than the original list: trust it.
         assert_eq!(carried_reading(1000, frozen, 10, 1200), (10, 1200));
+    }
+
+    /// A stats line as rclone v1.75.1 really prints it (`--use-json-log
+    /// --stats 1s`), so the field names the watchdog relies on are the real
+    /// ones rather than a guess.
+    const REAL_STATS_LINE: &str = r#"{"time":"2026-09-17T22:14:15.255203+05:45","level":"info","msg":"","stats":{"bytes":262144,"checks":0,"deletedDirs":0,"deletes":0,"elapsedTime":1.00163725,"errors":0,"eta":2,"fatalError":false,"listed":4,"renames":0,"retryError":false,"serverSideCopies":0,"serverSideCopyBytes":0,"serverSideMoveBytes":0,"serverSideMoves":0,"speed":262139.69671473873,"totalBytes":800000,"totalChecks":0,"totalTransfers":2,"transferTime":1.001194417,"transferring":[{"bytes":131072,"dstFs":"dst2/Nimrods (2025)","eta":1,"group":"global_stats","name":"Nimrods.2025.1080p.mkv","percentage":43,"size":300000,"speed":130941.74020437861,"speedAvg":131070.15964388844,"srcFs":"src/Nimrods (2025)"},{"bytes":131072,"dstFs":"dst2/Nimrods (2025)","eta":2,"group":"global_stats","name":"Nimrods.2025.2160p.mkv","percentage":26,"size":500000,"speed":130941.40781292172,"speedAvg":131070.03945434986,"srcFs":"src/Nimrods (2025)"}],"transfers":0},"source":"accounting/stats.go:549"}"#;
+
+    #[test]
+    fn real_stats_lines_feed_the_speed_watch() {
+        use crate::upload::speed_watch::{SpeedWatch, Transfer, CRAWL_WINDOW};
+        use std::time::Instant;
+
+        let entries = parse_json_file_progress(REAL_STATS_LINE).expect("a stats line");
+        assert_eq!(entries.len(), 2);
+        let transfers: Vec<Transfer<'_>> = entries
+            .iter()
+            .map(|(name, bytes, size, _)| Transfer {
+                name,
+                bytes: *bytes,
+                size: *size,
+            })
+            .collect();
+        assert_eq!(transfers[0].name, "Nimrods.2025.1080p.mkv");
+        assert_eq!((transfers[0].bytes, transfers[0].size), (131072, 300000));
+        assert_eq!((transfers[1].bytes, transfers[1].size), (131072, 500000));
+
+        // Two readings of a real line with no yardstick yet: a first window
+        // never triggers a restart.
+        let watch = SpeedWatch::new();
+        let stream = watch.open_stream();
+        let now = Instant::now();
+        assert!(!watch.observe(stream, &transfers, now));
+        assert!(!watch.observe(stream, &transfers, now + CRAWL_WINDOW));
     }
 
     #[test]
