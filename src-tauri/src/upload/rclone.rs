@@ -5,6 +5,7 @@ use crate::upload::events::{
 use crate::upload::scheduler::{
     wait_if_paused, JobTallies, QueueItemInput, UploadControlHandle, CANCELED,
 };
+use crate::upload::speed_record;
 use crate::upload::speed_watch::{SpeedWatch, Transfer, FUTILE_RUN, MAX_RESTART_STREAK};
 use regex::Regex;
 use serde::Deserialize;
@@ -33,6 +34,9 @@ pub struct RclonePreferences {
     pub bandwidth_limit: String,
     /// Glob patterns passed as repeated `--exclude` flags.
     pub exclude_patterns: Vec<String>,
+    /// Extra flags for the upload command, one per line; each line is split
+    /// on whitespace, so `--bind 0.0.0.0` is two arguments.
+    pub extra_args: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -145,13 +149,15 @@ pub async fn run_rclone_job(
         "queue.worker_pool_started concurrency={concurrency}"
     );
 
+    let watch = SpeedWatch::new();
+    watch.seed_link_record(speed_record::load(&app));
     let job = Arc::new(Job {
         app: app.clone(),
         control: control.clone(),
         prefs,
         sa_pool: Arc::new(Mutex::new(sa_files)),
         sa_tick: Arc::new(AtomicU64::new(0)),
-        watch: Arc::new(SpeedWatch::new()),
+        watch: Arc::new(watch),
     });
     let rx = Arc::new(Mutex::new(queue_rx));
 
@@ -212,6 +218,9 @@ pub async fn run_rclone_job(
                         );
                     }
                 }
+
+                // What this job achieved is the yardstick for the next one.
+                speed_record::save(&app, job.watch.link_record());
 
                 // The batch is finished when the last accepted item settles.
                 // Anything queued after this point starts a fresh batch, so the
@@ -2021,7 +2030,21 @@ fn build_rclone_args(
         None => args.extend(exclude_args(prefs)),
     }
 
+    // Last, so they can override anything above.
+    args.extend(extra_args(prefs));
+
     args
+}
+
+/// The user's extra flags as arguments: one line per flag, split on
+/// whitespace so a flag and its value become separate arguments.
+fn extra_args(prefs: &RclonePreferences) -> Vec<String> {
+    prefs
+        .extra_args
+        .iter()
+        .flat_map(|line| line.split_whitespace())
+        .map(str::to_string)
+        .collect()
 }
 
 fn load_service_account_files(folder: &str) -> Result<Vec<ServiceAccountFile>, String> {
@@ -2056,7 +2079,27 @@ fn load_service_account_files(folder: &str) -> Result<Vec<ServiceAccountFile>, S
         });
     }
 
+    // The pool is rebuilt for every job, and `select_service_account` takes
+    // the first of the least-used accounts. Left in directory order, the
+    // first file did every job's first item - every single-file upload -
+    // until Google throttled that one account while the other sixty sat
+    // idle. Start each job somewhere else, so the wear spreads.
+    rotate_randomly(&mut accounts);
     Ok(accounts)
+}
+
+/// Rotates the pool by a random offset, so successive jobs start on
+/// different accounts without any state to keep. `RandomState` is seeded by
+/// the OS and differs per instance, which is all the randomness this needs;
+/// the clock is no good for it, since it ticks in whole microseconds.
+fn rotate_randomly<T>(pool: &mut [T]) {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    if pool.len() < 2 {
+        return;
+    }
+    let random = RandomState::new().build_hasher().finish();
+    pool.rotate_left((random % pool.len() as u64) as usize);
 }
 
 fn read_service_account_email(path: &Path) -> Result<Option<String>, String> {
@@ -2590,7 +2633,44 @@ mod tests {
             retries: 3,
             bandwidth_limit: String::new(),
             exclude_patterns: exclude_patterns.iter().map(|p| p.to_string()).collect(),
+            extra_args: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_pool_does_not_always_start_at_the_first_account() {
+        // Over many rotations every account should come first at least once;
+        // the old code started at index 0 every single job.
+        let mut firsts = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let mut pool: Vec<u8> = (0..10).collect();
+            rotate_randomly(&mut pool);
+            assert_eq!(pool.len(), 10, "rotation keeps every account");
+            firsts.insert(pool[0]);
+        }
+        assert!(
+            firsts.len() >= 5,
+            "expected several different starting accounts, got {firsts:?}"
+        );
+        let mut single = vec![1_u8];
+        rotate_randomly(&mut single);
+        assert_eq!(single, vec![1]);
+    }
+
+    #[test]
+    fn extra_flags_come_last_and_split_flag_from_value() {
+        let mut prefs = test_prefs(&[]);
+        prefs.extra_args = vec![
+            "--bind 0.0.0.0".to_string(),
+            "  --drive-disable-http2=false ".to_string(),
+        ];
+        let args = build_rclone_args(&prefs, &test_item(), Path::new("/sa/one.json"), None);
+        let tail: Vec<&str> = args.iter().rev().take(3).map(String::as_str).collect();
+        assert_eq!(
+            tail,
+            vec!["--drive-disable-http2=false", "0.0.0.0", "--bind"],
+            "flag and value are separate arguments, appended after everything else"
+        );
     }
 
     fn test_item() -> QueueItemInput {

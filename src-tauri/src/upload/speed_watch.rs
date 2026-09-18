@@ -16,11 +16,13 @@
 //!   another process is demonstrably fine right now. The link is proven good,
 //!   so the loss of a restart is worth it whatever the progress.
 //! * **On an idle link.** The whole job moves at under an eighth of the best
-//!   rate the link has delivered lately, and so does this process. Nothing
-//!   proves the link is still that fast, so this only fires while there is at
-//!   most half a file to lose, and a restart that turns out futile pauses the
-//!   rule for a while: the link itself has slowed, and thrashing would only
-//!   re-send files for nothing.
+//!   rate the link has delivered - lately in this job, or ever on this
+//!   machine (the *link record*, which the app keeps across runs so a lone
+//!   file has something to be judged against) - and so does this process.
+//!   Nothing proves the link is still that fast, so this only fires while
+//!   there is at most half a file to lose, and a restart that turns out
+//!   futile pauses the rule for a while: the link itself has slowed, and
+//!   thrashing would only re-send files for nothing.
 //!
 //! A process with a transfer too young to judge, or one about to finish, is
 //! left alone until the next reading.
@@ -94,6 +96,9 @@ struct State {
     transfer_by_minute: BTreeMap<u64, f64>,
     /// Best whole-job rate seen, by minute of the job.
     link_by_minute: BTreeMap<u64, f64>,
+    /// Best whole-job rate this machine has ever sustained, seeded from the
+    /// previous runs and raised by this one. Never ages out.
+    link_record: f64,
     idle_rule_paused_until: Option<Instant>,
     started: Option<Instant>,
 }
@@ -144,6 +149,20 @@ impl SpeedWatch {
         let mut state = self.state.lock().expect("speed watch poisoned");
         state.streams.remove(&stream);
         state.latest.remove(&stream);
+    }
+
+    /// Seeds the link record from what earlier runs achieved, so the first
+    /// process of a job - a lone file, typically - can be judged against it.
+    pub fn seed_link_record(&self, bytes_per_sec: f64) {
+        let mut state = self.state.lock().expect("speed watch poisoned");
+        if bytes_per_sec > state.link_record {
+            state.link_record = bytes_per_sec;
+        }
+    }
+
+    /// The best whole-job rate seen so far, seeded or measured, for saving.
+    pub fn link_record(&self) -> f64 {
+        self.state.lock().expect("speed watch poisoned").link_record
     }
 
     /// A restarted process crawled again straight away: the link itself has
@@ -217,6 +236,9 @@ impl SpeedWatch {
             job_rate,
             LINK_REFERENCE_TTL,
         );
+        if job_rate > state.link_record {
+            state.link_record = job_rate;
+        }
 
         // Judge only a process whose every transfer has a full window behind
         // it and is not about to finish.
@@ -250,7 +272,8 @@ impl SpeedWatch {
         }
 
         // On an idle link.
-        let best_link = best_within(&state.link_by_minute, minute, LINK_REFERENCE_TTL);
+        let best_link =
+            best_within(&state.link_by_minute, minute, LINK_REFERENCE_TTL).max(state.link_record);
         let link_floor = CRAWL_FRACTION * best_link;
         let paused = state
             .idle_rule_paused_until
@@ -345,6 +368,49 @@ mod tests {
             }],
             t
         ));
+    }
+
+    #[test]
+    fn a_lone_file_is_judged_against_the_machines_record() {
+        // The first and only process of a job - a single file on a throttled
+        // account - has no other process to compare with. The record of what
+        // this machine did before is the yardstick instead.
+        let watch = SpeedWatch::new();
+        watch.seed_link_record(38.0 * MIB as f64);
+        let start = Instant::now();
+        let slow = watch.open_stream();
+        let mut verdict = false;
+        for sec in 0..=65 {
+            let t = start + Duration::from_secs(sec);
+            verdict = watch.observe(
+                slow,
+                &[Transfer {
+                    name: "a.mkv",
+                    bytes: sec * 2 * MIB + sec * MIB / 2,
+                    size: 6000 * MIB,
+                }],
+                t,
+            );
+            if sec < 60 {
+                assert!(!verdict, "a full window first, at {sec}s");
+            }
+        }
+        assert!(verdict, "2.5 MiB/s against a 38 MiB/s record is a crawl");
+
+        // The record is not lowered by a slow job, and is raised by a fast one.
+        assert_eq!(watch.link_record(), 38.0 * MIB as f64);
+        let fast = watch.open_stream();
+        feed(
+            &watch,
+            fast,
+            "b.mkv",
+            100 * 1024 * MIB,
+            start,
+            100,
+            165,
+            60 * MIB,
+        );
+        assert_eq!(watch.link_record(), 60.0 * MIB as f64);
     }
 
     #[test]

@@ -93,6 +93,7 @@ export const GeneralPane: React.FC = () => {
       rcloneRetries: preferences.rcloneRetries ?? 3,
       rcloneBandwidthLimit: preferences.rcloneBandwidthLimit ?? '',
       rcloneExcludePatterns: preferences.rcloneExcludePatterns ?? [],
+      rcloneExtraArgs: preferences.rcloneExtraArgs ?? [],
       destinationPresets: preferences.destinationPresets ?? [],
       notifyOnCompletion: preferences.notifyOnCompletion ?? true,
       notificationSound: preferences.notificationSound ?? true,
@@ -177,6 +178,12 @@ const GeneralPaneForm: React.FC<{
   )
   const [lastSavedExcludePatterns, setLastSavedExcludePatterns] = useState(() =>
     (preferences.rcloneExcludePatterns ?? []).join('\n')
+  )
+  const [extraArgsInput, setExtraArgsInput] = useState<string>(() =>
+    (preferences.rcloneExtraArgs ?? []).join('\n')
+  )
+  const [lastSavedExtraArgs, setLastSavedExtraArgs] = useState(() =>
+    (preferences.rcloneExtraArgs ?? []).join('\n')
   )
   const [isInstallingRclone, setIsInstallingRclone] = useState(false)
   const [isDetectingRclone, setIsDetectingRclone] = useState(false)
@@ -421,6 +428,35 @@ const GeneralPaneForm: React.FC<{
       .mutateAsync({ rcloneExcludePatterns: parsedExcludePatterns })
       .then(() => setLastSavedExcludePatterns(next))
       .catch(() => setExcludePatternsInput(lastSavedExcludePatterns))
+  }
+
+  const parsedExtraArgs = useMemo(
+    () =>
+      extraArgsInput
+        .split('\n')
+        .map(line => line.trim())
+        .filter(Boolean),
+    [extraArgsInput]
+  )
+
+  const extraArgsError = useMemo(() => {
+    if (parsedExtraArgs.length > 50) return 'At most 50 flags.'
+    if (parsedExtraArgs.some(line => line.length > 256)) {
+      return 'Each flag must be 256 characters or fewer.'
+    }
+    const notAFlag = parsedExtraArgs.find(line => !line.startsWith('-'))
+    if (notAFlag)
+      return `"${notAFlag}" is not a flag: each line must start with "-".`
+    return null
+  }, [parsedExtraArgs])
+
+  const handleSaveExtraArgs = () => {
+    if (extraArgsError) return
+    const next = extraArgsInput
+    savePreferences
+      .mutateAsync({ rcloneExtraArgs: parsedExtraArgs })
+      .then(() => setLastSavedExtraArgs(next))
+      .catch(() => setExtraArgsInput(lastSavedExtraArgs))
   }
 
   const applyRclonePath = async (path: string) => {
@@ -680,6 +716,27 @@ const GeneralPaneForm: React.FC<{
             />
             {excludePatternsError ? (
               <p className="text-sm text-destructive">{excludePatternsError}</p>
+            ) : null}
+          </div>
+        </SettingsField>
+
+        <SettingsField
+          label="Extra rclone flags"
+          description="One flag per line, added to every upload after the app's own flags. For example --bind 0.0.0.0 to upload over IPv4 only, or --drive-disable-http2=false."
+        >
+          <div className="space-y-2">
+            <textarea
+              value={extraArgsInput}
+              onChange={e => setExtraArgsInput(e.target.value)}
+              onBlur={handleSaveExtraArgs}
+              rows={3}
+              spellCheck={false}
+              placeholder={'--bind 0.0.0.0'}
+              aria-invalid={Boolean(extraArgsError)}
+              className="flex w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 aria-invalid:border-destructive aria-invalid:ring-destructive/20"
+            />
+            {extraArgsError ? (
+              <p className="text-sm text-destructive">{extraArgsError}</p>
             ) : null}
           </div>
         </SettingsField>

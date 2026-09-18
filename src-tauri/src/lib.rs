@@ -277,6 +277,7 @@ fn rclone_preferences(preferences: &AppPreferences) -> upload::rclone::RclonePre
         retries: preferences.rclone_retries,
         bandwidth_limit: preferences.rclone_bandwidth_limit.clone(),
         exclude_patterns: preferences.rclone_exclude_patterns.clone(),
+        extra_args: preferences.rclone_extra_args.clone(),
     }
 }
 
@@ -663,6 +664,25 @@ fn validate_rclone_exclude_patterns(patterns: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_rclone_extra_args(lines: &[String]) -> Result<(), String> {
+    if lines.len() > 50 {
+        return Err("Too many extra rclone flags (max 50).".to_string());
+    }
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            return Err("Extra rclone flags cannot be empty.".to_string());
+        }
+        if !line.starts_with('-') {
+            return Err(format!(
+                "\"{line}\" is not a flag: each line must start with \"-\"."
+            ));
+        }
+        validate_string_input(line, 256, "Extra rclone flag")?;
+    }
+    Ok(())
+}
+
 fn validate_service_account_json_path(path: &Option<String>) -> Result<(), String> {
     let Some(path) = path else {
         return Ok(());
@@ -753,6 +773,11 @@ pub struct AppPreferences {
     /// Glob patterns passed to rclone as `--exclude`.
     #[serde(default)]
     pub rclone_exclude_patterns: Vec<String>,
+    /// Extra flags appended to every upload command, one per line, for
+    /// tuning that has no setting of its own - `--bind 0.0.0.0` to stay on
+    /// IPv4, `--drive-disable-http2=false`, and the like.
+    #[serde(default)]
+    pub rclone_extra_args: Vec<String>,
     pub destination_presets: Vec<DestinationPreset>,
 }
 
@@ -786,6 +811,7 @@ impl Default for AppPreferences {
             rclone_retries: default_rclone_retries(),
             rclone_bandwidth_limit: String::new(),
             rclone_exclude_patterns: Vec::new(),
+            rclone_extra_args: Vec::new(),
             destination_presets: Vec::new(),
         }
     }
@@ -930,6 +956,7 @@ async fn save_preferences(app: AppHandle, preferences: AppPreferences) -> Result
     validate_rclone_retries(preferences.rclone_retries)?;
     validate_rclone_bandwidth_limit(&preferences.rclone_bandwidth_limit)?;
     validate_rclone_exclude_patterns(&preferences.rclone_exclude_patterns)?;
+    validate_rclone_extra_args(&preferences.rclone_extra_args)?;
     validate_service_account_json_path(&preferences.service_account_folder_path)?;
     validate_destination_presets(&preferences.destination_presets)?;
 

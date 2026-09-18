@@ -25,6 +25,11 @@ export interface AppPreferences {
   rcloneBandwidthLimit: string
   /** Glob patterns passed to rclone as `--exclude`. */
   rcloneExcludePatterns: string[]
+  /**
+   * Extra flags appended to every upload command, one per line, e.g.
+   * `--bind 0.0.0.0` to stay on IPv4.
+   */
+  rcloneExtraArgs: string[]
   destinationPresets: DestinationPreset[]
 }
 
@@ -57,5 +62,6 @@ export const defaultPreferences: AppPreferences = {
   rcloneRetries: 3,
   rcloneBandwidthLimit: '',
   rcloneExcludePatterns: [],
+  rcloneExtraArgs: [],
   destinationPresets: [],
 }
