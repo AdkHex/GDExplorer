@@ -5,6 +5,7 @@ use crate::upload::events::{
 use crate::upload::scheduler::{
     wait_if_paused, JobTallies, QueueItemInput, UploadControlHandle, CANCELED,
 };
+use crate::upload::slow_accounts;
 use crate::upload::speed_record;
 use crate::upload::speed_watch::{SpeedWatch, Transfer, FUTILE_RUN, MAX_RESTART_STREAK};
 use regex::Regex;
@@ -136,10 +137,26 @@ pub async fn run_rclone_job(
     queue_rx: mpsc::UnboundedReceiver<QueueItemInput>,
     tallies: Arc<JobTallies>,
 ) -> Result<(), String> {
-    let sa_files = load_service_account_files(&service_account_folder)?;
+    let mut sa_files = load_service_account_files(&service_account_folder)?;
     if sa_files.is_empty() {
         return Err(
             "No valid service account JSON files found in the selected folder.".to_string(),
+        );
+    }
+    // An account found crawling in the last day starts this job marked, so
+    // it is picked only once every other account has been.
+    let recently_slow = slow_accounts::recently_slow(&app);
+    for account in &mut sa_files {
+        if recently_slow.contains(&account.path) {
+            account.slow_marks = 1;
+        }
+    }
+    if !recently_slow.is_empty() {
+        log::info!(
+            target: "rclone",
+            "sa.pool_loaded accounts={} recently_slow={}",
+            sa_files.len(),
+            recently_slow.len()
         );
     }
 
@@ -332,6 +349,7 @@ async fn run_rclone_for_item(
             Err(err) if err == RESTART => {
                 budget.restarted(&job.watch);
                 mark_slow(&job.sa_pool, &sa_path).await;
+                slow_accounts::note(&job.app, &sa_path);
                 continue;
             }
             other => return other,
@@ -799,6 +817,7 @@ async fn run_rclone_group(
             Err(err) if err == RESTART => {
                 budget.restarted(&job.watch);
                 mark_slow(&job.sa_pool, &sa_path).await;
+                slow_accounts::note(&job.app, &sa_path);
                 aggregator.restarting(part).await;
                 continue;
             }
