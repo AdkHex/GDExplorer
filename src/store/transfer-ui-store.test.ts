@@ -21,6 +21,7 @@ describe('transferUiStore file progress keying', () => {
       _fileSamplesById: {},
       _samplesById: {},
       _reportedSpeedById: {},
+      _activeSinceById: {},
     })
   })
 
@@ -106,7 +107,8 @@ const MIB = 1024 * 1024
  *
  * Returns the speeds and ETAs observed after `settleMs`, so the first moments -
  * where there is legitimately not enough history to measure anything - do not
- * count against the assertions.
+ * count against the assertions. An item gets no ETA in its first minute, so
+ * tests that read ETAs settle for at least that long.
  */
 function runTicks(
   bytesAt: (t: number) => number,
@@ -145,6 +147,7 @@ describe('transferUiStore measures the real rate', () => {
       _fileSamplesById: {},
       _samplesById: {},
       _reportedSpeedById: {},
+      _activeSinceById: {},
     })
   })
   afterEach(() => vi.useRealTimers())
@@ -178,25 +181,68 @@ describe('transferUiStore measures the real rate', () => {
     const chunk = 64 * MIB
     const totalBytes = 200 * chunk
     const bytesAt = (t: number) => Math.floor(t / 2000) * chunk
-    const { etas } = runTicks(bytesAt, { totalBytes })
+    const { etas } = runTicks(bytesAt, {
+      totalBytes,
+      durationMs: 120_000,
+      settleMs: 60_000,
+    })
 
     const truth = (t: number) => (totalBytes - bytesAt(t)) / (chunk / 2)
     etas.forEach((eta, i) => {
-      const t = 20_000 + i * 500
+      const t = 60_000 + i * 500
       expect(eta).not.toBeNull()
       expect(eta ?? 0).toBeGreaterThan(truth(t) * 0.85)
       expect(eta ?? 0).toBeLessThan(truth(t) * 1.2)
     })
   })
 
+  it('holds the ETA back for the first minute instead of extrapolating the opening burst', () => {
+    // What a folder fan-out looks like from the counter: every connection
+    // fills at once, so the first eleven seconds move 929 MiB (708 Mbps),
+    // then the accounts sustain 25 MB/s. Read over a short window and
+    // extrapolated over 52 GiB, that burst was "10 min left" for a job that
+    // needed 35.
+    const totalBytes = 52 * 1024 * MIB
+    const burst = 929 * MIB
+    const burstMs = 11_000
+    const sustained = 25_000_000
+    const bytesAt = (t: number) =>
+      t < burstMs
+        ? Math.floor((t / burstMs) * burst)
+        : burst + Math.floor((t - burstMs) / 1000) * sustained
+    const { speeds, etas } = runTicks(bytesAt, {
+      totalBytes,
+      durationMs: 150_000,
+      settleMs: 0,
+    })
+    const at = (t: number) => t / 500
+
+    // No ETA at all while the burst is the whole history.
+    for (let t = 0; t < 60_000; t += 500) expect(etas[at(t)]).toBeNull()
+    expect(etas[at(60_000)]).not.toBeNull()
+
+    // Once the burst has aged out of the window, rate and ETA are the
+    // sustained truth, not the opening seconds.
+    const truthEta = (t: number) => (totalBytes - bytesAt(t)) / sustained
+    for (let t = 75_000; t <= 150_000; t += 500) {
+      expect(speeds[at(t)]).toBeGreaterThan(sustained * 0.9)
+      expect(speeds[at(t)]).toBeLessThanOrEqual(sustained * 1.05)
+      expect(etas[at(t)] ?? 0).toBeGreaterThan(truthEta(t) * 0.95)
+      expect(etas[at(t)] ?? 0).toBeLessThan(truthEta(t) * 1.1)
+    }
+  })
+
   it('decays to zero and drops the ETA when the transfer stalls', () => {
-    // Moves for 20s, then nothing.
+    // Moves for 20s, then nothing. The rate charges the idle time as it
+    // grows and reads 0 once nothing has moved for a whole window.
     const { speeds, etas } = runTicks(t => Math.min(t, 20_000) * 40_000, {
-      durationMs: 60_000,
+      durationMs: 90_000,
       settleMs: 0,
     })
 
-    expect(speeds[Math.floor(20_000 / 500)]).toBeGreaterThan(0)
+    const at = (t: number) => t / 500
+    expect(speeds[at(20_000)]).toBeGreaterThan(0)
+    expect(speeds[at(50_000)]).toBeLessThan(speeds[at(20_000)] ?? 0)
     expect(speeds[speeds.length - 1]).toBe(0)
     expect(etas[etas.length - 1]).toBeNull()
   })
@@ -236,7 +282,8 @@ describe('transferUiStore measures the real rate', () => {
 
   it('shows rclone reported speed until bytes have settled', () => {
     // Before the first chunk lands there is only one reading, so there is no
-    // measured rate yet. The row shows rclone's own current speed instead of 0.
+    // measured rate yet. The row shows rclone's own current speed instead of
+    // 0 - but no ETA, which waits for a minute of history like any other.
     useTransferUiStore.getState().recordItemSpeed(ITEM, 3_000_000)
 
     vi.setSystemTime(0)
@@ -248,7 +295,7 @@ describe('transferUiStore measures the real rate', () => {
 
     const m = useTransferUiStore.getState().metricsById[ITEM]
     expect(m?.speedBytesPerSec).toBe(3_000_000)
-    expect(m?.etaSeconds).toBeGreaterThan(0)
+    expect(m?.etaSeconds).toBeNull()
   })
 })
 
@@ -265,6 +312,7 @@ describe('transferUiStore measures per-file rates the same way', () => {
       _fileSamplesById: {},
       _samplesById: {},
       _reportedSpeedById: {},
+      _activeSinceById: {},
     })
   })
   afterEach(() => vi.useRealTimers())

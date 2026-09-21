@@ -35,6 +35,7 @@ export function summarizeQueue(
   let sentBytes = 0
   let speedBytesPerSec = 0
   let isActive = false
+  let etaPending = false
 
   for (const item of items) {
     const status = item.status ?? 'queued'
@@ -60,14 +61,26 @@ export function summarizeQueue(
 
     if (state === 'uploading') {
       isActive = true
-      speedBytesPerSec += metrics[item.id]?.speedBytesPerSec ?? 0
+      const itemMetrics = metrics[item.id]
+      speedBytesPerSec += itemMetrics?.speedBytesPerSec ?? 0
+      // An item that is moving but has no ETA yet is still in its first
+      // minute, where its rate is the opening burst (see the transfer UI
+      // store). The roll-up waits with it rather than extrapolating.
+      if (
+        (itemMetrics?.speedBytesPerSec ?? 0) > 0 &&
+        itemMetrics?.etaSeconds === null
+      ) {
+        etaPending = true
+      }
     }
   }
 
   const percent = totalBytes > 0 ? (sentBytes / totalBytes) * 100 : 0
   const remaining = Math.max(0, totalBytes - sentBytes)
   const etaSeconds =
-    isActive && speedBytesPerSec > 0 ? remaining / speedBytesPerSec : null
+    isActive && !etaPending && speedBytesPerSec > 0
+      ? remaining / speedBytesPerSec
+      : null
 
   const state: TransferState = counts.uploading
     ? 'uploading'

@@ -9,11 +9,27 @@ type UploadRuntimeStatus =
   | 'failed'
 
 /**
- * How far back a rate is measured. Long enough to span several of rclone's
- * counter updates, so a genuine change in speed shows up within a few seconds
- * without every individual update swinging the number.
+ * How far back a file's rate is measured. Long enough to span several of
+ * rclone's counter updates, so a genuine change in speed shows up within a few
+ * seconds without every individual update swinging the number.
  */
-const SPEED_WINDOW_MS = 15_000
+const FILE_SPEED_WINDOW_MS = 15_000
+
+/**
+ * How far back an item's rate is measured, and how long an item must have been
+ * running before it gets an ETA.
+ *
+ * A job opens every connection at once, and for its first seconds the counter
+ * runs at whatever the socket buffers and Google's opening acceptance will
+ * take - close to a gigabyte in ten seconds on a folder fan-out - before it
+ * settles to what the accounts sustain. Read over a short window that burst
+ * is the whole rate, and an ETA extrapolates it over the entire job: a 52 GiB
+ * folder once showed 708 Mbps and "10 min left" eleven seconds in. So an item's
+ * rate spans a full minute, and its ETA waits until it has one. The first ETA
+ * still carries a diluted trace of the burst, which ages out over the minute
+ * that follows.
+ */
+const ITEM_SPEED_WINDOW_MS = 60_000
 
 /** Below this much observed history there is nothing honest to report. */
 const MIN_SPEED_SPAN_MS = 1000
@@ -41,7 +57,8 @@ interface Sample {
 function pushSample(
   history: Sample[] | undefined,
   bytes: number,
-  now: number
+  now: number,
+  windowMs: number
 ): Sample[] {
   const previous = history ?? []
   const last = previous[previous.length - 1]
@@ -54,7 +71,7 @@ function pushSample(
     if (bytes === last.bytes) return previous
   }
 
-  const kept = previous.filter(sample => sample.atMs >= now - SPEED_WINDOW_MS)
+  const kept = previous.filter(sample => sample.atMs >= now - windowMs)
   // Always keep one older reading when the window has emptied, so a link slow
   // enough that its updates are further apart than the window still has two
   // points to measure between.
@@ -75,12 +92,16 @@ function pushSample(
  * Both halves of that are one-directional: this can read low while a chunk is
  * still in flight, and can never read higher than the bytes that arrived.
  */
-function measureRate(samples: Sample[] | undefined, now: number): number {
+function measureRate(
+  samples: Sample[] | undefined,
+  now: number,
+  windowMs: number
+): number {
   if (!samples || samples.length < 2) return 0
 
   // Age readings out against `now`, not only when a new one arrives: a stalled
   // transfer stops producing samples altogether.
-  const recent = samples.filter(sample => sample.atMs >= now - SPEED_WINDOW_MS)
+  const recent = samples.filter(sample => sample.atMs >= now - windowMs)
   const window = recent.length >= 2 ? recent : samples.slice(-2)
 
   const first = window[0]
@@ -94,7 +115,7 @@ function measureRate(samples: Sample[] | undefined, now: number): number {
   const typicalGap = span / (window.length - 1)
   // Nothing has arrived for far longer than this transfer's own cadence, so
   // it is stalled rather than part-way through an update. The honest rate is 0.
-  if (now - last.atMs >= Math.max(SPEED_WINDOW_MS, typicalGap * 4)) return 0
+  if (now - last.atMs >= Math.max(windowMs, typicalGap * 4)) return 0
 
   const idle = Math.max(0, now - last.atMs - typicalGap)
   const elapsed = span + idle
@@ -155,6 +176,11 @@ interface TransferUiState {
    * have settled to measure a rate from the counter. See `measureRate`.
    */
   _reportedSpeedById: Record<string, number>
+  /**
+   * When each running item was first seen running, so its ETA can wait out the
+   * opening burst. See `ITEM_SPEED_WINDOW_MS`.
+   */
+  _activeSinceById: Record<string, number>
 
   isPaused: (id: string) => boolean
   setPaused: (id: string, paused: boolean) => void
@@ -193,6 +219,7 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
   _fileSamplesById: {},
   _samplesById: {},
   _reportedSpeedById: {},
+  _activeSinceById: {},
 
   isPaused: id => Boolean(get().pausedById[id]),
 
@@ -271,9 +298,14 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       // `speedAvg`: that counts bytes as they enter the upload buffer, so with
       // large chunks it reports the disk read rate rather than what Drive has
       // accepted. See `measureRate` for how the rate is derived.
-      const samples = pushSample(existingSamples?.[resolvedKey], bytesSent, now)
+      const samples = pushSample(
+        existingSamples?.[resolvedKey],
+        bytesSent,
+        now,
+        FILE_SPEED_WINDOW_MS
+      )
       const complete = totalBytes > 0 && bytesSent >= totalBytes
-      const measured = measureRate(samples, now)
+      const measured = measureRate(samples, now, FILE_SPEED_WINDOW_MS)
       // Until two byte-counter readings have settled there is nothing to
       // measure, so fall back to rclone's own current-speed reading instead of
       // showing 0 B/s for the whole first chunk. Once bytes settle the measured
@@ -424,6 +456,7 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       const nextFileSamples: Record<string, Record<string, Sample[]>> = {}
       const nextSamples: Record<string, Sample[]> = {}
       const nextReported: Record<string, number> = {}
+      const nextActiveSince: Record<string, number> = {}
 
       for (const [id, v] of Object.entries(state.pausedById)) {
         if (remaining.has(id)) nextPaused[id] = v
@@ -452,6 +485,9 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       for (const [id, v] of Object.entries(state._reportedSpeedById)) {
         if (remaining.has(id)) nextReported[id] = v
       }
+      for (const [id, v] of Object.entries(state._activeSinceById)) {
+        if (remaining.has(id)) nextActiveSince[id] = v
+      }
 
       return {
         pausedById: nextPaused,
@@ -463,6 +499,7 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
         _fileSamplesById: nextFileSamples,
         _samplesById: nextSamples,
         _reportedSpeedById: nextReported,
+        _activeSinceById: nextActiveSince,
       }
     }),
 
@@ -472,6 +509,7 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
       let metricsById = state.metricsById
       let samplesById = state._samplesById
       let reportedById = state._reportedSpeedById
+      let activeSinceById = state._activeSinceById
 
       for (const item of items) {
         const id = item.id
@@ -496,16 +534,24 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
         // reading; once bytes settle the measured rate wins because it counts
         // what Drive actually accepted.
         let speed = 0
+        let activeSince: number | null = null
         if (isActive) {
+          activeSince = activeSinceById[id] ?? now
+          if (activeSinceById[id] === undefined) {
+            if (activeSinceById === state._activeSinceById) {
+              activeSinceById = { ...state._activeSinceById }
+            }
+            activeSinceById[id] = activeSince
+          }
           const previous = samplesById[id]
-          const samples = pushSample(previous, sent, now)
+          const samples = pushSample(previous, sent, now, ITEM_SPEED_WINDOW_MS)
           if (samples !== previous) {
             if (samplesById === state._samplesById) {
               samplesById = { ...state._samplesById }
             }
             samplesById[id] = samples
           }
-          const measured = measureRate(samples, now)
+          const measured = measureRate(samples, now, ITEM_SPEED_WINDOW_MS)
           speed =
             measured > 0
               ? measured
@@ -517,10 +563,20 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
           // measures its own rate instead of averaging across the pause.
           samplesById = omitKey(samplesById, id)
           reportedById = omitKey(reportedById, id)
+          activeSinceById = omitKey(activeSinceById, id)
         }
 
+        // No ETA until the item has run for a whole window: before that the
+        // rate is the opening burst, and extrapolating it is what put
+        // "10 min left" on a 52 GiB folder.
+        const settled =
+          activeSince !== null && now - activeSince >= ITEM_SPEED_WINDOW_MS
         const etaSeconds =
-          status === 'done' ? 0 : isActive ? etaFrom(sent, total, speed) : null
+          status === 'done'
+            ? 0
+            : isActive && settled
+              ? etaFrom(sent, total, speed)
+              : null
 
         const prevMetrics = state.metricsById[id]
         const nextMetrics: TransferMetrics = {
@@ -542,6 +598,7 @@ export const useTransferUiStore = create<TransferUiState>((set, get) => ({
         metricsById,
         _samplesById: samplesById,
         _reportedSpeedById: reportedById,
+        _activeSinceById: activeSinceById,
       }
     }),
 }))
