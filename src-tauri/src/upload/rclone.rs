@@ -59,6 +59,9 @@ struct Job {
     sa_tick: Arc<AtomicU64>,
     /// Spots a process crawling on a bad flow or account, see `speed_watch`.
     watch: Arc<SpeedWatch>,
+    /// Items accepted but not finished; a small job has accounts to spare for
+    /// racing them, see `run_on_best_account`.
+    tallies: Arc<JobTallies>,
 }
 
 /// Rations an item's or group's restarts for crawling, so a link that is
@@ -107,6 +110,8 @@ enum StopReason {
     /// The process was crawling and is to be run again on a fresh flow, on
     /// another service account when there is one. See `speed_watch`.
     Restart,
+    /// Another account proved faster for this upload. See `AccountRace`.
+    Lost,
 }
 
 /// Internal sentinel error meaning "this item was paused, run it again once it
@@ -116,6 +121,10 @@ const PAUSE_RESTART: &str = "__gdexplorer_pause_restart__";
 /// Internal sentinel error meaning "this process crawled, run it again". Never
 /// surfaced to the UI.
 const RESTART: &str = "__gdexplorer_restart__";
+
+/// Internal sentinel error meaning "another lane of the race won; nothing to
+/// do". Never surfaced to the UI.
+const LOST: &str = "__gdexplorer_lost__";
 
 /// Keep the failure message useful without letting a pathological log line blow
 /// up the UI tooltip.
@@ -175,6 +184,7 @@ pub async fn run_rclone_job(
         sa_pool: Arc::new(Mutex::new(sa_files)),
         sa_tick: Arc::new(AtomicU64::new(0)),
         watch: Arc::new(watch),
+        tallies: tallies.clone(),
     });
     let rx = Arc::new(Mutex::new(queue_rx));
 
@@ -280,6 +290,10 @@ async fn run_rclone_for_item(
 ) -> Result<(), String> {
     let (app, control, prefs) = (&job.app, &job.control, &job.prefs);
     let files = collect_file_list(item);
+    let total_bytes: u64 = files
+        .as_deref()
+        .map(|list| list.iter().map(|f| f.total_bytes).sum())
+        .unwrap_or(0);
     if let Some(file_list) = &files {
         let _ = app.emit(
             "upload:file_list",
@@ -331,20 +345,17 @@ async fn run_rclone_for_item(
 
         wait_if_paused(control, &item.id).await?;
 
-        let (sa_path, sa_email) = select_service_account(&job.sa_pool, &job.sa_tick).await?;
         let may_restart = budget.starting();
-
-        match run_rclone_command(
+        let (sa_path, result) = run_on_best_account(
             job,
-            &sa_path,
-            sa_email,
             item,
-            &ItemProgress::Direct,
+            ItemProgress::Direct,
             None,
+            total_bytes,
             may_restart,
         )
-        .await
-        {
+        .await?;
+        match result {
             Err(err) if err == PAUSE_RESTART => continue,
             Err(err) if err == RESTART => {
                 budget.restarted(&job.watch);
@@ -357,7 +368,145 @@ async fn run_rclone_for_item(
     }
 }
 
+/// Accounts an upload is started on at once when the job is small enough to
+/// spare them. See `run_on_best_account`.
+const RACE_LANES: usize = 4;
+
+/// How long every lane runs before the one with the most bytes is kept.
+const RACE_TRIAL: Duration = Duration::from_secs(15);
+
+/// A lane this far ahead of every other after `RACE_EARLY_CALL` has won
+/// already; waiting the full trial would only waste the losers' bandwidth.
+const RACE_EARLY_CALL: Duration = Duration::from_secs(8);
+const RACE_DECISIVE_LEAD: u64 = 4;
+
+/// Below this the upload could finish inside the trial, and two lanes
+/// finishing the same file would leave two copies in Drive.
+const RACE_MIN_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// With more items than this in flight the accounts are the scarce resource
+/// and every item gets one; racing only pays when most accounts are idle.
+const RACE_MAX_OUTSTANDING: usize = 2;
+
+/// A lane whose bytes fall this far short of the winner's was crawling, and
+/// its account is marked so it is picked last for a while.
+const RACE_CRAWL_FRACTION: u64 = 4;
+
+#[derive(Default)]
+struct RaceState {
+    bytes: Vec<u64>,
+    winner: Option<usize>,
+    /// The winner announces itself to the UI once, on its first reading
+    /// after the decision.
+    announced: bool,
+}
+
+/// One upload started on several accounts at once. Every lane reports its
+/// byte counter; after the trial the lane with the most bytes wins and the
+/// rest stop themselves on their next reading.
+struct AccountRace {
+    started: Instant,
+    state: std::sync::Mutex<RaceState>,
+}
+
+impl AccountRace {
+    fn new(lanes: usize, now: Instant) -> Self {
+        Self {
+            started: now,
+            state: std::sync::Mutex::new(RaceState {
+                bytes: vec![0; lanes],
+                ..RaceState::default()
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RaceState> {
+        self.state.lock().expect("race poisoned")
+    }
+
+    fn leader(bytes: &[u64]) -> usize {
+        bytes
+            .iter()
+            .enumerate()
+            .max_by_key(|(lane, b)| (**b, std::cmp::Reverse(*lane)))
+            .map(|(lane, _)| lane)
+            .unwrap_or(0)
+    }
+
+    /// Records a lane's byte counter and calls the race once it can be
+    /// called: after the trial, or earlier with a decisive lead.
+    fn report(&self, lane: usize, bytes: u64, now: Instant) {
+        let mut state = self.lock();
+        if state.winner.is_some() {
+            return;
+        }
+        if let Some(slot) = state.bytes.get_mut(lane) {
+            *slot = (*slot).max(bytes);
+        }
+        let elapsed = now.duration_since(self.started);
+        let leader = Self::leader(&state.bytes);
+        let lead = state.bytes[leader];
+        let decisive = elapsed >= RACE_EARLY_CALL
+            && lead > 0
+            && state
+                .bytes
+                .iter()
+                .enumerate()
+                .all(|(l, b)| l == leader || *b * RACE_DECISIVE_LEAD <= lead);
+        if elapsed >= RACE_TRIAL || decisive {
+            state.winner = Some(leader);
+        }
+    }
+
+    /// A lane finished the whole upload: it has won, whatever the clock says,
+    /// and the others must stop before they finish a second copy.
+    fn finished(&self, lane: usize) {
+        let mut state = self.lock();
+        if state.winner.is_none() {
+            state.winner = Some(lane);
+        }
+    }
+
+    fn winner(&self) -> Option<usize> {
+        self.lock().winner
+    }
+
+    fn is_winner(&self, lane: usize) -> bool {
+        self.lock().winner == Some(lane)
+    }
+
+    fn lost(&self, lane: usize) -> bool {
+        self.lock().winner.is_some_and(|w| w != lane)
+    }
+
+    /// Whether this lane's progress reaches the UI: the first lane until the
+    /// race is called, then only the winner. The winner has at least the
+    /// first lane's bytes, so the progress shown never goes backwards.
+    fn may_report(&self, lane: usize) -> bool {
+        match self.lock().winner {
+            None => lane == 0,
+            Some(w) => w == lane,
+        }
+    }
+
+    /// True exactly once, for the winner, after the race is called.
+    fn take_announcement(&self, lane: usize) -> bool {
+        let mut state = self.lock();
+        if state.winner == Some(lane) && !state.announced {
+            state.announced = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn bytes(&self, lane: usize) -> u64 {
+        self.lock().bytes.get(lane).copied().unwrap_or(0)
+    }
+}
+
 /// How one rclone process reports the item-level progress it produces.
+#[derive(Clone)]
 enum ItemProgress {
     /// This process owns the item and emits its status and progress directly.
     Direct,
@@ -610,7 +759,7 @@ async fn plan_folder_fanout(
     item: &QueueItemInput,
     files: Option<&[FileListEntry]>,
     max_fanout: usize,
-) -> Option<Vec<Vec<String>>> {
+) -> Option<Vec<(Vec<String>, u64)>> {
     let files = files?;
     if files.len() < 2 || max_fanout < 2 {
         return None;
@@ -641,7 +790,29 @@ async fn plan_folder_fanout(
     };
 
     match partition_files(root, &kept, max_fanout) {
-        Ok(groups) if groups.len() > 1 => Some(groups),
+        Ok(groups) if groups.len() > 1 => {
+            // Each group's byte total decides whether it is worth racing.
+            let sizes: HashMap<String, u64> = kept
+                .iter()
+                .filter_map(|file| {
+                    relative_path(root, &file.file_path)
+                        .ok()
+                        .map(|relative| (relative, file.total_bytes))
+                })
+                .collect();
+            Some(
+                groups
+                    .into_iter()
+                    .map(|paths| {
+                        let bytes = paths
+                            .iter()
+                            .map(|p| sizes.get(p).copied().unwrap_or(0))
+                            .sum();
+                        (paths, bytes)
+                    })
+                    .collect(),
+            )
+        }
         Ok(_) => None,
         Err(err) => {
             log::warn!(
@@ -695,7 +866,7 @@ async fn create_remote_folder(
 async fn run_folder_fanout(
     job: &Arc<Job>,
     item: &QueueItemInput,
-    groups: Vec<Vec<String>>,
+    groups: Vec<(Vec<String>, u64)>,
 ) -> Result<(), String> {
     let (app, control) = (&job.app, &job.control);
     let group_count = groups.len();
@@ -725,14 +896,15 @@ async fn run_folder_fanout(
     let aggregator = Arc::new(FolderAggregator::new(app.clone(), item.clone()));
 
     let mut tasks = Vec::with_capacity(group_count);
-    for (part, group) in groups.into_iter().enumerate() {
+    for (part, (group, group_bytes)) in groups.into_iter().enumerate() {
         let files_from = write_files_from(&group)?;
         let job = job.clone();
         let item = item.clone();
         let aggregator = aggregator.clone();
 
         tasks.push(tokio::spawn(async move {
-            let result = run_rclone_group(&job, &item, part, &files_from, &aggregator).await;
+            let result =
+                run_rclone_group(&job, &item, part, &files_from, group_bytes, &aggregator).await;
             let _ = std::fs::remove_file(&files_from);
             result
         }));
@@ -787,32 +959,31 @@ async fn run_folder_fanout(
 /// Runs one fan-out group to completion, running it again after a Windows
 /// pause or a restart for crawling the same way the single-process path does.
 async fn run_rclone_group(
-    job: &Job,
+    job: &Arc<Job>,
     item: &QueueItemInput,
     part: usize,
     files_from: &Path,
+    group_bytes: u64,
     aggregator: &Arc<FolderAggregator>,
 ) -> Result<(), String> {
     let mut budget = RestartBudget::new();
     loop {
         wait_if_paused(&job.control, &item.id).await?;
-        let (sa_path, sa_email) = select_service_account(&job.sa_pool, &job.sa_tick).await?;
         let progress = ItemProgress::Fanout {
             aggregator: aggregator.clone(),
             part,
         };
         let may_restart = budget.starting();
-        match run_rclone_command(
+        let (sa_path, result) = run_on_best_account(
             job,
-            &sa_path,
-            sa_email,
             item,
-            &progress,
-            Some(files_from),
+            progress,
+            Some(files_from.to_path_buf()),
+            group_bytes,
             may_restart,
         )
-        .await
-        {
+        .await?;
+        match result {
             Err(err) if err == PAUSE_RESTART => continue,
             Err(err) if err == RESTART => {
                 budget.restarted(&job.watch);
@@ -826,11 +997,144 @@ async fn run_rclone_group(
     }
 }
 
+/// Runs an upload on the account that proves fastest for it.
+///
+/// Google caps every account on its own - about 300 Mbps here - and throttles
+/// a hard-used one to a small fraction of that for hours, so which account a
+/// lone file lands on decides its speed several times over. When the job is
+/// small enough to have accounts to spare, the upload is started on
+/// `RACE_LANES` accounts at once; the lane with the most bytes after the
+/// trial keeps going and the others are stopped. A stopped resumable upload
+/// leaves nothing behind in Drive, so the losers cost only the bandwidth they
+/// used. Returns the account the upload ended up on with its result, so a
+/// crawl can be charged to the right account.
+async fn run_on_best_account(
+    job: &Arc<Job>,
+    item: &QueueItemInput,
+    progress: ItemProgress,
+    files_from: Option<PathBuf>,
+    total_bytes: u64,
+    may_restart: bool,
+) -> Result<(PathBuf, Result<(), String>), String> {
+    let lanes = {
+        let pool = job.sa_pool.lock().await.len();
+        let outstanding = job.tallies.outstanding.load(Ordering::Relaxed);
+        if total_bytes >= RACE_MIN_BYTES && outstanding <= RACE_MAX_OUTSTANDING {
+            RACE_LANES.min(pool)
+        } else {
+            1
+        }
+    };
+
+    if lanes < 2 {
+        let (sa_path, sa_email) = select_service_account(&job.sa_pool, &job.sa_tick).await?;
+        let result = run_rclone_command(
+            job,
+            &sa_path,
+            sa_email,
+            item,
+            &progress,
+            files_from.as_deref(),
+            may_restart,
+            None,
+        )
+        .await;
+        return Ok((sa_path, result));
+    }
+
+    let mut accounts = Vec::with_capacity(lanes);
+    for _ in 0..lanes {
+        accounts.push(select_service_account(&job.sa_pool, &job.sa_tick).await?);
+    }
+    log::info!(
+        target: "rclone",
+        "upload.race id={} lanes={} trial={}s",
+        item.id,
+        lanes,
+        RACE_TRIAL.as_secs()
+    );
+
+    let race = Arc::new(AccountRace::new(lanes, Instant::now()));
+    let mut tasks = Vec::with_capacity(lanes);
+    for (lane, (sa_path, sa_email)) in accounts.iter().cloned().enumerate() {
+        let job = job.clone();
+        let item = item.clone();
+        let progress = progress.clone();
+        let files_from = files_from.clone();
+        let race = race.clone();
+        tasks.push(tokio::spawn(async move {
+            run_rclone_command(
+                &job,
+                &sa_path,
+                sa_email,
+                &item,
+                &progress,
+                files_from.as_deref(),
+                may_restart,
+                Some((race, lane)),
+            )
+            .await
+        }));
+    }
+
+    let mut results = Vec::with_capacity(lanes);
+    for task in tasks {
+        results.push(
+            task.await
+                .unwrap_or_else(|join| Err(format!("upload worker stopped: {join}"))),
+        );
+    }
+    let results = &mut results;
+
+    // The lane that finished, or that the race called, is the one whose
+    // result counts. Every other lane was stopped with `LOST`.
+    let winner = race.winner().or_else(|| {
+        results
+            .iter()
+            .position(|r| r.as_ref().err().map(String::as_str) != Some(LOST))
+    });
+    let Some(winner) = winner else {
+        return Ok((
+            accounts[0].0.clone(),
+            Err("no upload lane produced a result".to_string()),
+        ));
+    };
+
+    let won = race.bytes(winner);
+    for (lane, (sa_path, _)) in accounts.iter().enumerate() {
+        if lane == winner {
+            continue;
+        }
+        let bytes = race.bytes(lane);
+        log::info!(
+            target: "rclone",
+            "upload.race_lost id={} sa={} bytes={bytes} winner_bytes={won}",
+            item.id,
+            sa_path.to_string_lossy()
+        );
+        if bytes * RACE_CRAWL_FRACTION < won {
+            mark_slow(&job.sa_pool, sa_path).await;
+            slow_accounts::note(&job.app, sa_path);
+        }
+    }
+    log::info!(
+        target: "rclone",
+        "upload.race_won id={} sa={} bytes={won}",
+        item.id,
+        accounts[winner].0.to_string_lossy()
+    );
+
+    Ok((accounts[winner].0.clone(), results.swap_remove(winner)))
+}
+
 /// Runs one rclone process for an item or fan-out group.
 ///
 /// With `may_restart`, a process whose transfers crawl next to what the job has
 /// shown it can do (see `speed_watch`) is stopped and `RESTART` is returned,
-/// so the caller runs it again on a fresh flow.
+/// so the caller runs it again on a fresh flow. As a lane of a `race`, the
+/// process reports its bytes to the race, keeps its progress away from the UI
+/// unless it is the lane being shown, and stops itself once another lane has
+/// won.
 #[allow(clippy::too_many_arguments)]
 async fn run_rclone_command(
     job: &Job,
@@ -840,11 +1144,16 @@ async fn run_rclone_command(
     progress: &ItemProgress,
     files_from: Option<&Path>,
     may_restart: bool,
+    race: Option<(Arc<AccountRace>, usize)>,
 ) -> Result<(), String> {
     let (app, control, prefs) = (&job.app, &job.control, &job.prefs);
     if control.is_canceled() {
         return Err(CANCELED.to_string());
     }
+    let shown = |race: &Option<(Arc<AccountRace>, usize)>| {
+        race.as_ref()
+            .is_none_or(|(race, lane)| race.may_report(*lane))
+    };
 
     log::debug!(
         target: "rclone",
@@ -852,7 +1161,7 @@ async fn run_rclone_command(
         item.id,
         sa_path.to_string_lossy()
     );
-    if let ItemProgress::Direct = progress {
+    if matches!(progress, ItemProgress::Direct) && shown(&race) {
         let _ = app.emit(
             "upload:item_status",
             ItemStatusEvent {
@@ -952,7 +1261,9 @@ async fn run_rclone_command(
                         };
                         if should_emit {
                             last_file_progress.insert(file_path.clone(), (*bytes, *total, *speed));
-                            emit_file_progress(app, item, file_path, *bytes, *total, *speed).await;
+                            if shown(&race) {
+                                emit_file_progress(app, item, file_path, *bytes, *total, *speed).await;
+                            }
                         }
                     }
 
@@ -967,10 +1278,10 @@ async fn run_rclone_command(
                             size: *size,
                         })
                         .collect();
-                    if may_restart
-                        && stop_reason == StopReason::None
-                        && job.watch.observe(stream, &transfers, Instant::now())
-                    {
+                    let crawling = job.watch.observe(stream, &transfers, Instant::now());
+                    let may_restart_now = may_restart
+                        && race.as_ref().is_none_or(|(race, lane)| race.is_winner(*lane));
+                    if may_restart_now && stop_reason == StopReason::None && crawling {
                         log::info!(
                             target: "rclone",
                             "upload.restart_for_crawling id={} pid={} sa={}",
@@ -991,11 +1302,44 @@ async fn run_rclone_command(
                 .or_else(|| {
                     parse_progress_line(&progress_re, &line).map(|(b, t)| (b, t, None))
                 }) {
+                    if let Some((race, lane)) = &race {
+                        race.report(*lane, bytes, Instant::now());
+                        if race.lost(*lane) && stop_reason == StopReason::None {
+                            log::info!(
+                                target: "rclone",
+                                "upload.race_stop id={} pid={} sa={} bytes={bytes}",
+                                item.id,
+                                pid,
+                                sa_path.to_string_lossy()
+                            );
+                            stop_reason = StopReason::Lost;
+                            stopped = true;
+                            stop_child(&mut child, pid, item, stop_reason).await;
+                        } else if race.take_announcement(*lane) {
+                            // The winner takes over the row from the first
+                            // lane, account and all.
+                            if let ItemProgress::Direct = progress {
+                                let _ = app.emit(
+                                    "upload:item_status",
+                                    ItemStatusEvent {
+                                        item_id: item.id.clone(),
+                                        path: item.path.clone(),
+                                        kind: item.kind.clone(),
+                                        status: "uploading".to_string(),
+                                        message: None,
+                                        sa_email: sa_email.clone(),
+                                    },
+                                );
+                            }
+                        }
+                    }
                     if bytes != last_bytes || total != last_total || speed != last_speed {
                         last_bytes = bytes;
                         last_total = total;
                         last_speed = speed;
-                        progress.report(app, item, bytes, total, speed).await;
+                        if shown(&race) {
+                            progress.report(app, item, bytes, total, speed).await;
+                        }
                     }
                 }
             }
@@ -1038,6 +1382,9 @@ async fn run_rclone_command(
     if stop_reason == StopReason::Restart {
         return Err(RESTART.to_string());
     }
+    if stop_reason == StopReason::Lost {
+        return Err(LOST.to_string());
+    }
 
     if status.success() {
         log::info!(
@@ -1045,6 +1392,11 @@ async fn run_rclone_command(
             "upload.done id={} status=ok",
             item.id
         );
+        if let Some((race, lane)) = &race {
+            // Finishing settles the race whatever the clock says; the other
+            // lanes stop before they can finish a second copy.
+            race.finished(*lane);
+        }
         if let ItemProgress::Direct = progress {
             let _ = app.emit(
                 "upload:item_status",
@@ -2654,6 +3006,63 @@ mod tests {
             exclude_patterns: exclude_patterns.iter().map(|p| p.to_string()).collect(),
             extra_args: Vec::new(),
         }
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn the_race_keeps_the_lane_with_the_most_bytes_after_the_trial() {
+        let start = Instant::now();
+        let race = AccountRace::new(3, start);
+        // Before the call only the first lane is shown, whatever it does.
+        assert!(race.may_report(0));
+        assert!(!race.may_report(2));
+        for sec in 1..RACE_TRIAL.as_secs() {
+            let t = start + Duration::from_secs(sec);
+            race.report(0, sec * 3 * MIB, t);
+            race.report(1, sec * 2 * MIB, t);
+            race.report(2, sec * 30 * MIB, t);
+            // Lane 2 leads by 10x from the start, but only after the early
+            // call point is that decisive.
+            if sec < RACE_EARLY_CALL.as_secs() {
+                assert_eq!(race.winner(), None, "no call before {sec}s");
+            }
+        }
+        assert_eq!(race.winner(), Some(2));
+        assert!(race.lost(0) && race.lost(1) && !race.lost(2));
+        assert!(race.may_report(2) && !race.may_report(0));
+        assert!(race.take_announcement(2));
+        assert!(!race.take_announcement(2), "announced once");
+        assert!(!race.take_announcement(0));
+    }
+
+    #[test]
+    fn a_close_race_is_only_called_at_the_end_of_the_trial() {
+        let start = Instant::now();
+        let race = AccountRace::new(2, start);
+        for sec in 1..=RACE_TRIAL.as_secs() {
+            let t = start + Duration::from_secs(sec);
+            race.report(0, sec * 30 * MIB, t);
+            race.report(1, sec * 20 * MIB, t);
+            if sec < RACE_TRIAL.as_secs() {
+                assert_eq!(race.winner(), None, "no decisive lead at {sec}s");
+            }
+        }
+        assert_eq!(race.winner(), Some(0));
+    }
+
+    #[test]
+    fn a_lane_that_finishes_wins_at_once() {
+        let start = Instant::now();
+        let race = AccountRace::new(2, start);
+        race.report(0, 10 * MIB, start + Duration::from_secs(1));
+        race.report(1, 40 * MIB, start + Duration::from_secs(1));
+        race.finished(0);
+        assert_eq!(race.winner(), Some(0));
+        assert!(race.lost(1));
+        // A later reading cannot reopen the race.
+        race.report(1, 400 * MIB, start + Duration::from_secs(30));
+        assert_eq!(race.winner(), Some(0));
     }
 
     #[test]
