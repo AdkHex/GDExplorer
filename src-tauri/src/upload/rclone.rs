@@ -62,6 +62,10 @@ struct Job {
     /// Items accepted but not finished; a small job has accounts to spare for
     /// racing them, see `run_on_best_account`.
     tallies: Arc<JobTallies>,
+    /// Held while an item's Drive folder is found or created, so two items of
+    /// the same name bound for the same destination cannot both find nothing
+    /// and create one each. See `item_root_folder`.
+    folder_lock: Mutex<()>,
 }
 
 /// Rations an item's or group's restarts for crawling, so a link that is
@@ -185,6 +189,7 @@ pub async fn run_rclone_job(
         sa_tick: Arc::new(AtomicU64::new(0)),
         watch: Arc::new(watch),
         tallies: tallies.clone(),
+        folder_lock: Mutex::new(()),
     });
     let rx = Arc::new(Mutex::new(queue_rx));
 
@@ -314,10 +319,29 @@ async fn run_rclone_for_item(
         }
     }
 
+    // Each file's path below the Drive folder the item goes into; a file item
+    // lands in its destination directly, under its own name.
+    let relative: Vec<String> = match files.as_deref() {
+        Some(list) if item.kind == "folder" => list
+            .iter()
+            .map(|file| relative_path(Path::new(&item.path), &file.file_path))
+            .collect::<Result<_, _>>()
+            .unwrap_or_default(),
+        Some(list) => list
+            .iter()
+            .filter_map(|file| Path::new(&file.file_path).file_name())
+            .map(|name| name.to_string_lossy().to_string())
+            .collect(),
+        None => Vec::new(),
+    };
+    let raceable = raceable(&relative, total_bytes);
+
     // On Windows a pause stops the child process, so the item has to be run
     // again when it resumes. rclone skips whatever already reached Drive, so
     // re-running is safe. The same goes for a process restarted for crawling.
-    // On Unix without a restart the loop runs exactly once.
+    // On Unix without a restart the loop runs exactly once. Every run goes
+    // into the same Drive folder, found or created on the first.
+    let root_folder = tokio::sync::OnceCell::new();
     let mut budget = RestartBudget::new();
     loop {
         let should_pause =
@@ -344,14 +368,18 @@ async fn run_rclone_for_item(
         );
 
         wait_if_paused(control, &item.id).await?;
+        let root_id = root_folder
+            .get_or_try_init(|| item_root_folder(job, item))
+            .await?;
 
         let may_restart = budget.starting();
         let (sa_path, result) = run_on_best_account(
             job,
             item,
             ItemProgress::Direct,
+            root_id,
             None,
-            total_bytes,
+            raceable,
             may_restart,
         )
         .await?;
@@ -391,6 +419,18 @@ const RACE_MAX_OUTSTANDING: usize = 2;
 /// A lane whose bytes fall this far short of the winner's was crawling, and
 /// its account is marked so it is picked last for a while.
 const RACE_CRAWL_FRACTION: u64 = 4;
+
+/// Whether an upload may be raced (see `run_on_best_account`): it is one big
+/// file, and `relative` - each file's path below the Drive folder the upload
+/// goes into - puts that file directly in the folder.
+///
+/// Every lane is a whole rclone process writing into the same folder. A file a
+/// lane finishes stays in Drive whichever lane wins, and rclone creates any
+/// subfolder it cannot find, so a second file or a subfolder would land once
+/// per lane.
+fn raceable(relative: &[String], total_bytes: u64) -> bool {
+    total_bytes >= RACE_MIN_BYTES && matches!(relative, [only] if !only.contains('/'))
+}
 
 #[derive(Default)]
 struct RaceState {
@@ -825,12 +865,61 @@ async fn plan_folder_fanout(
     }
 }
 
-/// Creates the item's folder in Drive before any fan-out group starts.
+/// The Drive folder every rclone process of an item uploads into, by ID: the
+/// destination itself for a file, the item's own folder inside it for a
+/// folder.
 ///
 /// Drive allows two folders of the same name side by side, and rclone creates
-/// a folder it cannot list. Groups starting at the same instant each listed,
-/// saw nothing and created their own - which is where the duplicate folders
-/// came from. Created once up front, every group finds it.
+/// a folder it cannot find by name. Processes that looked the item's folder up
+/// at the same moment - the lanes of an account race, the groups of a
+/// fan-out - each saw nothing and created their own, so one upload left four
+/// `500 Miles (2026)` folders, three of them empty. The folder is found or
+/// created here once, and every process, rerun and lane is handed its ID as
+/// the root, so none of them ever looks it up by name.
+async fn item_root_folder(job: &Job, item: &QueueItemInput) -> Result<String, String> {
+    if item.kind != "folder" {
+        return Ok(item.destination_folder_id.clone());
+    }
+    let name = item_folder_name(item);
+    let _serial = job.folder_lock.lock().await;
+    let (sa_path, _) = select_service_account(&job.sa_pool, &job.sa_tick).await?;
+    let find = || find_child_folder(&job.prefs, &sa_path, &item.destination_folder_id, name);
+
+    if let Some(id) = find().await? {
+        log::info!(target: "rclone", "upload.folder id={} existing={id}", item.id);
+        return Ok(id);
+    }
+    create_remote_folder(job, item, &sa_path).await?;
+    // Drive can take a moment to list a folder it has just created.
+    for delay in [0, 1, 2, 4] {
+        tokio::time::sleep(Duration::from_secs(delay)).await;
+        if let Some(id) = find().await? {
+            log::info!(target: "rclone", "upload.folder id={} created={id}", item.id);
+            return Ok(id);
+        }
+    }
+    Err(format!(
+        "Created the folder \"{name}\" in Drive but could not find it again. Start the upload again; it will reuse that folder."
+    ))
+}
+
+/// The ID of the folder called `name` directly inside `parent_id`. When Drive
+/// already holds several, the first listed is as good as any.
+async fn find_child_folder(
+    prefs: &RclonePreferences,
+    sa_path: &Path,
+    parent_id: &str,
+    name: &str,
+) -> Result<Option<String>, String> {
+    Ok(run_lsjson(prefs, sa_path, parent_id, LsMode::TopLevelDirs)
+        .await?
+        .into_iter()
+        .find(|entry| entry.is_dir && entry.name == name)
+        .and_then(|entry| entry.id))
+}
+
+/// Creates the item's folder in Drive. Only `item_root_folder` calls this,
+/// once per item, after finding no folder of that name.
 async fn create_remote_folder(
     job: &Job,
     item: &QueueItemInput,
@@ -838,7 +927,7 @@ async fn create_remote_folder(
 ) -> Result<(), String> {
     let args = vec![
         "mkdir".to_string(),
-        remote_target(&job.prefs, item),
+        format!("{}:{}", job.prefs.remote_name, item_folder_name(item)),
         "--drive-root-folder-id".to_string(),
         item.destination_folder_id.clone(),
         "--drive-service-account-file".to_string(),
@@ -890,21 +979,30 @@ async fn run_folder_fanout(
     );
 
     wait_if_paused(control, &item.id).await?;
-    let (sa_path, _) = select_service_account(&job.sa_pool, &job.sa_tick).await?;
-    create_remote_folder(job, item, &sa_path).await?;
+    let root_id = item_root_folder(job, item).await?;
 
     let aggregator = Arc::new(FolderAggregator::new(app.clone(), item.clone()));
 
     let mut tasks = Vec::with_capacity(group_count);
     for (part, (group, group_bytes)) in groups.into_iter().enumerate() {
+        let raceable = raceable(&group, group_bytes);
         let files_from = write_files_from(&group)?;
         let job = job.clone();
         let item = item.clone();
+        let root_id = root_id.clone();
         let aggregator = aggregator.clone();
 
         tasks.push(tokio::spawn(async move {
-            let result =
-                run_rclone_group(&job, &item, part, &files_from, group_bytes, &aggregator).await;
+            let result = run_rclone_group(
+                &job,
+                &item,
+                part,
+                &root_id,
+                &files_from,
+                raceable,
+                &aggregator,
+            )
+            .await;
             let _ = std::fs::remove_file(&files_from);
             result
         }));
@@ -962,8 +1060,9 @@ async fn run_rclone_group(
     job: &Arc<Job>,
     item: &QueueItemInput,
     part: usize,
+    root_id: &str,
     files_from: &Path,
-    group_bytes: u64,
+    raceable: bool,
     aggregator: &Arc<FolderAggregator>,
 ) -> Result<(), String> {
     let mut budget = RestartBudget::new();
@@ -978,8 +1077,9 @@ async fn run_rclone_group(
             job,
             item,
             progress,
+            root_id,
             Some(files_from.to_path_buf()),
-            group_bytes,
+            raceable,
             may_restart,
         )
         .await?;
@@ -1002,24 +1102,26 @@ async fn run_rclone_group(
 /// Google caps every account on its own - about 300 Mbps here - and throttles
 /// a hard-used one to a small fraction of that for hours, so which account a
 /// lone file lands on decides its speed several times over. When the job is
-/// small enough to have accounts to spare, the upload is started on
-/// `RACE_LANES` accounts at once; the lane with the most bytes after the
-/// trial keeps going and the others are stopped. A stopped resumable upload
-/// leaves nothing behind in Drive, so the losers cost only the bandwidth they
-/// used. Returns the account the upload ended up on with its result, so a
-/// crawl can be charged to the right account.
+/// small enough to have accounts to spare and the upload is `raceable`, it is
+/// started on `RACE_LANES` accounts at once; the lane with the most bytes
+/// after the trial keeps going and the others are stopped. A stopped resumable
+/// upload leaves nothing behind in Drive, and every lane writes into the one
+/// folder `root_id` names, so the losers cost only the bandwidth they used.
+/// Returns the account the upload ended up on with its result, so a crawl can
+/// be charged to the right account.
 async fn run_on_best_account(
     job: &Arc<Job>,
     item: &QueueItemInput,
     progress: ItemProgress,
+    root_id: &str,
     files_from: Option<PathBuf>,
-    total_bytes: u64,
+    raceable: bool,
     may_restart: bool,
 ) -> Result<(PathBuf, Result<(), String>), String> {
     let lanes = {
         let pool = job.sa_pool.lock().await.len();
         let outstanding = job.tallies.outstanding.load(Ordering::Relaxed);
-        if total_bytes >= RACE_MIN_BYTES && outstanding <= RACE_MAX_OUTSTANDING {
+        if raceable && outstanding <= RACE_MAX_OUTSTANDING {
             RACE_LANES.min(pool)
         } else {
             1
@@ -1034,6 +1136,7 @@ async fn run_on_best_account(
             sa_email,
             item,
             &progress,
+            root_id,
             files_from.as_deref(),
             may_restart,
             None,
@@ -1060,6 +1163,7 @@ async fn run_on_best_account(
         let job = job.clone();
         let item = item.clone();
         let progress = progress.clone();
+        let root_id = root_id.to_string();
         let files_from = files_from.clone();
         let race = race.clone();
         tasks.push(tokio::spawn(async move {
@@ -1069,6 +1173,7 @@ async fn run_on_best_account(
                 sa_email,
                 &item,
                 &progress,
+                &root_id,
                 files_from.as_deref(),
                 may_restart,
                 Some((race, lane)),
@@ -1142,6 +1247,7 @@ async fn run_rclone_command(
     sa_email: Option<String>,
     item: &QueueItemInput,
     progress: &ItemProgress,
+    root_id: &str,
     files_from: Option<&Path>,
     may_restart: bool,
     race: Option<(Arc<AccountRace>, usize)>,
@@ -1175,7 +1281,7 @@ async fn run_rclone_command(
         );
     }
 
-    let args = build_rclone_args(prefs, item, sa_path, files_from);
+    let args = build_rclone_args(prefs, item, root_id, sa_path, files_from);
 
     let mut command = build_rclone_command(&prefs.rclone_path, &args);
 
@@ -2330,32 +2436,30 @@ fn exclude_args(prefs: &RclonePreferences) -> Vec<String> {
         .collect()
 }
 
-/// Where an item lands: a folder under its own name inside the destination, a
-/// file directly in it.
-fn remote_target(prefs: &RclonePreferences, item: &QueueItemInput) -> String {
-    let folder = if item.kind == "folder" {
-        Path::new(&item.path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("folder")
-    } else {
-        ""
-    };
-    format!("{}:{}", prefs.remote_name, folder)
+/// The name a folder item's own folder gets inside the destination.
+fn item_folder_name(item: &QueueItemInput) -> &str {
+    Path::new(&item.path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("folder")
 }
 
+/// The upload command. It copies into the root of the remote, and the root is
+/// `root_id` - the folder `item_root_folder` settled on - so rclone never has
+/// to find the item's folder by name, and cannot create a second one.
 fn build_rclone_args(
     prefs: &RclonePreferences,
     item: &QueueItemInput,
+    root_id: &str,
     sa_path: &Path,
     files_from: Option<&Path>,
 ) -> Vec<String> {
     let mut args = vec![
         "copy".to_string(),
         item.path.clone(),
-        remote_target(prefs, item),
+        format!("{}:", prefs.remote_name),
         "--drive-root-folder-id".to_string(),
-        item.destination_folder_id.clone(),
+        root_id.to_string(),
         // Kept deliberately close to rclone's own defaults.
         //
         // A previous round of "tuning" added --drive-upload-cutoff, an
@@ -3092,7 +3196,13 @@ mod tests {
             "--bind 0.0.0.0".to_string(),
             "  --drive-disable-http2=false ".to_string(),
         ];
-        let args = build_rclone_args(&prefs, &test_item(), Path::new("/sa/one.json"), None);
+        let args = build_rclone_args(
+            &prefs,
+            &test_item(),
+            "ROOT",
+            Path::new("/sa/one.json"),
+            None,
+        );
         let tail: Vec<&str> = args.iter().rev().take(3).map(String::as_str).collect();
         assert_eq!(
             tail,
@@ -3115,6 +3225,7 @@ mod tests {
         let args = build_rclone_args(
             &test_prefs(&[".DS_Store", " ", "**/node_modules/**"]),
             &test_item(),
+            "ROOT",
             Path::new("/sa/one.json"),
             None,
         );
@@ -3134,6 +3245,7 @@ mod tests {
         let args = build_rclone_args(
             &test_prefs(&[".DS_Store"]),
             &test_item(),
+            "ROOT",
             Path::new("/sa/one.json"),
             Some(Path::new("/tmp/list.txt")),
         );
@@ -3143,5 +3255,49 @@ mod tests {
             .expect("file list flag present");
         assert_eq!(args[position + 1], "/tmp/list.txt");
         assert!(!args.iter().any(|arg| arg == "--exclude"));
+    }
+
+    #[test]
+    fn every_process_copies_into_the_resolved_folder_by_id() {
+        // The item's folder is never named on the command line, so no process
+        // can look it up, miss it and create a second one.
+        let args = build_rclone_args(
+            &test_prefs(&[]),
+            &test_item(),
+            "ITEM_FOLDER_ID",
+            Path::new("/sa/one.json"),
+            None,
+        );
+        assert_eq!(args[..3], ["copy", "/movies/Flyboys (2006)", "gdrive:"]);
+        let root = args
+            .iter()
+            .position(|arg| arg == "--drive-root-folder-id")
+            .expect("root folder flag present");
+        assert_eq!(args[root + 1], "ITEM_FOLDER_ID");
+        assert_eq!(
+            args.iter().filter(|arg| arg.contains("Flyboys")).count(),
+            1,
+            "only the local source path names the folder"
+        );
+    }
+
+    #[test]
+    fn only_one_big_file_directly_in_the_folder_is_raced() {
+        let big = RACE_MIN_BYTES;
+        let paths = |list: &[&str]| list.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        assert!(raceable(&paths(&["movie.mkv"]), big));
+        assert!(
+            !raceable(&paths(&["movie.mkv"]), big - 1),
+            "too small to race"
+        );
+        assert!(
+            !raceable(&paths(&["movie.mkv", "movie.srt"]), big),
+            "every lane would finish the small file"
+        );
+        assert!(
+            !raceable(&paths(&["Extras/movie.mkv"]), big),
+            "every lane would create the subfolder"
+        );
+        assert!(!raceable(&[], big), "an unknown file list is not raced");
     }
 }
