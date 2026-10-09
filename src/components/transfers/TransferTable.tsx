@@ -100,6 +100,9 @@ import {
 const GRID_COLUMNS =
   'grid grid-cols-[28px_minmax(140px,2fr)_96px_minmax(110px,1.2fr)_88px_64px_76px_60px_52px] items-center gap-x-2.5 px-3'
 
+/** Status of an upload held until the machine has memory free for it. */
+const WAITING_FOR_MEMORY = 'Waiting for memory'
+
 function getPathName(path: string): string {
   const normalized = path.replace(/[/\\]+$/g, '')
   const parts = normalized.split(/[/\\]/)
@@ -338,9 +341,13 @@ export function TransferTable({
       const progressPct =
         progressState === 'completed' ? 100 : Math.min(99.9, rawPct)
 
+      // The backend gives a preparing item a message only when it is holding
+      // the upload until there is memory for it (src-tauri upload/memory.rs).
       const statusLabel =
         runtime === 'preparing' && progressState === 'uploading'
-          ? 'Preparing'
+          ? item.message
+            ? WAITING_FOR_MEMORY
+            : 'Preparing'
           : TRANSFER_STATUS[progressState].label
 
       // A paused transfer has no meaningful rate, so both columns read as "no
@@ -1654,6 +1661,7 @@ function RemoveButton({
 
 function StatusCell({ item }: { item: TransferRowData }) {
   const status = TRANSFER_STATUS[item.progressState]
+  const waitingForMemory = item.statusLabel === WAITING_FOR_MEMORY
   // Status is conveyed by icon plus text, not colour alone, so it stays
   // readable for colour-blind users and in increased-contrast mode.
   const content = (
@@ -1661,16 +1669,18 @@ function StatusCell({ item }: { item: TransferRowData }) {
       <status.Icon
         className={cn(
           'size-3.5 shrink-0',
-          item.statusLabel === 'Preparing' && 'animate-pulse'
+          (item.statusLabel === 'Preparing' || waitingForMemory) &&
+            'animate-pulse'
         )}
       />
       <span className="truncate">{item.statusLabel}</span>
     </span>
   )
 
+  // A failure's message is its error; a held upload's says what it waits for.
   return (
     <div className={cn('flex items-center text-xs', status.text)}>
-      {item.progressState === 'failed' && item.error ? (
+      {(item.progressState === 'failed' || waitingForMemory) && item.error ? (
         <Tooltip>
           <TooltipTrigger asChild>{content}</TooltipTrigger>
           <TooltipContent side="top" align="start">

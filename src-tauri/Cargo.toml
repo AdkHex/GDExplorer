@@ -44,6 +44,15 @@ socket2 = "0.5"
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"
 
+# Reads the machine's physical memory, which caps what a job's rclone
+# processes may reserve. See `upload::memory`.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+
+[dev-dependencies]
+# Lets the memory tests move the clock instead of sleeping through holds.
+tokio = { version = "1", features = ["test-util"] }
+
 # Optimize for smaller binary size in release builds
 [profile.release]
 codegen-units = 1        # Better LLVM optimization (slower build, smaller binary)

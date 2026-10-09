@@ -2,6 +2,7 @@ use crate::upload::events::{
     CompletedEvent, FileListEntry, FileListEvent, FileProgressEvent, ItemStatusEvent,
     ProgressEvent, Summary,
 };
+use crate::upload::memory::{self, MemoryBudget};
 use crate::upload::scheduler::{
     wait_if_paused, JobTallies, QueueItemInput, UploadControlHandle, CANCELED,
 };
@@ -66,6 +67,50 @@ struct Job {
     /// the same name bound for the same destination cannot both find nothing
     /// and create one each. See `item_root_folder`.
     folder_lock: Mutex<()>,
+    /// What every upload process reserves before it starts, see `memory`.
+    memory: &'static MemoryBudget,
+    running: RunningProcesses,
+}
+
+/// How many rclone processes each item has running, so an item says it is
+/// waiting for memory only while none of its processes is uploading.
+#[derive(Default)]
+struct RunningProcesses(std::sync::Mutex<HashMap<String, usize>>);
+
+impl RunningProcesses {
+    fn counts(&self) -> std::sync::MutexGuard<'_, HashMap<String, usize>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn idle(&self, item_id: &str) -> bool {
+        !self.counts().contains_key(item_id)
+    }
+
+    /// Counts a process of `item_id` as running until the guard is dropped.
+    fn start(&self, item_id: &str) -> RunningProcess<'_> {
+        *self.counts().entry(item_id.to_string()).or_default() += 1;
+        RunningProcess {
+            running: self,
+            item_id: item_id.to_string(),
+        }
+    }
+}
+
+struct RunningProcess<'a> {
+    running: &'a RunningProcesses,
+    item_id: String,
+}
+
+impl Drop for RunningProcess<'_> {
+    fn drop(&mut self) {
+        let mut counts = self.running.counts();
+        if let Some(count) = counts.get_mut(&self.item_id) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.item_id);
+            }
+        }
+    }
 }
 
 /// Rations an item's or group's restarts for crawling, so a link that is
@@ -130,6 +175,21 @@ const RESTART: &str = "__gdexplorer_restart__";
 /// do". Never surfaced to the UI.
 const LOST: &str = "__gdexplorer_lost__";
 
+/// Internal prefix meaning "rclone itself crashed - most often out of memory -
+/// run it again". The failure message follows it, for when the reruns run out.
+/// See `after_crash`.
+const CRASHED: &str = "__gdexplorer_crashed__";
+
+/// How many times an item or fan-out group is run again after rclone crashed,
+/// before the crash is reported as its failure. A crash used to fail the item
+/// and every other upload running beside it, and each had to be started again
+/// by hand.
+const MAX_CRASH_RERUNS: u32 = 5;
+
+/// How long a crashed process waits before running again, so whatever ran the
+/// machine out of memory has a moment to give it back.
+const CRASH_RERUN_DELAY: Duration = Duration::from_secs(10);
+
 /// Keep the failure message useful without letting a pathological log line blow
 /// up the UI tooltip.
 const MAX_ERROR_DETAIL: usize = 600;
@@ -174,9 +234,11 @@ pub async fn run_rclone_job(
     }
 
     let concurrency = max_concurrent.clamp(1, 10) as usize;
-    log::debug!(
+    let memory = memory::machine_budget();
+    log::info!(
         target: "rclone",
-        "queue.worker_pool_started concurrency={concurrency}"
+        "queue.worker_pool_started concurrency={concurrency} memory_budget_mib={}",
+        memory.total_mib()
     );
 
     let watch = SpeedWatch::new();
@@ -190,6 +252,8 @@ pub async fn run_rclone_job(
         watch: Arc::new(watch),
         tallies: tallies.clone(),
         folder_lock: Mutex::new(()),
+        memory,
+        running: RunningProcesses::default(),
     });
     let rx = Arc::new(Mutex::new(queue_rx));
 
@@ -343,6 +407,7 @@ async fn run_rclone_for_item(
     // into the same Drive folder, found or created on the first.
     let root_folder = tokio::sync::OnceCell::new();
     let mut budget = RestartBudget::new();
+    let mut crash_reruns = 0;
     loop {
         let should_pause =
             *control.pause_rx.borrow() || control.paused_items_rx.borrow().contains(&item.id);
@@ -391,9 +456,34 @@ async fn run_rclone_for_item(
                 slow_accounts::note(&job.app, &sa_path);
                 continue;
             }
+            Err(err) if err.starts_with(CRASHED) => {
+                let failure = &err[CRASHED.len()..];
+                if !rerun_after_crash(item, failure, &mut crash_reruns).await {
+                    return Err(failure.to_string());
+                }
+            }
             other => return other,
         }
     }
+}
+
+/// Whether a run that rclone crashed out of goes again: yes, after
+/// `CRASH_RERUN_DELAY`, while `reruns` has not reached `MAX_CRASH_RERUNS`. A
+/// rerun skips every file already in Drive, and is admitted for memory like
+/// any other start, so it waits rather than crashing again into the same
+/// shortage.
+async fn rerun_after_crash(item: &QueueItemInput, failure: &str, reruns: &mut u32) -> bool {
+    if *reruns >= MAX_CRASH_RERUNS {
+        return false;
+    }
+    *reruns += 1;
+    log::warn!(
+        target: "rclone",
+        "upload.crash_rerun id={} rerun={reruns}/{MAX_CRASH_RERUNS} detail={failure}",
+        item.id
+    );
+    tokio::time::sleep(CRASH_RERUN_DELAY).await;
+    true
 }
 
 /// Accounts an upload is started on at once when the job is small enough to
@@ -876,12 +966,46 @@ async fn plan_folder_fanout(
 /// `500 Miles (2026)` folders, three of them empty. The folder is found or
 /// created here once, and every process, rerun and lane is handed its ID as
 /// the root, so none of them ever looks it up by name.
+///
+/// One rclone run that crashes or loses its connection here used to fail the
+/// item before a byte was sent, so a failed attempt is tried again on the next
+/// account. Every attempt looks before it creates, so a folder an earlier
+/// attempt did make is found, not made twice.
 async fn item_root_folder(job: &Job, item: &QueueItemInput) -> Result<String, String> {
     if item.kind != "folder" {
         return Ok(item.destination_folder_id.clone());
     }
-    let name = item_folder_name(item);
     let _serial = job.folder_lock.lock().await;
+    let mut failure = String::new();
+    for delay in [0, 3, 10] {
+        tokio::time::sleep(Duration::from_secs(delay)).await;
+        // A listing or a mkdir is small, but dies like any rclone when the
+        // machine is out of memory.
+        let admitted = job
+            .memory
+            .admit(
+                memory::SMALL_PROCESS_MIB,
+                || job.control.is_canceled(),
+                |hold| emit_hold(&job.app, item, hold),
+            )
+            .await;
+        let Some(_memory) = admitted else {
+            return Err(CANCELED.to_string());
+        };
+        match find_or_create_item_folder(job, item).await {
+            Ok(id) => return Ok(id),
+            Err(err) => {
+                log::warn!(target: "rclone", "upload.folder_failed id={} err={err}", item.id);
+                failure = err;
+            }
+        }
+    }
+    Err(failure)
+}
+
+/// One attempt of `item_root_folder`, on one service account.
+async fn find_or_create_item_folder(job: &Job, item: &QueueItemInput) -> Result<String, String> {
+    let name = item_folder_name(item);
     let (sa_path, _) = select_service_account(&job.sa_pool, &job.sa_tick).await?;
     let find = || find_child_folder(&job.prefs, &sa_path, &item.destination_folder_id, name);
 
@@ -1066,6 +1190,7 @@ async fn run_rclone_group(
     aggregator: &Arc<FolderAggregator>,
 ) -> Result<(), String> {
     let mut budget = RestartBudget::new();
+    let mut crash_reruns = 0;
     loop {
         wait_if_paused(&job.control, &item.id).await?;
         let progress = ItemProgress::Fanout {
@@ -1091,6 +1216,13 @@ async fn run_rclone_group(
                 slow_accounts::note(&job.app, &sa_path);
                 aggregator.restarting(part).await;
                 continue;
+            }
+            Err(err) if err.starts_with(CRASHED) => {
+                let failure = &err[CRASHED.len()..];
+                if !rerun_after_crash(item, failure, &mut crash_reruns).await {
+                    return Err(failure.to_string());
+                }
+                aggregator.restarting(part).await;
             }
             other => return other,
         }
@@ -1267,7 +1399,52 @@ async fn run_rclone_command(
         item.id,
         sa_path.to_string_lossy()
     );
-    if matches!(progress, ItemProgress::Direct) && shown(&race) {
+    let args = build_rclone_args(prefs, item, root_id, sa_path, files_from);
+
+    // Admitted only once the memory it can use is free, and holding it until
+    // the process exits; see `memory`. Until then the item says it is waiting,
+    // unless another of its processes is already uploading.
+    let files = match files_from {
+        Some(list) => std::fs::read_to_string(list)
+            .ok()
+            .map(|paths| paths.lines().count()),
+        None if item.kind == "file" => Some(1),
+        None => None,
+    };
+    let footprint = memory::footprint_mib(&args, files);
+    let mut held = false;
+    let admitted = job
+        .memory
+        .admit(
+            footprint,
+            || control.is_canceled(),
+            |hold| {
+                if !held {
+                    log::info!(
+                        target: "rclone",
+                        "upload.memory_hold id={} needs_mib={footprint} reason={hold}",
+                        item.id
+                    );
+                }
+                held = true;
+                if shown(&race) && job.running.idle(&item.id) {
+                    emit_hold(app, item, hold);
+                }
+            },
+        )
+        .await;
+    let Some(_memory) = admitted else {
+        return Err(CANCELED.to_string());
+    };
+    if control.is_canceled() {
+        return Err(CANCELED.to_string());
+    }
+    if held {
+        log::info!(target: "rclone", "upload.memory_admitted id={}", item.id);
+    }
+    let _running = job.running.start(&item.id);
+
+    if (held || matches!(progress, ItemProgress::Direct)) && shown(&race) {
         let _ = app.emit(
             "upload:item_status",
             ItemStatusEvent {
@@ -1276,14 +1453,16 @@ async fn run_rclone_command(
                 kind: item.kind.clone(),
                 status: "uploading".to_string(),
                 message: None,
-                sa_email: sa_email.clone(),
+                sa_email: match progress {
+                    ItemProgress::Direct => sa_email.clone(),
+                    ItemProgress::Fanout { .. } => None,
+                },
             },
         );
     }
 
-    let args = build_rclone_args(prefs, item, root_id, sa_path, files_from);
-
     let mut command = build_rclone_command(&prefs.rclone_path, &args);
+    command.env("GOMEMLIMIT", memory::go_memory_limit(footprint));
 
     log::debug!(
         target: "rclone",
@@ -1336,6 +1515,7 @@ async fn run_rclone_command(
     // Keep the most recent rclone errors so a failure can say what went wrong
     // instead of only reporting an exit code.
     let mut error_lines: Vec<String> = Vec::new();
+    let mut crash_lines: Vec<String> = Vec::new();
     let mut recent_lines: Vec<String> = Vec::new();
     let mut stop_reason = StopReason::None;
     let mut stopped = false;
@@ -1352,6 +1532,11 @@ async fn run_rclone_command(
                             error_lines.remove(0);
                         }
                         error_lines.push(message);
+                    }
+                }
+                if let Some(headline) = go_crash_line(&line) {
+                    if crash_lines.len() < 3 {
+                        crash_lines.push(headline.to_string());
                     }
                 }
                 if recent_lines.len() == 3 {
@@ -1519,7 +1704,7 @@ async fn run_rclone_command(
         return Ok(());
     }
 
-    let failure = describe_failure(&status, &error_lines, &recent_lines);
+    let failure = describe_failure(&status, &error_lines, &crash_lines, &recent_lines);
     log::warn!(
         target: "rclone",
         "upload.failed id={} status={} detail={}",
@@ -1528,7 +1713,26 @@ async fn run_rclone_command(
         failure
     );
 
-    Err(failure)
+    if crash_lines.is_empty() {
+        Err(failure)
+    } else {
+        Err(format!("{CRASHED}{failure}"))
+    }
+}
+
+/// Shows an item as waiting for memory instead of uploading. See `memory`.
+fn emit_hold(app: &AppHandle, item: &QueueItemInput, hold: memory::Hold) {
+    let _ = app.emit(
+        "upload:item_status",
+        ItemStatusEvent {
+            item_id: item.id.clone(),
+            path: item.path.clone(),
+            kind: item.kind.clone(),
+            status: "preparing".to_string(),
+            message: Some(hold.to_string()),
+            sa_email: None,
+        },
+    );
 }
 
 /// Stops the child process. A suspended process cannot act on a terminate
@@ -1589,16 +1793,50 @@ fn extract_log_error(line: &str) -> Option<String> {
     })
 }
 
+/// The line itself when it is part of a Go crash headline - `panic: ...`,
+/// `fatal error: ...` and the lines the runtime prints beside them.
+///
+/// A crashed rclone follows the headline with a trace of every goroutine, so
+/// its last lines are only the tail of that trace: one folder creation failed
+/// with "crypto/tls/conn.go:1550 +0x265; created by
+/// crypto/tls.(*Conn).handshakeContext in goroutine 59", which says nothing
+/// about why.
+fn go_crash_line(line: &str) -> Option<&str> {
+    const HEADLINES: [&str; 6] = [
+        "panic: ",
+        "fatal error: ",
+        "runtime: ",
+        "Exception 0x",
+        "[signal ",
+        "unexpected fault address",
+    ];
+    let line = line.trim();
+    HEADLINES
+        .iter()
+        .any(|headline| line.starts_with(headline))
+        .then_some(line)
+}
+
+/// How rclone crashed, from the headline lines `go_crash_line` picked out.
+fn describe_crash(crash_lines: &[&str]) -> Option<String> {
+    (!crash_lines.is_empty()).then(|| format!("rclone crashed - {}", crash_lines.join("; ")))
+}
+
 /// Build a failure message that tells the user what rclone actually complained
-/// about, falling back to the last raw output when nothing was tagged as an
-/// error (for example when rclone dies before it starts logging JSON).
+/// about, falling back to how it crashed, then to the last raw output when
+/// nothing was tagged as an error (for example when rclone dies before it
+/// starts logging JSON).
 fn describe_failure(
     status: &std::process::ExitStatus,
     error_lines: &[String],
+    crash_lines: &[String],
     recent_lines: &[String],
 ) -> String {
+    let crash: Vec<&str> = crash_lines.iter().map(String::as_str).collect();
     let mut detail = if !error_lines.is_empty() {
         error_lines.join("; ")
+    } else if let Some(crash) = describe_crash(&crash) {
+        crash
     } else {
         recent_lines.join("; ")
     };
@@ -1791,15 +2029,18 @@ pub(crate) async fn run_rclone_to_completion(
         .map_err(|e| format!("Failed to run rclone: {e}"))
 }
 
-/// The most useful part of a failed rclone run: what it logged as an error, or
-/// the last thing it said before giving up.
+/// The most useful part of a failed rclone run: what it logged as an error,
+/// how it crashed, or the last thing it said before giving up.
 pub(crate) fn describe_command_failure(output: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let error_lines: Vec<String> = stderr.lines().filter_map(extract_log_error).collect();
-    let detail = if error_lines.is_empty() {
-        stderr.lines().rev().take(2).collect::<Vec<_>>().join("; ")
-    } else {
+    let crash_lines: Vec<&str> = stderr.lines().filter_map(go_crash_line).take(3).collect();
+    let detail = if !error_lines.is_empty() {
         error_lines.join("; ")
+    } else if let Some(crash) = describe_crash(&crash_lines) {
+        crash
+    } else {
+        stderr.lines().rev().take(2).collect::<Vec<_>>().join("; ")
     };
     detail.trim().to_string()
 }
@@ -1950,18 +2191,11 @@ pub async fn verify_destination(
         return Ok(());
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let error_lines: Vec<String> = stderr.lines().filter_map(extract_log_error).collect();
-    let detail = if error_lines.is_empty() {
-        stderr.lines().rev().take(2).collect::<Vec<_>>().join("; ")
-    } else {
-        error_lines.join("; ")
-    };
-
-    Err(if detail.trim().is_empty() {
+    let detail = describe_command_failure(&output);
+    Err(if detail.is_empty() {
         "Destination folder is not reachable with the configured service accounts.".to_string()
     } else {
-        format!("Destination folder is not reachable: {}", detail.trim())
+        format!("Destination folder is not reachable: {detail}")
     })
 }
 
@@ -2047,12 +2281,11 @@ async fn run_lsjson(
         .map_err(|e| format!("Failed to run rclone: {e}"))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.lines().rev().take(2).collect::<Vec<_>>().join("; ");
-        return Err(if detail.trim().is_empty() {
+        let detail = describe_command_failure(&output);
+        return Err(if detail.is_empty() {
             "Could not list the destination folder.".to_string()
         } else {
-            format!("Could not list the destination folder: {}", detail.trim())
+            format!("Could not list the destination folder: {detail}")
         });
     }
 
@@ -2171,12 +2404,11 @@ pub async fn list_shared_drives(
         .map_err(|e| format!("Failed to run rclone: {e}"))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.lines().rev().take(2).collect::<Vec<_>>().join("; ");
-        return Err(if detail.trim().is_empty() {
+        let detail = describe_command_failure(&output);
+        return Err(if detail.is_empty() {
             "Could not list shared drives.".to_string()
         } else {
-            format!("Could not list shared drives: {}", detail.trim())
+            format!("Could not list shared drives: {detail}")
         });
     }
 
@@ -3299,5 +3531,88 @@ mod tests {
             "every lane would create the subfolder"
         );
         assert!(!raceable(&[], big), "an unknown file list is not raced");
+    }
+
+    fn failed_with(stderr: &str) -> std::process::Output {
+        std::process::Output {
+            status: Default::default(),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_crash_is_described_by_its_headline_not_its_trace() {
+        let out_of_memory = failed_with(concat!(
+            "{\"level\":\"info\",\"msg\":\"Starting\"}\n",
+            "runtime: VirtualAlloc of 8192 bytes failed with errno=1455\n",
+            "fatal error: out of memory\n",
+            "\n",
+            "runtime stack:\n",
+            "runtime.throw({0x1b8d0a2?, 0xc000080000?})\n",
+            "\truntime/panic.go:1101 +0x4d\n",
+            "\n",
+            "goroutine 60 [select]:\n",
+            "crypto/tls.(*Conn).handshakeContext.func2()\n",
+            "\tcrypto/tls/conn.go:1553 +0x8e\n",
+            "created by crypto/tls.(*Conn).handshakeContext in goroutine 59\n",
+            "\tcrypto/tls/conn.go:1550 +0x265\n",
+        ));
+        assert_eq!(
+            describe_command_failure(&out_of_memory),
+            "rclone crashed - runtime: VirtualAlloc of 8192 bytes failed with errno=1455; fatal error: out of memory"
+        );
+
+        let nil_pointer = failed_with(concat!(
+            "panic: runtime error: invalid memory address or nil pointer dereference\n",
+            "[signal 0xc0000005 code=0x0 addr=0x0 pc=0x7ff6]\n",
+            "\n",
+            "goroutine 59 [running]:\n",
+            "github.com/rclone/rclone/backend/drive.(*Fs).Mkdir(0x0)\n",
+            "\tgithub.com/rclone/rclone/backend/drive/drive.go:1 +0x1\n",
+        ));
+        assert_eq!(
+            describe_command_failure(&nil_pointer),
+            "rclone crashed - panic: runtime error: invalid memory address or nil pointer dereference; [signal 0xc0000005 code=0x0 addr=0x0 pc=0x7ff6]"
+        );
+    }
+
+    #[test]
+    fn a_logged_error_wins_and_plain_output_falls_back_to_its_last_lines() {
+        let logged = failed_with(concat!(
+            "{\"level\":\"error\",\"msg\":\"googleapi: Error 403: forbidden\"}\n",
+            "fatal error: out of memory\n",
+        ));
+        assert_eq!(
+            describe_command_failure(&logged),
+            "googleapi: Error 403: forbidden"
+        );
+
+        let plain = failed_with("one\ntwo\nthree\n");
+        assert_eq!(describe_command_failure(&plain), "three; two");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_crash_is_run_again_until_the_reruns_run_out() {
+        let item = test_item();
+        let mut reruns = 0;
+        for _ in 0..MAX_CRASH_RERUNS {
+            assert!(rerun_after_crash(&item, "rclone crashed", &mut reruns).await);
+        }
+        assert!(!rerun_after_crash(&item, "rclone crashed", &mut reruns).await);
+        assert_eq!(reruns, MAX_CRASH_RERUNS);
+    }
+
+    #[test]
+    fn an_item_is_idle_only_while_none_of_its_processes_runs() {
+        let running = RunningProcesses::default();
+        assert!(running.idle("a"));
+        let first = running.start("a");
+        let second = running.start("a");
+        drop(first);
+        assert!(!running.idle("a"), "one process is still uploading");
+        assert!(running.idle("b"));
+        drop(second);
+        assert!(running.idle("a"));
     }
 }
