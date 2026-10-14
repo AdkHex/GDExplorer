@@ -1522,7 +1522,7 @@ dependencies = [
 
 [[package]]
 name = "gdexplorer"
-version = "0.2.33"
+version = "0.2.34"
 dependencies = [
  "base64 0.22.1",
  "fern",
