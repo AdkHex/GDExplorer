@@ -296,12 +296,12 @@ pub fn lock_reason(doc: &StatusDoc, app_version: &str) -> Option<LockReason> {
 }
 
 /// The lock for this OS user: the document's own lock first, then the password.
-/// `granted` is the access id held in the credential store.
+/// `granted` holds the access ids this user has unlocked with.
 pub fn evaluate(
     doc: Option<&StatusDoc>,
     app_version: &str,
     require_access: bool,
-    granted: Option<&str>,
+    granted: &[String],
 ) -> Option<LockReason> {
     let Some(doc) = doc else {
         return require_access.then_some(LockReason::Connect);
@@ -310,7 +310,7 @@ pub fn evaluate(
         return Some(reason);
     }
     match &doc.access {
-        Some(access) if granted != Some(access.id.as_str()) => Some(LockReason::Access),
+        Some(access) if !granted.contains(&access.id) => Some(LockReason::Access),
         _ => None,
     }
 }
@@ -341,11 +341,14 @@ fn is_loopback(u: &url::Url) -> bool {
 
 // ------------------------------------------------------------------ credential store
 
-/// Where the accepted access id is kept. The app uses the OS credential store
-/// (`service::KeyringStore`), which is per OS user, so every account on a
-/// shared machine is asked separately.
+/// Where the accepted access id is kept, per OS user, so every account on a
+/// shared machine is asked separately. The app uses the OS credential store
+/// plus a file in the user's app data folder (`service::RememberedAccess`).
 pub trait AccessStore: Send + Sync {
-    fn load(&self) -> Option<String>;
+    /// Every id remembered here. More than one when the places it is kept in
+    /// disagree (one of them failed to take the latest).
+    fn load(&self) -> Vec<String>;
+    /// Ok when at least one place took it.
     fn save(&self, id: &str) -> Result<(), String>;
 }
 
@@ -360,14 +363,69 @@ impl MemoryAccessStore {
 }
 
 impl AccessStore for MemoryAccessStore {
-    fn load(&self) -> Option<String> {
-        self.get()
+    fn load(&self) -> Vec<String> {
+        self.get().into_iter().collect()
     }
 
     fn save(&self, id: &str) -> Result<(), String> {
         *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.to_string());
         Ok(())
     }
+}
+
+/// An `AccessStore` (the OS credential store in the app) backed by a file in
+/// the user's app data folder. Each counts on its own: an id is remembered if
+/// either place took it, and a place that failed to take the latest id cannot
+/// hide it. See `service::KeyringAccess` for why the file is needed.
+pub struct FileBackedAccess<P: AccessStore> {
+    pub primary: P,
+    pub file: PathBuf,
+}
+
+impl<P: AccessStore> AccessStore for FileBackedAccess<P> {
+    fn load(&self) -> Vec<String> {
+        let mut ids = self.primary.load();
+        if let Some(id) = read_access_file(&self.file) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    fn save(&self, id: &str) -> Result<(), String> {
+        let primary = self.primary.save(id);
+        let file = write_access_file(&self.file, id);
+        if let Err(e) = &primary {
+            log::warn!("access: {e}; kept in {} instead", self.file.display());
+        }
+        match (primary, file) {
+            (Err(a), Err(b)) => Err(format!("{a}; {b}")),
+            _ => Ok(()),
+        }
+    }
+}
+
+fn is_access_id(s: &str) -> bool {
+    s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The access id kept in a file, when there is a valid one.
+pub fn read_access_file(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let id = text.trim().to_ascii_lowercase();
+    is_access_id(&id).then_some(id)
+}
+
+/// Keeps the access id in a file (write, then rename into place).
+pub fn write_access_file(path: &Path, id: &str) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, id)
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 // ------------------------------------------------------------------ runtime state
@@ -400,7 +458,8 @@ struct Shared {
     doc: Option<StatusDoc>,
     fetched_at: Option<i64>,
     last_error: Option<String>,
-    granted: Option<String>,
+    /// Access ids this OS user has unlocked with.
+    granted: Vec<String>,
     checking: bool,
     failures: u32,
     blocked_until: Option<Instant>,
@@ -521,7 +580,7 @@ impl ServiceCore {
             sh.doc.as_ref(),
             &self.cfg.app_version,
             self.cfg.require_access,
-            sh.granted.as_deref(),
+            &sh.granted,
         )
     }
 
@@ -748,7 +807,7 @@ impl ServiceCore {
                 drop(sh);
                 return Ok(self.state());
             };
-            if sh.granted.as_deref() == Some(spec.id.as_str()) {
+            if sh.granted.contains(&spec.id) {
                 drop(sh);
                 return Ok(self.state());
             }
@@ -764,7 +823,7 @@ impl ServiceCore {
             if accepted {
                 sh.failures = 0;
                 sh.blocked_until = None;
-                sh.granted = Some(spec.id.clone());
+                sh.granted.push(spec.id.clone());
             } else {
                 sh.failures += 1;
                 if sh.failures >= FREE_ATTEMPTS {
@@ -775,10 +834,11 @@ impl ServiceCore {
 
         if accepted {
             log::info!("access: password accepted");
-            // Without the store the password still holds for this run; it is
-            // asked again next time.
-            if let Err(e) = self.store.save(&spec.id) {
-                log::warn!("access: cannot remember the password in the credential store: {e}");
+            // If nothing could keep it, the password still holds for this run
+            // and is asked again next time.
+            match self.store.save(&spec.id) {
+                Ok(()) => log::info!("access: remembered for this user"),
+                Err(e) => log::warn!("access: cannot remember the password: {e}"),
             }
             self.publish();
             Ok(self.state())
@@ -1003,41 +1063,75 @@ mod tests {
     }
 
     #[test]
+    fn the_access_file_round_trips_and_ignores_junk() {
+        let dir = std::env::temp_dir().join(format!(
+            "gdx-access-file-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = dir.join("nested").join("access-id");
+        assert_eq!(read_access_file(&file), None, "missing file");
+        write_access_file(&file, ID_1K).unwrap();
+        assert_eq!(read_access_file(&file).as_deref(), Some(ID_1K));
+        assert!(!file.with_extension("tmp").exists());
+        for junk in ["", "not an id", "31ee27f8fc8c671", "31ee27f8fc8c671bz"] {
+            std::fs::write(&file, junk).unwrap();
+            assert_eq!(read_access_file(&file), None, "{junk:?}");
+        }
+        // hand-edited: whitespace and capitals are fine
+        std::fs::write(&file, format!(" {}\r\n", ID_1K.to_uppercase())).unwrap();
+        assert_eq!(read_access_file(&file).as_deref(), Some(ID_1K));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn evaluate_orders_the_locks() {
         let with_access = doc_with_access(1_000, HASH_1K, None).unwrap();
         // never fetched: only a build that requires access is locked
-        assert_eq!(evaluate(None, "1.0.0", false, None), None);
+        assert_eq!(evaluate(None, "1.0.0", false, &[]), None);
         assert_eq!(
-            evaluate(None, "1.0.0", true, None),
+            evaluate(None, "1.0.0", true, &[]),
             Some(LockReason::Connect)
         );
         // password
         assert_eq!(
-            evaluate(Some(&with_access), "1.0.0", false, None),
+            evaluate(Some(&with_access), "1.0.0", false, &[]),
             Some(LockReason::Access)
         );
         assert_eq!(
-            evaluate(Some(&with_access), "1.0.0", true, Some("other")),
+            evaluate(Some(&with_access), "1.0.0", true, &["other".to_string()]),
             Some(LockReason::Access)
         );
         assert_eq!(
-            evaluate(Some(&with_access), "1.0.0", true, Some(ID_1K)),
+            evaluate(Some(&with_access), "1.0.0", true, &[ID_1K.to_string()]),
+            None
+        );
+        // remembered in two places that disagree: either one is enough
+        assert_eq!(
+            evaluate(
+                Some(&with_access),
+                "1.0.0",
+                true,
+                &["stale".to_string(), ID_1K.to_string()]
+            ),
             None
         );
         // maintenance wins over the password screen
         let mut both = with_access.clone();
         both.status = RemoteState::Maintenance;
         assert_eq!(
-            evaluate(Some(&both), "1.0.0", true, None),
+            evaluate(Some(&both), "1.0.0", true, &[]),
             Some(LockReason::Maintenance)
         );
         assert_eq!(
-            evaluate(Some(&both), "1.0.0", true, Some(ID_1K)),
+            evaluate(Some(&both), "1.0.0", true, &[ID_1K.to_string()]),
             Some(LockReason::Maintenance)
         );
         // after one successful fetch a document without access means no password
         assert_eq!(
-            evaluate(Some(&StatusDoc::default()), "1.0.0", true, None),
+            evaluate(Some(&StatusDoc::default()), "1.0.0", true, &[]),
             None
         );
     }

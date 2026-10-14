@@ -128,6 +128,15 @@ fn core(
     store: &MemoryAccessStore,
     require_access: bool,
 ) -> Arc<ServiceCore> {
+    core_with(url, dir, Box::new(store.clone()), require_access)
+}
+
+fn core_with(
+    url: Option<String>,
+    dir: &TempDir,
+    store: Box<dyn AccessStore>,
+    require_access: bool,
+) -> Arc<ServiceCore> {
     ServiceCore::new(
         ServiceConfig {
             url,
@@ -137,8 +146,23 @@ fn core(
             poll_every: None,
             throttle: Duration::from_millis(300),
         },
-        Box::new(store.clone()),
+        store,
     )
+}
+
+/// A credential store like Windows Credential Manager on a server that
+/// forbids storing credentials: it refuses every entry, and may still hold an
+/// old one.
+struct RefusingStore(Vec<String>);
+
+impl AccessStore for RefusingStore {
+    fn load(&self) -> Vec<String> {
+        self.0.clone()
+    }
+
+    fn save(&self, _id: &str) -> Result<(), String> {
+        Err("A specified logon session does not exist. (os error 1312)".into())
+    }
 }
 
 /// What `scripts/gdexplorer-status.mjs password` writes, with few rounds so
@@ -525,4 +549,103 @@ async fn the_poll_loop_follows_the_document() {
         .await
         .expect("released by a later poll")
         .unwrap();
+}
+
+#[tokio::test]
+async fn a_refusing_credential_store_still_remembers_the_password() {
+    let password = "correct horse battery staple";
+    let server = Server::start(Reply::Json(
+        with_access(ok(), access_block(password, &[7; 16])).to_string(),
+    ))
+    .await;
+    let dir = TempDir::new("refusing-store");
+    let file = dir.0.join("access-id");
+
+    // What v0.2.33 did on a server whose Credential Manager refuses entries:
+    // the password opened the app for that run only, and every start asked
+    // again.
+    let bare = core_with(
+        Some(server.url()),
+        &dir,
+        Box::new(RefusingStore(Vec::new())),
+        true,
+    );
+    bare.check_now().await;
+    assert!(!bare.unlock(password).unwrap().locked);
+    drop(bare);
+    let restarted = core_with(
+        Some(server.url()),
+        &dir,
+        Box::new(RefusingStore(Vec::new())),
+        true,
+    );
+    assert_eq!(restarted.state().reason, Some(LockReason::Access));
+    drop(restarted);
+
+    // Backed by the file in the app data folder, it is remembered.
+    let backed = || -> Box<dyn AccessStore> {
+        Box::new(FileBackedAccess {
+            primary: RefusingStore(Vec::new()),
+            file: file.clone(),
+        })
+    };
+    let app = core_with(Some(server.url()), &dir, backed(), true);
+    assert_eq!(app.state().reason, Some(LockReason::Access));
+    assert!(!app.unlock(password).unwrap().locked);
+    assert!(file.exists());
+    drop(app);
+    for _ in 0..3 {
+        let restarted = core_with(Some(server.url()), &dir, backed(), true);
+        assert!(!restarted.is_locked(), "asked again after a restart");
+        assert!(!restarted.check_now().await.locked);
+    }
+}
+
+#[tokio::test]
+async fn a_stale_credential_store_entry_does_not_hide_the_new_password() {
+    let (old, new) = ("the old passphrase here", "the new passphrase here");
+    let old_id = access_block(old, &[8; 16])["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let server = Server::start(Reply::Json(
+        with_access(ok(), access_block(new, &[9; 16])).to_string(),
+    ))
+    .await;
+    let dir = TempDir::new("stale-store");
+    let file = dir.0.join("access-id");
+    // The credential store still has the old password's id and refuses the new one.
+    let backed = || -> Box<dyn AccessStore> {
+        Box::new(FileBackedAccess {
+            primary: RefusingStore(vec![old_id.clone()]),
+            file: file.clone(),
+        })
+    };
+    let app = core_with(Some(server.url()), &dir, backed(), true);
+    assert_eq!(app.check_now().await.reason, Some(LockReason::Access));
+    assert!(!app.unlock(new).unwrap().locked);
+    drop(app);
+    let restarted = core_with(Some(server.url()), &dir, backed(), true);
+    assert!(!restarted.is_locked());
+}
+
+#[tokio::test]
+async fn the_file_alone_is_not_enough_when_both_places_fail() {
+    let password = "correct horse battery staple";
+    let server = Server::start(Reply::Json(
+        with_access(ok(), access_block(password, &[10; 16])).to_string(),
+    ))
+    .await;
+    let dir = TempDir::new("both-fail");
+    // a file path that cannot be created: its parent is a file
+    std::fs::write(dir.0.join("blocker"), "x").unwrap();
+    let store = FileBackedAccess {
+        primary: RefusingStore(Vec::new()),
+        file: dir.0.join("blocker").join("access-id"),
+    };
+    assert!(store.save("31ee27f8fc8c671b").is_err());
+    // the password still opens the app for this run
+    let app = core_with(Some(server.url()), &dir, Box::new(store), true);
+    app.check_now().await;
+    assert!(!app.unlock(password).unwrap().locked);
 }

@@ -16,7 +16,8 @@ use serde::Deserialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::remote_status::{
-    validate_url, AccessStore, ServiceConfig, ServiceCore, ServiceLock, LOCKED_ERROR, THROTTLE,
+    validate_url, AccessStore, FileBackedAccess, ServiceConfig, ServiceCore, ServiceLock,
+    LOCKED_ERROR, THROTTLE,
 };
 
 const BAKED: &str = include_str!("../remote-status.json");
@@ -26,6 +27,9 @@ pub const EVENT: &str = "service-lock-changed";
 
 /// Credential store entry: service = bundle identifier, account = this.
 const KEYRING_ACCOUNT: &str = "access";
+
+/// The same id, kept in the app data folder. See `KeyringAccess`.
+const ACCESS_FILE: &str = "access-id";
 
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
@@ -90,18 +94,26 @@ fn data_dir(app: &AppHandle) -> PathBuf {
 }
 
 /// Windows Credential Manager / macOS Keychain, both per OS user.
-struct KeyringStore {
+///
+/// Not always usable on its own: Windows servers commonly enable "Network
+/// access: Do not allow storage of passwords and credentials for network
+/// authentication", under which Credential Manager refuses the entry, and the
+/// password was then asked on every start. So `init` backs it with a file in
+/// the user's app data folder (`FileBackedAccess`). What is kept is the access
+/// id, which is derived from the public gist, so the file holds nothing
+/// secret; like the credential store it lives in the user's own profile.
+struct KeyringAccess {
     service: String,
 }
 
-impl AccessStore for KeyringStore {
-    fn load(&self) -> Option<String> {
+impl AccessStore for KeyringAccess {
+    fn load(&self) -> Vec<String> {
         match keyring::Entry::new(&self.service, KEYRING_ACCOUNT).and_then(|e| e.get_password()) {
-            Ok(id) => Some(id),
-            Err(keyring::Error::NoEntry) => None,
+            Ok(id) => vec![id],
+            Err(keyring::Error::NoEntry) => Vec::new(),
             Err(e) => {
                 log::warn!("access: cannot read the credential store: {e}");
-                None
+                Vec::new()
             }
         }
     }
@@ -109,7 +121,7 @@ impl AccessStore for KeyringStore {
     fn save(&self, id: &str) -> Result<(), String> {
         keyring::Entry::new(&self.service, KEYRING_ACCOUNT)
             .and_then(|e| e.set_password(id))
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("credential store refused the entry: {e}"))
     }
 }
 
@@ -127,8 +139,11 @@ pub fn init(app: &AppHandle) -> Arc<ServiceCore> {
             poll_every: poll_override(),
             throttle: THROTTLE,
         },
-        Box::new(KeyringStore {
-            service: app.config().identifier.clone(),
+        Box::new(FileBackedAccess {
+            primary: KeyringAccess {
+                service: app.config().identifier.clone(),
+            },
+            file: data_dir(app).join(ACCESS_FILE),
         }),
     );
 

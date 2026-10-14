@@ -125,8 +125,15 @@ link can read it, so it holds only the status and the salted hash.
 - The password, once accepted, is remembered offline and across updates: the
   app keeps `access.id` in the OS credential store (service
   `com.ionicboy.gdexplorer`, account `access`): Windows Credential Manager or the
-  macOS Keychain. Both are per OS user, so every account on a shared machine is
-  asked separately. A new password has a new id, so everyone is asked again.
+  macOS Keychain. It also keeps it in the file `access-id` in the app data
+  folder, because some Windows servers refuse Credential Manager entries (policy
+  "Network access: Do not allow storage of passwords and credentials for network
+  authentication"). Without the file, v0.2.33 asked on every start on such a
+  server. Either place is enough. Both are per OS user, so every account on a
+  shared machine is asked separately. A new password has a new id, so everyone
+  is asked again. If neither place can keep it, the password still opens the
+  app for that run, and the log says why ("access: cannot remember the
+  password: …").
 
 ## Per-user Windows install
 
@@ -218,7 +225,7 @@ node scripts/gdexplorer-status.mjs password --off --no-publish
 without it the command publishes to the real gist (only `--serve` implies
 `--no-publish`). The debug app shares its data folder and credential store entry
 with an installed copy, so clean up afterwards: delete `service-status.json`
-from the data folder and the stored id
+and `access-id` from the data folder and the stored id
 (macOS: `security delete-generic-password -s com.ionicboy.gdexplorer -a access`;
 Windows: Control Panel > Credential Manager > Windows Credentials, the entry
 naming `com.ionicboy.gdexplorer`). To see whether the id is stored on macOS
