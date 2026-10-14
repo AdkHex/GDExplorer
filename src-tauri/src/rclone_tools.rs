@@ -51,6 +51,7 @@ fn download_url() -> Result<&'static str, String> {
 /// Downloads rclone and returns the path to the extracted binary.
 #[tauri::command]
 pub async fn install_rclone(app: AppHandle) -> Result<String, String> {
+    crate::service::ensure_unlocked(&app)?;
     let url = download_url()?;
     let install_dir = managed_install_dir(&app)?;
     std::fs::create_dir_all(&install_dir)
@@ -139,6 +140,7 @@ pub struct DetectedRclone {
 /// install is invisible by name and only the explicit paths find it.
 #[tauri::command]
 pub async fn detect_rclone(app: AppHandle) -> Result<Option<DetectedRclone>, String> {
+    crate::service::ensure_unlocked(&app)?;
     let mut candidates: Vec<PathBuf> = Vec::new();
 
     if let Ok(dir) = managed_install_dir(&app) {
@@ -216,10 +218,12 @@ async fn probe_rclone(path: &str) -> Option<String> {
 /// config first.
 #[tauri::command]
 pub async fn configure_rclone_remote(
+    app: AppHandle,
     rclone_path: String,
     remote_name: String,
     service_account_folder: String,
 ) -> Result<(), String> {
+    crate::service::ensure_unlocked(&app)?;
     let service_account_file = pick_service_account_file(&service_account_folder)?
         .to_string_lossy()
         .to_string();

@@ -85,3 +85,13 @@ The installer is not code-signed with a paid certificate, so the first run of a
 downloaded installer shows "Windows protected your PC" → _More info_ → _Run
 anyway_. Updates applied by the app itself install per-user and do not prompt for
 an administrator.
+
+## Per-user install only
+
+The installer installs for the user who runs it and nobody else
+(`bundle.windows.nsis.installMode: currentUser`, NSIS only, no MSI), and so does
+every update: `latest.json` points at the NSIS `-setup.exe`. The workflow checks
+both. An older all-users copy in `C:\Program Files\GDrive-Upload` has to be
+uninstalled once by an administrator from Settings > Apps; the release notes say
+so, and the app tells each user once. Details, and the identifier change to
+`com.ionicboy.gdexplorer`, are in `docs/REMOTE-STATUS.md`.

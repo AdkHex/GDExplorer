@@ -74,6 +74,14 @@ jobs:
         run: |
           node -e "const c=require('./src-tauri/tauri.conf.json'); const k=c?.plugins?.updater?.pubkey; if(!k||k.includes('YOUR_UPDATER_PUBLIC_KEY_HERE')){ console.error('Updater pubkey is not configured in src-tauri/tauri.conf.json (plugins.updater.pubkey).'); process.exit(1);} console.log('Updater pubkey is configured.');"
 
+      # On a shared Windows server (RDP) the app must install for the user who
+      # runs the installer, never for every account. An MSI always installs
+      # per machine, and so does NSIS in perMachine or both mode.
+      - name: Check the installer installs per user
+        shell: bash
+        run: |
+          node -e "const b=require('./src-tauri/tauri.conf.json').bundle||{}; const t=[].concat(b.targets); const m=b.windows?.nsis?.installMode; if(t.includes('all')||t.includes('msi')){ console.error('bundle.targets must not build an MSI - it installs for all users: '+JSON.stringify(b.targets)); process.exit(1);} if(m!=='currentUser'){ console.error('bundle.windows.nsis.installMode must be currentUser, is '+m); process.exit(1);} console.log('NSIS, installMode currentUser, no MSI.');"
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -135,8 +143,9 @@ jobs:
 
       # NSIS only, deliberately. Shipping an .msi as well would let someone
       # install one flavour and be updated into the other, ending up with two
-      # copies of the app; the NSIS installer also installs per-user, so
-      # neither installing nor updating needs an admin prompt.
+      # copies of the app, and an MSI installs for every account on the
+      # machine. The NSIS installer installs per user (installMode
+      # currentUser), so neither installing nor updating needs an admin prompt.
       - name: Build and publish
         uses: tauri-apps/tauri-action@v0
         env:
@@ -152,6 +161,12 @@ jobs:
             Already have it installed? You do not need this page — the app
             checks for updates on startup and offers this version itself.
 
+            **Shared Windows server (RDP)**: the installer installs only for
+            the user who runs it. If an older copy was installed for all users
+            (in `C:\Program Files\GDrive-Upload`), an administrator has to
+            uninstall that one once, from Settings > Apps > GDrive-Upload;
+            each user then installs this version for themselves.
+
             **Changes**: https://github.com/${{ github.repository }}/commits/v${{ steps.bump.outputs.version }}
           # Published, not a draft. The updater reads
           # /releases/latest/download/latest.json, and a draft release is never
@@ -162,6 +177,21 @@ jobs:
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
           args: --bundles nsis
+
+      # The updater installs whatever latest.json's Windows entry points at,
+      # so it has to be the signed per-user NSIS installer, never an MSI.
+      - name: Check the updater points at the NSIS installer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="v${{ steps.bump.outputs.version }}"
+          if gh release view "$tag" --json assets -q '.assets[].name' | grep -i '\.msi'; then
+            echo "::error::Release $tag carries an MSI, which installs for all users."
+            exit 1
+          fi
+          gh release download "$tag" --pattern latest.json --dir "$RUNNER_TEMP" --clobber
+          node -e "const j=JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')); const w=(j.platforms||{})['windows-x86_64']; if(!w||!/-setup\.exe$/.test(w.url)||!w.signature){ console.error('latest.json windows-x86_64 must point at the signed -setup.exe: '+JSON.stringify(w)); process.exit(1);} console.log('Updater installs '+w.url);" "$RUNNER_TEMP/latest.json"
 
   macos:
     name: macOS bundle

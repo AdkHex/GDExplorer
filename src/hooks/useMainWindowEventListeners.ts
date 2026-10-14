@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event'
 import { useUIStore } from '@/store/ui-store'
 import { logger } from '@/lib/logger'
 import { checkForUpdates } from '@/lib/updater'
+import { isServiceLocked } from '@/lib/service-lock'
 
 function isTextInputTarget(target: EventTarget | null): boolean {
   if (!(target instanceof Element)) return false
@@ -68,7 +69,10 @@ export function useMainWindowEventListeners() {
     const setupMenuListeners = async () => {
       logger.debug('Setting up menu event listeners')
       const unlisteners = await Promise.all([
+        // The native menu and the tray still fire while the lock screen
+        // shows; a dialog opened under it would take its focus.
         listen('menu-about', () => {
+          if (isServiceLocked()) return
           logger.debug('About menu event received')
           // Open the About pane, which reads the real version from Tauri,
           // rather than a blocking alert with a hardcoded version string.
@@ -85,11 +89,13 @@ export function useMainWindowEventListeners() {
         }),
 
         listen('menu-preferences', () => {
+          if (isServiceLocked()) return
           logger.debug('Preferences menu event received')
           useUIStore.getState().setPreferencesOpen(true)
         }),
 
         listen('menu-toggle-left-sidebar', () => {
+          if (isServiceLocked()) return
           logger.debug('Toggle left sidebar menu event received')
           const { leftSidebarVisible, setLeftSidebarVisible } =
             useUIStore.getState()
@@ -97,6 +103,7 @@ export function useMainWindowEventListeners() {
         }),
 
         listen('menu-toggle-log-panel', () => {
+          if (isServiceLocked()) return
           logger.debug('Toggle log panel menu event received')
           useUIStore.getState().toggleLogPanel()
         }),

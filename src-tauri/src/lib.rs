@@ -7,10 +7,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+mod data_migration;
 mod logbuf;
 mod preflight;
 mod rclone_tools;
+pub mod remote_status;
 mod send_buffer;
+mod service;
 mod tray;
 mod upload;
 
@@ -27,10 +30,14 @@ struct UploadControl {
     /// a running upload can be extended instead of cancelled and restarted.
     queue_tx: tokio::sync::mpsc::UnboundedSender<upload::scheduler::QueueItemInput>,
     tallies: std::sync::Arc<upload::scheduler::JobTallies>,
+    /// True while the remote switch or the access password locks the app.
+    service_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl UploadControl {
-    fn new() -> (
+    fn new(
+        service_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> (
         Self,
         tokio::sync::mpsc::UnboundedReceiver<upload::scheduler::QueueItemInput>,
     ) {
@@ -44,6 +51,7 @@ impl UploadControl {
                 paused_items_tx,
                 queue_tx,
                 tallies: std::sync::Arc::new(upload::scheduler::JobTallies::default()),
+                service_rx,
             },
             queue_rx,
         )
@@ -126,6 +134,7 @@ impl UploadControl {
             cancel: self.cancel.clone(),
             pause_rx: self.pause_tx.subscribe(),
             paused_items_rx: self.paused_items_tx.subscribe(),
+            service_rx: self.service_rx.clone(),
         }
     }
 }
@@ -171,6 +180,7 @@ async fn start_upload(
     args: StartUploadArgs,
 ) -> Result<(), String> {
     let app = window.app_handle();
+    service::ensure_unlocked(app)?;
     let preferences = load_preferences(app.clone()).await?;
 
     let service_account_folder = preferences
@@ -215,7 +225,10 @@ async fn start_upload(
     }
 
     // No live job, so start one. Any stale handle is cancelled first.
-    let (control, queue_rx) = UploadControl::new();
+    let service_rx = app
+        .state::<std::sync::Arc<remote_status::ServiceCore>>()
+        .subscribe();
+    let (control, queue_rx) = UploadControl::new(service_rx);
     let control_handle = control.handle();
     let tallies = control.tallies.clone();
     {
@@ -287,6 +300,9 @@ fn rclone_preferences(preferences: &AppPreferences) -> upload::rclone::RclonePre
 async fn rclone_context(
     app: AppHandle,
 ) -> Result<(upload::rclone::RclonePreferences, String), String> {
+    // Every Drive call goes through here, so this is where the remote switch
+    // and the access password refuse them.
+    service::ensure_unlocked(&app)?;
     let preferences = load_preferences(app).await?;
     let service_account_folder = preferences
         .service_account_folder_path
@@ -318,6 +334,7 @@ async fn run_preflight(
     app: AppHandle,
     args: PreflightArgs,
 ) -> Result<Vec<preflight::PreflightCheck>, String> {
+    service::ensure_unlocked(&app)?;
     let preferences = load_preferences(app).await?;
     let prefs = rclone_preferences(&preferences);
 
@@ -333,7 +350,8 @@ async fn run_preflight(
 /// returns the refreshed preflight check. See `send_buffer` for why this is
 /// what stands between one file and the full link.
 #[tauri::command]
-async fn raise_send_buffer() -> Result<preflight::PreflightCheck, String> {
+async fn raise_send_buffer(app: AppHandle) -> Result<preflight::PreflightCheck, String> {
+    service::ensure_unlocked(&app)?;
     // The elevation prompt blocks until the user answers it.
     let state = tokio::task::spawn_blocking(send_buffer::raise)
         .await
@@ -1412,6 +1430,10 @@ fn skip_debug_in_release(metadata: &log::Metadata<'_>) -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Before Tauri creates the new identifier's folders, or the webview its
+    // storage in them: the user's data still lives under the old identifier.
+    let carried_over = data_migration::carry_over();
+
     tauri::Builder::default()
         .manage(UploadControlState::default())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1456,12 +1478,20 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
+        .setup(move |app| {
             log::info!("🚀 Application starting up");
+            for line in &carried_over {
+                log::info!("{line}");
+            }
             log::debug!(
                 "App handle initialized for package: {}",
                 app.package_info().name
             );
+
+            // Before anything else: a lock from the last run (maintenance, or
+            // a password not yet entered) must hold from the first instant.
+            let service = service::init(app.handle());
+            app.manage(service);
 
             // Set up native menu system
             if let Err(e) = create_app_menu(app) {
@@ -1587,7 +1617,12 @@ pub fn run() {
             list_item_files,
             rclone_tools::install_rclone,
             rclone_tools::detect_rclone,
-            rclone_tools::configure_rclone_remote
+            rclone_tools::configure_rclone_remote,
+            service::service_lock,
+            service::check_service_status,
+            service::unlock_access,
+            service::all_users_install_notice,
+            service::dismiss_all_users_install_notice
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

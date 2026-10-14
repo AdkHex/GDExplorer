@@ -409,8 +409,7 @@ async fn run_rclone_for_item(
     let mut budget = RestartBudget::new();
     let mut crash_reruns = 0;
     loop {
-        let should_pause =
-            *control.pause_rx.borrow() || control.paused_items_rx.borrow().contains(&item.id);
+        let should_pause = control.is_held(&item.id);
         let initial_status = if should_pause { "paused" } else { "uploading" };
         log::debug!(
             target: "rclone",
@@ -1084,8 +1083,7 @@ async fn run_folder_fanout(
     let (app, control) = (&job.app, &job.control);
     let group_count = groups.len();
 
-    let should_pause =
-        *control.pause_rx.borrow() || control.paused_items_rx.borrow().contains(&item.id);
+    let should_pause = control.is_held(&item.id);
     let _ = app.emit(
         "upload:item_status",
         ItemStatusEvent {
@@ -1916,6 +1914,8 @@ async fn monitor_pause_state(
     let _ = pid;
     let mut pause_all_rx = control.pause_rx.clone();
     let mut paused_items_rx = control.paused_items_rx.clone();
+    let mut service_rx = control.service_rx.clone();
+    let mut service_open = true;
     let mut is_paused = false;
 
     loop {
@@ -1926,6 +1926,31 @@ async fn monitor_pause_state(
         if control.is_canceled() {
             log::debug!(target: "rclone", "upload.cancel id={}", item.id);
             let _ = stop_tx.send(StopReason::Cancel);
+            break;
+        }
+
+        // The remote switch stops rclone outright on every platform instead of
+        // suspending it: a lock can last hours, and a suspended upload's
+        // connections would not survive that anyway. The worker runs it again
+        // once the lock lifts, and rclone skips what already reached Drive.
+        if control.is_service_locked() {
+            log::info!(
+                target: "rclone",
+                "upload.service_lock stopping child id={}",
+                item.id
+            );
+            let _ = app.emit(
+                "upload:item_status",
+                ItemStatusEvent {
+                    item_id: item.id.clone(),
+                    path: item.path.clone(),
+                    kind: item.kind.clone(),
+                    status: "paused".to_string(),
+                    message: None,
+                    sa_email: None,
+                },
+            );
+            let _ = stop_tx.send(StopReason::PauseRestart);
             break;
         }
 
@@ -1982,6 +2007,10 @@ async fn monitor_pause_state(
         tokio::select! {
             _ = pause_all_rx.changed() => {}
             _ = paused_items_rx.changed() => {}
+            changed = service_rx.changed(), if service_open => {
+                // A closed channel would be ready forever and spin this loop.
+                service_open = changed.is_ok();
+            }
             _ = done_rx.changed() => {}
             _ = tokio::time::sleep(Duration::from_millis(200)) => {}
         }

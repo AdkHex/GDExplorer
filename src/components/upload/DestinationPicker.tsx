@@ -30,6 +30,7 @@ import { Input } from '@/components/ui/input'
 import { useUploadDestinationStore } from '@/store/upload-destination-store'
 import { usePreferences, useSavePreferences } from '@/services/preferences'
 import { logger } from '@/lib/logger'
+import { useServiceLockStore } from '@/lib/service-lock'
 import { cn } from '@/lib/utils'
 import { extractDriveFolderId } from '@/lib/drive-url'
 import { driveFolderUrl } from '@/lib/drive-links'
@@ -121,8 +122,10 @@ export function DestinationPicker() {
 
   // A pasted link carries only an ID, so ask rclone what the folder is called.
   // Browsing already supplies the name, hence the `destinationName` guard.
+  // While the app is locked rclone is refused, so this waits for the unlock.
+  const serviceLocked = useServiceLockStore(state => state.lock?.locked ?? true)
   useEffect(() => {
-    if (!destinationFolderId || destinationName) return
+    if (!destinationFolderId || destinationName || serviceLocked) return
     let cancelled = false
     invoke<string | null>('resolve_folder_name', {
       args: { folderId: destinationFolderId },
@@ -139,7 +142,7 @@ export function DestinationPicker() {
     return () => {
       cancelled = true
     }
-  }, [destinationFolderId, destinationName, setDestinationName])
+  }, [destinationFolderId, destinationName, setDestinationName, serviceLocked])
 
   // Everything above the chosen folder, shown as the picker's breadcrumb.
   const parentSegments = destinationPath.slice(0, -1)

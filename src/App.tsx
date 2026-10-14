@@ -9,12 +9,31 @@ import ErrorBoundary from './components/ErrorBoundary'
 import { usePreferences } from './services/preferences'
 import { UpdateSplash } from './components/update/UpdateSplash'
 import { useUIStore } from './store/ui-store'
+import { ServiceLockOverlay } from './components/service/ServiceLockOverlay'
+import { AllUsersInstallNotice } from './components/service/AllUsersInstallNotice'
+import { startServiceLockSync, useServiceLockStore } from './lib/service-lock'
+import { queryClient } from './lib/query-client'
 
 function App() {
   const { data: preferences } = usePreferences()
   const { updateChecking, updateDownloading, updateSplashDismissed } =
     useUIStore()
   const hasCheckedUpdates = useRef(false)
+
+  // The remote switch and access password. Anything that failed while locked
+  // is fetched again once the lock lifts.
+  useEffect(() => {
+    const stop = startServiceLockSync()
+    const unsubscribe = useServiceLockStore.subscribe((state, previous) => {
+      if (previous.lock?.locked && state.lock && !state.lock.locked) {
+        void queryClient.invalidateQueries()
+      }
+    })
+    return () => {
+      unsubscribe()
+      void stop.then(f => f())
+    }
+  }, [])
 
   // Initialize command system and cleanup on app startup
   useEffect(() => {
@@ -54,6 +73,8 @@ function App() {
             (updateChecking || updateDownloading) && !updateSplashDismissed
           }
         />
+        <ServiceLockOverlay />
+        <AllUsersInstallNotice />
       </ThemeProvider>
     </ErrorBoundary>
   )

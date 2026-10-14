@@ -8,11 +8,26 @@ pub struct UploadControlHandle {
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
     pub pause_rx: watch::Receiver<bool>,
     pub paused_items_rx: watch::Receiver<HashSet<String>>,
+    /// True while the remote switch or the access password locks the app
+    /// (`remote_status`). Held work waits like a paused item and carries on by
+    /// itself when the lock lifts.
+    pub service_rx: watch::Receiver<bool>,
 }
 
 impl UploadControlHandle {
     pub fn is_canceled(&self) -> bool {
         self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn is_service_locked(&self) -> bool {
+        *self.service_rx.borrow()
+    }
+
+    /// Paused by the user, on its own or with everything, or held by the lock.
+    pub fn is_held(&self, item_id: &str) -> bool {
+        *self.pause_rx.borrow()
+            || self.paused_items_rx.borrow().contains(item_id)
+            || self.is_service_locked()
     }
 }
 
@@ -106,13 +121,16 @@ pub async fn wait_if_paused(control: &UploadControlHandle, item_id: &str) -> Res
 
     let mut pause_all_rx = control.pause_rx.clone();
     let mut paused_items_rx = control.paused_items_rx.clone();
+    let mut service_rx = control.service_rx.clone();
 
-    let is_blocked = *pause_all_rx.borrow() || paused_items_rx.borrow().contains(item_id);
-    if !is_blocked {
+    if !control.is_held(item_id) {
         return Ok(());
     }
 
-    while *pause_all_rx.borrow() || paused_items_rx.borrow().contains(item_id) {
+    while *pause_all_rx.borrow()
+        || paused_items_rx.borrow().contains(item_id)
+        || *service_rx.borrow()
+    {
         if control.is_canceled() {
             return Err(CANCELED.to_string());
         }
@@ -122,6 +140,9 @@ pub async fn wait_if_paused(control: &UploadControlHandle, item_id: &str) -> Res
             }
             r = paused_items_rx.changed() => {
                 r.map_err(|_| "Pause channel closed".to_string())?;
+            }
+            r = service_rx.changed() => {
+                r.map_err(|_| "Service lock channel closed".to_string())?;
             }
         }
     }
@@ -184,6 +205,72 @@ mod tests {
             assert!(!tallies.record_finished());
         }
         assert_eq!(tallies.outstanding.load(Ordering::Relaxed), 0);
+    }
+
+    /// A handle plus the senders behind it; they must outlive the wait, or the
+    /// closed channel ends it.
+    struct Senders {
+        pause: watch::Sender<bool>,
+        _items: watch::Sender<HashSet<String>>,
+        service: watch::Sender<bool>,
+    }
+
+    fn handle(service_locked: bool) -> (UploadControlHandle, Senders) {
+        let (pause, pause_rx) = watch::channel(false);
+        let (items, paused_items_rx) = watch::channel(HashSet::new());
+        let (service, service_rx) = watch::channel(service_locked);
+        let handle = UploadControlHandle {
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pause_rx,
+            paused_items_rx,
+            service_rx,
+        };
+        (
+            handle,
+            Senders {
+                pause,
+                _items: items,
+                service,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn the_service_lock_holds_work_until_it_lifts() {
+        let (control, senders) = handle(true);
+        assert!(control.is_held("a"));
+        let waiter = tokio::spawn({
+            let control = control.clone();
+            async move { wait_if_paused(&control, "a").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "held while locked");
+
+        senders.service.send(false).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("released when the lock lifts")
+            .unwrap();
+        assert_eq!(result, Ok(()));
+        assert!(!control.is_held("a"));
+    }
+
+    #[tokio::test]
+    async fn cancel_ends_a_wait_held_by_the_service_lock() {
+        let (control, senders) = handle(true);
+        let waiter = tokio::spawn({
+            let control = control.clone();
+            async move { wait_if_paused(&control, "a").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // what UploadControl::cancel does
+        control.cancel.store(true, Ordering::Relaxed);
+        senders.pause.send(false).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("cancel wakes the wait")
+            .unwrap();
+        assert_eq!(result, Err(CANCELED.to_string()));
     }
 
     #[test]

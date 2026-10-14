@@ -32,3 +32,6 @@ yarn.lock
 *.njsproj
 *.sln
 *.sw?
+
+# Local documents written by scripts/gdexplorer-status.mjs for testing
+/remote-status/

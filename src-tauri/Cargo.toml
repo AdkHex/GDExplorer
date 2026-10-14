@@ -14,6 +14,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# Checks src-tauri/remote-status.json at build time. See build.rs.
+serde_json = "1"
 
 [dependencies]
 tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-png"] }
@@ -40,6 +42,13 @@ zip = "0.6"
 # Reads a fresh socket's SO_SNDBUF, the cap on every rclone connection on
 # Windows. See `send_buffer`.
 socket2 = "0.5"
+# The remote switch and access password (`remote_status`): PBKDF2-SHA256 and
+# SHA-256 from ring (already built for rustls), base64 for the document's salt
+# and hash, and the OS credential store that remembers the password per user.
+ring = "0.17"
+base64 = "0.22"
+url = "2"
+keyring = "4"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"
@@ -48,10 +57,13 @@ tauri-plugin-updater = "2"
 # processes may reserve. See `upload::memory`.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+# Finds an old all-users install in HKLM. See `service::all_users_install`.
+winreg = "0.55"
 
 [dev-dependencies]
-# Lets the memory tests move the clock instead of sleeping through holds.
-tokio = { version = "1", features = ["test-util"] }
+# Lets the memory tests move the clock instead of sleeping through holds; the
+# remote status tests run a local HTTP server.
+tokio = { version = "1", features = ["test-util", "net", "io-util"] }
 
 # Optimize for smaller binary size in release builds
 [profile.release]
