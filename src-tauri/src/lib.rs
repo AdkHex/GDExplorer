@@ -1089,20 +1089,17 @@ async fn play_notification_sound() -> Result<(), String> {
     let result = tokio::task::spawn_blocking(|| {
         #[cfg(target_os = "windows")]
         {
-            use std::os::windows::process::CommandExt;
-            // MessageBeep plays the user's configured notification sound; the
-            // flag keeps the helper console window from flashing.
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            std::process::Command::new("powershell")
-                .args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    "[System.Media.SystemSounds]::Asterisk.Play()",
-                ])
-                .creation_flags(CREATE_NO_WINDOW)
-                .status()
-                .map(|_| ())
+            use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
+            use windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONASTERISK;
+            // MessageBeep plays the user's configured notification sound. It
+            // used to run through a hidden PowerShell, which antivirus
+            // heuristics flag as malware.
+            // SAFETY: MessageBeep takes no pointers.
+            if unsafe { MessageBeep(MB_ICONASTERISK) } == 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
         }
 
         #[cfg(target_os = "macos")]

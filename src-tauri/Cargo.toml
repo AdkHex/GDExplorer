@@ -53,11 +53,21 @@ keyring = "4"
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"
 
-# Reads the machine's physical memory, which caps what a job's rclone
-# processes may reserve. See `upload::memory`.
+# Calls Windows directly instead of shelling out to PowerShell: physical memory
+# (`upload::memory`), the completion beep, and the elevated registry write in
+# `send_buffer`. Antivirus heuristics treat hidden PowerShell as malware.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
-# Finds an old all-users install in HKLM. See `service::all_users_install`.
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_Registry",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
+# Reads HKLM: an old all-users install (`service::all_users_install`) and the
+# AFD send buffer (`send_buffer`).
 winreg = "0.55"
 
 [dev-dependencies]

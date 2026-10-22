@@ -76,77 +76,83 @@ pub fn live_send_buffer_bytes() -> Result<u32, String> {
     u32::try_from(bytes).map_err(|_| format!("Unexpected send buffer size {bytes}"))
 }
 
-/// Parses `reg query` output for a REG_DWORD value, which `reg.exe` prints
-/// in hex: `    DefaultSendWindow    REG_DWORD    0x200000`.
-#[cfg_attr(not(windows), allow(dead_code))]
-pub fn parse_reg_query_dword(output: &str, value_name: &str) -> Option<u32> {
-    output.lines().find_map(|line| {
-        let mut parts = line.split_whitespace();
-        let name = parts.next()?;
-        if !name.eq_ignore_ascii_case(value_name) {
-            return None;
-        }
-        let kind = parts.next()?;
-        if !kind.eq_ignore_ascii_case("REG_DWORD") {
-            return None;
-        }
-        let raw = parts.next()?;
-        let hex = raw
-            .strip_prefix("0x")
-            .or_else(|| raw.strip_prefix("0X"))
-            .unwrap_or(raw);
-        u32::from_str_radix(hex, 16)
-            .ok()
-            .or_else(|| raw.parse::<u32>().ok())
-    })
-}
-
+// Both sides talk to Windows directly. They used to run `reg.exe` and a
+// hidden PowerShell `Start-Process -Verb RunAs`, a pattern antivirus
+// heuristics flag as malware.
 #[cfg(windows)]
 mod windows {
     use super::*;
-    use std::os::windows::process::CommandExt;
-    use std::process::Command;
-
-    /// Keeps the helper console windows from flashing.
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     pub fn registry_bytes() -> Result<Option<u32>, String> {
-        let output = Command::new("reg.exe")
-            .args(["query", REGISTRY_KEY, "/v", VALUE_NAME])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .map_err(|e| format!("Could not run reg.exe: {e}"))?;
-        // A missing value is reported as a failure by reg.exe; it is simply
-        // "not set" here.
-        if !output.status.success() {
-            return Ok(None);
+        use std::io::ErrorKind;
+        use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+        use winreg::RegKey;
+
+        let subkey = REGISTRY_KEY.trim_start_matches(r"HKLM\");
+        let key = match RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(subkey, KEY_READ)
+        {
+            Ok(key) => key,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("Could not open {REGISTRY_KEY}: {e}")),
+        };
+        match key.get_value::<u32, _>(VALUE_NAME) {
+            Ok(bytes) => Ok(Some(bytes)),
+            // Absent until someone sets it; Windows then uses 64 KiB.
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("Could not read {VALUE_NAME}: {e}")),
         }
-        Ok(parse_reg_query_dword(
-            &String::from_utf8_lossy(&output.stdout),
-            VALUE_NAME,
-        ))
     }
 
     /// Writes the registry value through an elevation prompt. Returns the
     /// value now in the registry, so the caller can tell a declined prompt
     /// from a successful write.
     pub fn raise_registry_value() -> Result<Option<u32>, String> {
-        // `reg add` needs administrator rights on HKLM; `Start-Process -Verb
-        // RunAs` is the supported way to ask for them from an unelevated
-        // process. `-Wait` keeps this call synchronous with the prompt.
-        let script = format!(
-            "Start-Process -FilePath reg.exe -ArgumentList @('add','{REGISTRY_KEY}','/v','{VALUE_NAME}','/t','REG_DWORD','/d','{RECOMMENDED_BYTES}','/f') -Verb RunAs -Wait -WindowStyle Hidden"
-        );
-        let status = Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .creation_flags(CREATE_NO_WINDOW)
-            .status()
-            .map_err(|e| format!("Could not run PowerShell: {e}"))?;
-        if !status.success() {
-            return Err(
-                "The change was not applied - the administrator prompt was declined or failed."
-                    .to_string(),
-            );
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, WaitForSingleObject, INFINITE,
+        };
+        use windows_sys::Win32::UI::Shell::{
+            ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+        fn wide(s: &str) -> Vec<u16> {
+            s.encode_utf16().chain(std::iter::once(0)).collect()
+        }
+
+        // `reg add` needs administrator rights on HKLM. The "runas" verb is
+        // how an unelevated process asks for them: Windows shows the UAC
+        // prompt and fails the call if it is declined.
+        let verb = wide("runas");
+        let file = wide("reg.exe");
+        let parameters = wide(&format!(
+            r#"add "{REGISTRY_KEY}" /v {VALUE_NAME} /t REG_DWORD /d {RECOMMENDED_BYTES} /f"#
+        ));
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+            lpVerb: verb.as_ptr(),
+            lpFile: file.as_ptr(),
+            lpParameters: parameters.as_ptr(),
+            nShow: SW_HIDE,
+            ..Default::default()
+        };
+        let not_applied =
+            "The change was not applied - the administrator prompt was declined or failed.";
+        // SAFETY: every pointer in `info` borrows a NUL-terminated buffer
+        // that outlives the call.
+        if unsafe { ShellExecuteExW(&mut info) } == 0 || info.hProcess.is_null() {
+            return Err(not_applied.to_string());
+        }
+        let mut exit_code = 1u32;
+        // SAFETY: `hProcess` is a live handle owned here until CloseHandle.
+        unsafe {
+            WaitForSingleObject(info.hProcess, INFINITE);
+            GetExitCodeProcess(info.hProcess, &mut exit_code);
+            CloseHandle(info.hProcess);
+        }
+        if exit_code != 0 {
+            return Err(not_applied.to_string());
         }
         registry_bytes()
     }
@@ -181,23 +187,6 @@ pub fn raise() -> Result<SendBufferState, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_the_hex_dword_reg_query_prints() {
-        let output = "\r\nHKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\AFD\\Parameters\r\n    DefaultSendWindow    REG_DWORD    0x200000\r\n\r\n";
-        assert_eq!(
-            parse_reg_query_dword(output, "DefaultSendWindow"),
-            Some(2 * 1024 * 1024)
-        );
-        assert_eq!(parse_reg_query_dword(output, "DefaultReceiveWindow"), None);
-        assert_eq!(
-            parse_reg_query_dword(
-                "ERROR: The system was unable to find the specified registry key or value.",
-                "DefaultSendWindow"
-            ),
-            None
-        );
-    }
 
     #[test]
     fn a_raised_registry_value_is_pending_until_restart() {
