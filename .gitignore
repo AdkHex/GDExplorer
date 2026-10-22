@@ -35,3 +35,12 @@ yarn.lock
 
 # Local documents written by scripts/gdexplorer-status.mjs for testing
 /remote-status/
+
+# AI assistant and design-tool files: kept on each machine, not part of the
+# project
+/.claude/
+/.nimbalyst/
+/nimbalyst-local/
+/AGENTS.md
+/CLAUDE.md
+/.cursorignore

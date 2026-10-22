@@ -1,8 +1,10 @@
 # GDExplorer
 
-GDExplorer is a Tauri v2 desktop app (React + TypeScript) for queueing local files/folders and uploading them to Google Drive Shared Drives using Service Accounts.
+GDExplorer is a Tauri v2 desktop app (React + TypeScript) for queueing local
+files and folders and uploading them to Google Drive Shared Drives using
+Service Accounts.
 
-Requirements
+## Requirements
 
 - Node.js 18+
 - pnpm 10 (this repo pins pnpm via `packageManager`; `pnpm-lock.yaml` is the
@@ -12,33 +14,34 @@ Requirements
 - [rclone](https://rclone.org/downloads/) on your `PATH`, or its full path set
   in Preferences. GDExplorer drives rclone to perform the actual uploads.
 
-Run in development
+## Run in development
 
-1. Install dependencies:
-   `pnpm install`
+```sh
+pnpm install
+pnpm run tauri:dev
+```
 
-2. Start the dev app:
-   `pnpm run tauri:dev`
+## Build installers
 
-Build installers
+```sh
+pnpm run build        # frontend
+pnpm run tauri:build  # installers and artifacts
+```
 
-1. Build the frontend:
-   `pnpm run build`
-
-2. Build the Tauri app (installers/artifacts):
-   `pnpm run tauri:build`
-
-Checks
+## Checks
 
 Run everything CI runs (typecheck, lint, format, JS tests, `cargo fmt`,
 `cargo clippy`, `cargo test`):
 
-`pnpm run check:all`
+```sh
+pnpm run check:all
+```
 
-Auto-updates (GitHub Releases)
+## Auto-updates
 
-See `docs/UPDATER_GITHUB_RELEASES.md`.
+Installed apps update from GitHub Releases. See
+[docs/UPDATER_GITHUB_RELEASES.md](docs/UPDATER_GITHUB_RELEASES.md).
 
-License
+## License
 
-MIT. See `LICENSE.md`.
+MIT. See [LICENSE.md](LICENSE.md).
